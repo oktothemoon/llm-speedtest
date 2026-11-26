@@ -172,6 +172,48 @@ def _render_html(token: str, default_submit_url: str) -> str:
   .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
   .actions .btn-primary {{ flex: 1; }}
   .privacy {{ font-size: 12px; color: var(--muted); margin-top: 8px; }}
+  .celeb {{
+    background: linear-gradient(135deg, #12384d 0%, #174761 100%);
+    color: #f3f7fa;
+    border-radius: 14px;
+    padding: 20px 22px;
+    margin: 14px 0 6px;
+    box-shadow: 0 10px 28px rgba(18, 56, 77, 0.22);
+    position: relative;
+    overflow: hidden;
+  }}
+  .celeb-top {{ display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }}
+  .celeb-title {{ font-size: 18px; font-weight: 800; }}
+  .celeb-id {{ background: #f5b301; color: #122634; font-weight: 800; font-size: 13px; padding: 3px 10px; border-radius: 999px; }}
+  .celeb-sub {{ color: #b7cfde; font-size: 13px; margin-top: 6px; }}
+  .celeb-card {{
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.16);
+    border-radius: 11px;
+    padding: 12px 14px;
+    margin: 14px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }}
+  .celeb-hw {{ font-size: 15px; font-weight: 700; }}
+  .celeb-mdl {{ font-size: 13px; color: #c7dce8; margin-top: 2px; }}
+  .celeb-spd {{ text-align: right; }}
+  .celeb-spd .big {{ font-size: 28px; font-weight: 800; color: #f5b301; line-height: 1.1; }}
+  .celeb-spd .sm {{ font-size: 12px; color: #c7dce8; }}
+  .celeb-cta {{
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    width: 100%; padding: 11px 16px; border-radius: 10px;
+    background: #f5b301; color: #122634; font-weight: 700; font-size: 14px;
+    text-decoration: none;
+  }}
+  .celeb-cta:hover {{ filter: brightness(1.06); }}
+  #confetti-canvas {{
+    position: fixed; inset: 0; width: 100vw; height: 100vh;
+    pointer-events: none; z-index: 9999;
+  }}
 </style>
 </head>
 <body>
@@ -418,6 +460,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
       </div>
       <pre id="json-preview"></pre>
       <div id="upload-msg" class="banner hidden"></div>
+      <div id="celeb-box" class="celeb hidden"></div>
       <div class="actions">
         <button id="btn-upload" class="btn btn-primary" type="button">确认上传至 itbanana.com</button>
       </div>
@@ -823,20 +866,56 @@ $('btn-upload').onclick = async () => {{
   $('btn-upload').disabled = true;
   $('btn-upload').textContent = '上传中...';
   $('upload-msg').classList.add('hidden');
+  $('celeb-box').classList.add('hidden');
   try {{
     const res = await api('/api/upload', {{ payload: lastPayload }});
-    const firstRes = (res.response && res.response.results && res.response.results[0]) || {{}};
-    let msg = firstRes.flag_reason === 'manual_hardware'
-      ? '已提交！由于硬件为手动选择，系统已标记为待复核，核验后计入社区统计。'
-      : '上传成功！感谢贡献实测数据。';
+    const resp = res.response || {{}};
+    const firstRes = (resp.results && resp.results[0]) || {{}};
+    const recId = resp.record_id || firstRes.id || null;
+    const isManual = firstRes.flag_reason === 'manual_hardware';
+    const hw = lastPayload.hardware || {{}};
+    const mdl = lastPayload.model || {{}};
+    const r0 = (lastPayload.results && lastPayload.results[0]) || {{}};
+    const verLabel = hw.detected_by === 'ssh' ? '🔒 SSH 实采' : hw.detected_by === 'local' ? '🔒 本机实采' : '人工自填（待复核）';
+    const pageUrl = recId && !isManual
+      ? `https://itbanana.com/llm-hardware?highlight=${{recId}}#live-speedtest`
+      : 'https://itbanana.com/llm-hardware#live-speedtest';
+
+    let extraLine = '';
+    if (resp.total_contributors) {{
+      extraLine = `全站累计已收录 ${{resp.total_samples || 1}} 条实测，你是第 ${{resp.total_contributors}} 位贡献实测数据的玩家！`;
+    }}
     if (res.stats && res.stats.group && res.stats.group.contributors) {{
       const g = res.stats.group;
-      msg += ` 当前同配置已有 ${{g.contributors}} 位贡献者，实测区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
+      extraLine += ` 同配置社区区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
     }}
-    $('upload-msg').className = 'banner banner-ok';
-    $('upload-msg').textContent = msg;
-    $('upload-msg').classList.remove('hidden');
-    $('btn-upload').textContent = '已上传';
+    if (isManual) {{
+      extraLine = '由于硬件为手动选择，系统已自动进入复核队列，核验后将在网站公开展示。';
+    }}
+
+    $('celeb-box').innerHTML = `
+      <div class="celeb-top">
+        <div class="celeb-title">${{isManual ? '✅ 实测已收到，感谢贡献！' : '🎉 恭喜！你的实测已成功上榜'}}</div>
+        <div class="celeb-id">${{recId && !isManual ? '实测 #' + recId : verLabel}}</div>
+      </div>
+      <div class="celeb-sub">${{extraLine}}</div>
+      <div class="celeb-card">
+        <div>
+          <div class="celeb-hw">${{hw.hw_raw}}${{hw.gpu_count > 1 ? ' ×' + hw.gpu_count : ''}}${{hw.ram_gb ? ' · ' + hw.ram_gb + 'GB' : ''}}</div>
+          <div class="celeb-mdl">${{mdl.model_raw}}${{mdl.quant ? ' · ' + mdl.quant : ''}} · ${{verLabel}}</div>
+        </div>
+        <div class="celeb-spd">
+          <div class="big">${{r0.tg_tps}} tok/s</div>
+          <div class="sm">${{r0.pp_tps ? '读题 ' + r0.pp_tps + ' tok/s' : '生成速度'}}</div>
+        </div>
+      </div>
+      <a class="celeb-cta" href="${{pageUrl}}" target="_blank" rel="noopener noreferrer">
+        ${{recId && !isManual ? '去 itbanana.com 查看我的 #' + recId + ' 实测记录 →' : '前往 itbanana.com/llm-hardware 查看实测榜 →'}}
+      </a>
+    `;
+    $('celeb-box').classList.remove('hidden');
+    $('btn-upload').textContent = '已完成上传';
+    launchConfetti();
   }} catch (e) {{
     $('upload-msg').className = 'banner banner-err';
     $('upload-msg').textContent = '上传失败：' + e.message;
@@ -845,6 +924,55 @@ $('btn-upload').onclick = async () => {{
     $('btn-upload').textContent = '重试上传';
   }}
 }};
+
+function launchConfetti() {{
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const old = document.getElementById('confetti-canvas');
+  if (old) old.remove();
+  const canvas = document.createElement('canvas');
+  canvas.id = 'confetti-canvas';
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = window.innerWidth, H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.scale(dpr, dpr);
+  const colors = ['#f5b301', '#0f766e', '#2dd4bf', '#fb7185', '#38bdf8', '#a78bfa'];
+  const parts = Array.from({{ length: 90 }}, () => ({{
+    x: W * (0.2 + Math.random() * 0.6),
+    y: H * 0.35 + (Math.random() - 0.5) * 60,
+    vx: (Math.random() - 0.5) * 11,
+    vy: -Math.random() * 10 - 3,
+    size: 5 + Math.random() * 6,
+    rot: Math.random() * Math.PI * 2,
+    vrot: (Math.random() - 0.5) * 0.25,
+    color: colors[Math.floor(Math.random() * colors.length)],
+    life: 1,
+  }}));
+  const start = performance.now();
+  function frame(now) {{
+    const elapsed = now - start;
+    ctx.clearRect(0, 0, W, H);
+    let alive = false;
+    for (const p of parts) {{
+      p.x += p.vx; p.y += p.vy; p.vy += 0.28; p.vx *= 0.99; p.rot += p.vrot;
+      p.life = Math.max(0, 1 - elapsed / 2400);
+      if (p.life > 0 && p.y < H + 20) {{
+        alive = true;
+        ctx.save();
+        ctx.globalAlpha = p.life;
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(-p.size / 2, -p.size / 3, p.size, p.size * 0.65);
+        ctx.restore();
+      }}
+    }}
+    if (alive && elapsed < 2500) requestAnimationFrame(frame);
+    else canvas.remove();
+  }}
+  requestAnimationFrame(frame);
+}}
 
 init();
 </script>

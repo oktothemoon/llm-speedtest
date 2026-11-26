@@ -196,7 +196,15 @@ class EndToEndMockTests(unittest.TestCase):
                     self.wfile.flush()
                 elif self.path == "/api/llm-speedtest/submit":
                     uploaded_ref.append(body)
-                    self._send_json(200, {"ok": True, "batch_id": "test-batch", "accepted": len(body["results"])})
+                    self._send_json(200, {
+                        "ok": True,
+                        "batch_id": "test-batch",
+                        "record_id": len(uploaded_ref),
+                        "accepted": len(body["results"]),
+                        "total_samples": len(uploaded_ref),
+                        "total_contributors": len(uploaded_ref),
+                        "results": [{"id": len(uploaded_ref), "status": "approved"}],
+                    })
                 else:
                     self._send_json(404, {"error": "not found"})
 

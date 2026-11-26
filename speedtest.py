@@ -1451,7 +1451,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         resp = http_json(args.submit_url, payload=payload, timeout=15.0)
-        print(f"\nUploaded successfully: {json.dumps(resp, ensure_ascii=False)}", file=sys.stderr)
+        rec_id = resp.get("record_id")
+        print(f"\n🎉 上传成功：{json.dumps(resp, ensure_ascii=False)}", file=sys.stderr)
+        if rec_id:
+            print(f"查看你的实测记录：https://itbanana.com/llm-hardware?highlight={rec_id}#live-speedtest", file=sys.stderr)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
         print(f"\nUpload failed (HTTP {e.code}): {detail}", file=sys.stderr)
