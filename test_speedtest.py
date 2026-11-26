@@ -235,6 +235,13 @@ class EndToEndMockTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+    def test_local_requests_bypass_http_proxy(self):
+        base = f"http://127.0.0.1:{self.port}"
+        with mock.patch.dict("os.environ", {"http_proxy": "http://127.0.0.1:1", "ALL_PROXY": "http://127.0.0.1:1"}):
+            ep, models = speedtest.resolve_endpoint(str(self.port))
+            self.assertEqual(ep, f"{base}/v1")
+            self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", models)
+
     def test_end_to_end_benchmark_and_upload(self):
         base = f"http://127.0.0.1:{self.port}"
         rc = speedtest.main([

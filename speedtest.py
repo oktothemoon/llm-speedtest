@@ -16,6 +16,7 @@ import json
 import os
 import platform
 import re
+import socket
 import statistics
 import subprocess
 import sys
@@ -25,7 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.1"
+CLIENT_VERSION = "0.3.2"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -420,8 +421,26 @@ def parse_linux_non_nvidia_gpus(
     return pci_gpus
 
 
+def _is_own_interface_ip(host: str) -> bool:
+    """Return True if host is an IP address assigned to a local network interface on this machine."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+        except OSError:
+            continue
+        s = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            s.bind((host, 0))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+    return False
+
+
 def is_local_endpoint(endpoint: str) -> bool:
-    """Return True if endpoint points to the local machine (loopback)."""
+    """Return True if endpoint points to the local machine (loopback or this host's own interface IP)."""
     try:
         host = (urllib.parse.urlparse(endpoint).hostname or "").lower().strip("[]")
     except Exception:
@@ -429,6 +448,8 @@ def is_local_endpoint(endpoint: str) -> bool:
     if host in ("localhost", "localhost.localdomain", "::1", "0.0.0.0"):
         return True
     if host.startswith("127."):
+        return True
+    if host and _is_own_interface_ip(host):
         return True
     return False
 
@@ -439,6 +460,10 @@ COMMON_ENDPOINTS = [
     "http://127.0.0.1:8000/v1",   # vLLM / SGLang
     "http://127.0.0.1:30000/v1",  # SGLang default
     "http://127.0.0.1:8081/v1",   # alternate local port
+    "http://127.0.0.1:8082/v1",   # alternate local port
+    "http://127.0.0.1:8001/v1",   # alternate vLLM / OpenAI port
+    "http://127.0.0.1:9000/v1",   # custom local port
+    "http://127.0.0.1:5000/v1",   # alternate local port
 ]
 
 FILLER_PARAGRAPH = (
@@ -848,6 +873,31 @@ def detect_hardware() -> Dict[str, Any]:
     }
 
 
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req: urllib.request.Request, timeout: float = 15.0) -> Any:
+    """Bypass system HTTP/SOCKS proxies for local endpoints while keeping proxy for external uploads."""
+    if is_local_endpoint(req.full_url):
+        return _NO_PROXY_OPENER.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _extract_model_ids(data: Any) -> List[str]:
+    if not isinstance(data, dict):
+        return []
+    raw_list = data.get("data") if isinstance(data.get("data"), list) else (
+        data.get("models") if isinstance(data.get("models"), list) else []
+    )
+    out: List[str] = []
+    for m in raw_list:
+        if isinstance(m, dict):
+            mid = m.get("id") or m.get("model") or m.get("name")
+            if mid and str(mid) not in out:
+                out.append(str(mid))
+    return out
+
+
 def http_json(url: str, payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: float = 15.0) -> Any:
     hdrs = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if headers:
@@ -857,11 +907,11 @@ def http_json(url: str, payload: Optional[Dict[str, Any]] = None, headers: Optio
         data = json.dumps(payload).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST" if data is not None else "GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-COMMON_PORTS = [8080, 11434, 1234, 8000, 30000, 8081]
+COMMON_PORTS = [8080, 11434, 1234, 8000, 30000, 8081, 8082, 8001, 9000, 5000]
 
 
 def endpoint_candidates(raw: str) -> List[str]:
@@ -945,12 +995,11 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
     for cand in cands:
         try:
             data = http_json(f"{cand}/models", headers=headers, timeout=2.5)
-            if isinstance(data, dict) and isinstance(data.get("data"), list):
-                models = [m["id"] for m in data["data"] if isinstance(m, dict) and m.get("id")]
-                if models:
-                    return cand, [explicit_model] if explicit_model else models
-                if explicit_model:
-                    return cand, [explicit_model]
+            models = _extract_model_ids(data)
+            if models:
+                return cand, [explicit_model] if explicit_model else models
+            if explicit_model:
+                return cand, [explicit_model]
         except Exception as e:
             last_err = e
             continue
@@ -964,19 +1013,25 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
 
 def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    auth_hint: Optional[str] = None
     for ep in COMMON_ENDPOINTS:
         for cand in (ep.rstrip("/"), ep.rstrip("/").removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep.rstrip("/"))):
             try:
                 data = http_json(f"{cand}/models", headers=headers, timeout=2.0)
-                models = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+                models = _extract_model_ids(data)
                 if models:
                     return cand, models
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403) and not auth_hint:
+                    auth_hint = f"在 {cand} 发现推理服务但需要认证（HTTP {e.code}），请传入 --api-key <你的密钥>。"
+                continue
             except Exception:
                 continue
+    if auth_hint:
+        raise RuntimeError(auth_hint)
     raise RuntimeError(
-        "未在本机常见端口（8080 / 11434 / 1234 / 8000 / 30000 / 8081）发现运行中的 OpenAI 兼容推理服务。\n"
-        "请先在本机启动推理服务（如 llama-server / Strata / Ollama / LM Studio / vLLM / MLX），"
-        "或传入自定义本机端口：--endpoint http://127.0.0.1:<端口>/v1"
+        "未在本机常见端口（8080 / 11434 / 1234 / 8000 / 30000 / 8081 / 8082 / 8001 / 9000 / 5000）发现运行中的 OpenAI 兼容推理服务。\n"
+        "请确认推理服务已启动并加载模型，或直接输入你的自定义端口号（如 8088）或 --endpoint http://127.0.0.1:<端口>/v1"
     )
 
 
@@ -1070,7 +1125,7 @@ def run_single_completion(
     usage: Dict[str, Any] = {}
     timings: Dict[str, Any] = {}
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _urlopen(req, timeout=timeout) as resp:
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="ignore").strip()
             if not line or not line.startswith("data:"):
