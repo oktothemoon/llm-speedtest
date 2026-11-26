@@ -32,7 +32,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>llm-speedtest · 本地大模型测速</title>
+<title>llm-speedtest · 本地大模型速度天梯图实测</title>
 <style>
   :root {{
     --bg: #f6f7f9;
@@ -213,8 +213,8 @@ def _render_html(token: str, default_submit_url: str) -> str:
 <div class="wrap">
   <header>
     <div>
-      <h1>llm-speedtest</h1>
-      <div class="sub">本机大模型标准化测速 · 实时上榜 itbanana.com/llm-speed &amp; /llm-hardware</div>
+      <h1>llm-speedtest · 本地大模型速度天梯图实测</h1>
+      <div class="sub">测完实时上榜 itbanana.com/llm-speed · 对比同款硬件真实速度与调优上限</div>
     </div>
     <span class="badge">🔒 仅限本机实测认证</span>
   </header>
@@ -592,9 +592,16 @@ $('nickname-input').oninput = syncPublicMetaToPayload;
 $('note-input').oninput = syncPublicMetaToPayload;
 
 function fmtCtx(n) {{
+  for (const t of [1024, 32768, 65536, 131072, 262144]) {{
+    if (Math.abs(n - t) / t <= 0.04) return (t / 1024) + 'k';
+  }}
   if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'k';
   if (n >= 1000 && Math.abs(n / 1024 - Math.round(n / 1024)) < 0.08) return Math.round(n / 1024) + 'k';
   return String(n);
+}}
+
+function fmtSrc(s) {{
+  return s === 'timings' ? '服务端精确计时' : '客户端流式计时';
 }}
 
 function renderResult(p) {{
@@ -606,7 +613,7 @@ function renderResult(p) {{
   $('score-grid').innerHTML = `
     <div class="metric"><div class="v">${{r.tg_tps}}</div><div class="k">生成速度 (${{fmtCtx(r.ctx_prompt)}} · tok/s)</div></div>
     <div class="metric"><div class="v">${{r.pp_tps || '-'}}</div><div class="k">读题速度 (${{fmtCtx(r.ctx_prompt)}} · tok/s)</div></div>
-    <div class="metric"><div class="v">${{r.ttft_ms || '-'}} ms</div><div class="k">首字延迟 (${{r.source}})</div></div>
+    <div class="metric"><div class="v">${{r.ttft_ms || '-'}} ms</div><div class="k">首字延迟 (${{fmtSrc(r.source)}})</div></div>
   `;
   if (p.results.length > 1) {{
     const rows = p.results.map((x) => `
@@ -615,7 +622,7 @@ function renderResult(p) {{
         <td class="num">${{x.tg_tps}} tok/s</td>
         <td>${{x.pp_tps || '-'}} tok/s</td>
         <td>${{x.ttft_ms || '-'}} ms</td>
-        <td>${{x.runs}} 轮 (${{x.source}})</td>
+        <td>${{x.runs}} 轮（${{fmtSrc(x.source)}}）</td>
       </tr>
     `).join('');
     $('tier-table-wrap').innerHTML = `
@@ -837,7 +844,8 @@ def create_ui_server(
                             measured_cpt = len(prompt) / float(r["prompt_tokens"])
                             if 3.0 <= measured_cpt <= 8.0:
                                 cpt = measured_cpt
-                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（实际 {r['prompt_tokens']} tok, {r['source']}）")
+                        src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
+                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（实际 {r['prompt_tokens']} tok，{src_lbl}）")
                 except Exception as e:
                     if results:
                         log(f"[{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")

@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.4"
+CLIENT_VERSION = "0.3.5"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -59,6 +59,9 @@ def parse_ctx_list(ctx_str: Optional[str]) -> List[int]:
 
 
 def format_ctx_label(tokens: int) -> str:
+    for tier in DEFAULT_CTX_TIERS:
+        if abs(tokens - tier) / float(tier) <= 0.04:
+            return f"{tier // 1024}k"
     if tokens >= 1024 and tokens % 1024 == 0:
         return f"{tokens // 1024}k"
     if tokens >= 1000:
@@ -1347,10 +1350,10 @@ def benchmark_context(
             measured_cpt = len(prompt) / float(r["prompt_tokens"])
             if 3.0 <= measured_cpt <= 8.0:
                 cpt = measured_cpt
-        src_lbl = "引擎 timings" if r["source"] == "timings" else "SSE 流式"
+        src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
         print(
             f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33')} tok/s | "
-            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（实际 {r['prompt_tokens']} tok, {src_lbl}）",
+            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（实际 {r['prompt_tokens']} tok，{src_lbl}）",
             file=sys.stderr,
         )
 
@@ -1511,7 +1514,7 @@ def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed
 
 def print_welcome_banner() -> None:
     print(_c("╭────────────────────────────────────────────────────────────╮", "36"), file=sys.stderr)
-    print(_c(f"│  ★ llm-speedtest v{CLIENT_VERSION} · 本地大模型标准化测速工具       │", "1;36"), file=sys.stderr)
+    print(_c(f"│  ★ llm-speedtest v{CLIENT_VERSION} · 本地大模型速度天梯图实测工具   │", "1;36"), file=sys.stderr)
     print(_c("╰────────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
     print(
         "[隐私承诺] 100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
@@ -1626,11 +1629,11 @@ def print_summary(payload: Dict[str, Any]) -> None:
             meta_parts.append(f"备注：{payload['note']}")
         print(f"  ◆ {' | '.join(meta_parts)}", file=sys.stderr)
     for r in payload["results"]:
-        src_lbl = "引擎 timings" if r["source"] == "timings" else "SSE 流式"
+        src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
         lbl = format_ctx_label(r["ctx_prompt"])
         print(
-            f"  ▸ [{lbl:>5}] ctx≈{r['ctx_prompt']} → 生成 {_c(str(r['tg_tps']) + ' tok/s', '1;33')} | "
-            f"读题 {r.get('pp_tps') or '-'} tok/s | 首字 {r.get('ttft_ms') or '-'} ms（{r['runs']}轮, {src_lbl}）",
+            f"  ▸ [{lbl:>4}] ctx≈{r['ctx_prompt']} → 生成 {_c(str(r['tg_tps']) + ' tok/s', '1;33')} | "
+            f"读题 {r.get('pp_tps') or '-'} tok/s | 首字 {r.get('ttft_ms') or '-'} ms（{r['runs']}轮，{src_lbl}）",
             file=sys.stderr,
         )
     print(_c("╰──────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
