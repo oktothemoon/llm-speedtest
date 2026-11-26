@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.2.1"
+CLIENT_VERSION = "0.2.2"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -269,6 +269,109 @@ def parse_human_hardware(text: str) -> Dict[str, Any]:
     return result
 
 
+def parse_linux_non_nvidia_gpus(
+    rocm_lines: List[str],
+    rocm_mem_lines: List[str],
+    amd_smi_lines: List[str],
+    pci_lines: List[str],
+    vram_bytes_list: List[int],
+) -> List[Tuple[str, Optional[int]]]:
+    """Extract (gpu_name, vram_gb) pairs for AMD/Intel GPUs on Linux (local or SSH)."""
+    vrams: List[int] = []
+    for b in vram_bytes_list:
+        if b and b > 0:
+            gb = max(1, round(b / (1024 ** 3)))
+            vrams.append(gb)
+    if not vrams:
+        for line in rocm_mem_lines:
+            low = line.lower()
+            if not line.strip() or low.startswith("device") or "total" in low and not re.search(r"\d{6,}", line):
+                continue
+            nums = [int(x) for x in re.findall(r"\b(\d{8,})\b", line)]
+            if nums:
+                vrams.append(max(1, round(nums[0] / (1024 ** 3))))
+    # Drop tiny iGPU carveouts (<=2GB) when discrete GPUs (>=6GB) are also present
+    if any(v >= 6 for v in vrams):
+        vrams = [v for v in vrams if v >= 4]
+
+    def pick_best_name(candidates: List[str], vram: Optional[int]) -> Optional[str]:
+        cleaned = []
+        for c in candidates:
+            s = re.sub(r"\s+", " ", (c or "").strip().strip('"'))
+            if not s or s.lower() in ("n/a", "none", "unknown", "card0", "card1", "card2", "card3"):
+                continue
+            if re.fullmatch(r"0x[0-9a-f]+|\d+", s, re.IGNORECASE):
+                continue
+            cleaned.append(s)
+        for s in cleaned:
+            if map_gpu_id(s, vram):
+                return s
+        for s in cleaned:
+            if any(k in s.lower() for k in ("radeon", "instinct", "arc ", "intel arc")):
+                return s
+        return cleaned[0] if cleaned else None
+
+    gpus: List[Tuple[str, Optional[int]]] = []
+
+    # 1. amd-smi static CSV
+    amd_rows = [l for l in amd_smi_lines if l.strip() and not l.lower().startswith(("gpu,", "device"))]
+    for idx, line in enumerate(amd_rows):
+        cols = [c.strip() for c in line.split(",")]
+        vram = vrams[idx] if idx < len(vrams) else None
+        if vram is None:
+            m_mb = re.search(r"\b(\d{4,6})\s*mb\b", line, re.IGNORECASE)
+            if m_mb:
+                vram = max(1, round(int(m_mb.group(1)) / 1024))
+        name = pick_best_name(cols[1:] if len(cols) > 1 else cols, vram)
+        if name:
+            gpus.append((name, vram))
+    if gpus:
+        return gpus
+
+    # 2. rocm-smi --showproductname --csv
+    rocm_rows = [l for l in rocm_lines if l.strip() and not l.lower().startswith("device")]
+    for idx, line in enumerate(rocm_rows):
+        cols = [c.strip() for c in line.split(",")]
+        vram = vrams[idx] if idx < len(vrams) else None
+        name = pick_best_name(cols[1:] if len(cols) > 1 else cols, vram)
+        if name:
+            gpus.append((name, vram))
+
+    # 3. lspci fallback (or enrich generic ROCm name when lspci gives a mappable model)
+    pci_gpus: List[Tuple[str, Optional[int]]] = []
+    skip_pci = ("aspeed", "matrox", "vmware", "qxl", "virtio", "bochs", "raphael", "granite ridge", "phoenix", "rembrandt", "cezanne")
+    for line in pci_lines:
+        low = line.lower()
+        if any(sk in low for sk in skip_pci):
+            continue
+        if not any(k in low for k in ("amd", "ati", "radeon", "instinct", "navi", "intel", "arc ")):
+            continue
+        # Strip leading PCI bus + device class prefix
+        desc = re.sub(r"^[0-9a-f:.]+\s+[^:]+:\s*", "", line.strip(), flags=re.IGNORECASE)
+        desc = re.sub(r"\s*\(rev [^)]+\)\s*$", "", desc).strip()
+        # Prefer bracketed product name if present (e.g. "[Radeon AI PRO R9700]")
+        brackets = re.findall(r"\[([^\]]+)\]", desc)
+        vram = vrams[len(pci_gpus)] if len(pci_gpus) < len(vrams) else None
+        cand = pick_best_name(brackets + [desc], vram) or desc
+        if cand:
+            pci_gpus.append((cand, vram))
+
+    if gpus:
+        # If ROCm didn't map cleanly to a known hw_id but lspci + VRAM did, prefer lspci name
+        enriched: List[Tuple[str, Optional[int]]] = []
+        for idx, (name, vram) in enumerate(gpus):
+            if not map_gpu_id(name, vram) and idx < len(pci_gpus):
+                p_name, p_vram = pci_gpus[idx]
+                use_vram = vram or p_vram
+                if map_gpu_id(p_name, use_vram):
+                    enriched.append((p_name, use_vram))
+                    continue
+            enriched.append((name, vram))
+        return enriched
+
+    return pci_gpus
+
+
 def detect_hardware_via_ssh(ssh_target: str) -> Optional[Dict[str, Any]]:
     """Read-only hardware spec detection over SSH (no hostname, username, or paths collected)."""
     remote_cmd = (
@@ -276,22 +379,42 @@ def detect_hardware_via_ssh(ssh_target: str) -> Optional[Dict[str, Any]]:
         "if command -v nvidia-smi >/dev/null 2>&1; then "
         "  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | sed 's/^/NV=/'; "
         "fi; "
+        "if command -v amd-smi >/dev/null 2>&1; then "
+        "  amd-smi static --asic --vram --csv 2>/dev/null | sed 's/^/AMDSMI=/'; "
+        "fi; "
+        "if command -v rocm-smi >/dev/null 2>&1; then "
+        "  rocm-smi --showproductname --csv 2>/dev/null | sed 's/^/ROCM=/'; "
+        "  rocm-smi --showmeminfo vram --csv 2>/dev/null | sed 's/^/ROCMMEM=/'; "
+        "fi; "
+        "if command -v lspci >/dev/null 2>&1; then "
+        "  lspci 2>/dev/null | grep -iE 'VGA|3D|Display' | sed 's/^/PCI=/'; "
+        "fi; "
+        "for f in /sys/class/drm/card*/device/mem_info_vram_total; do "
+        "  [ -r \"$f\" ] && echo \"VRAM_B=$(cat \"$f\" 2>/dev/null)\"; "
+        "done; "
         "if [ -r /proc/meminfo ]; then grep '^MemTotal:' /proc/meminfo | awk '{print \"MEMKB=\"$2}'; fi; "
+        "if [ -r /proc/cpuinfo ]; then grep -m1 -i '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^/CPU=/'; fi; "
         "if [ \"$(uname -s)\" = \"Darwin\" ]; then "
         "  echo CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null); "
         "  echo MEMB=$(sysctl -n hw.memsize 2>/dev/null); "
         "  system_profiler SPDisplaysDataType 2>/dev/null | grep 'Total Number of Cores' | head -n 1 | sed 's/^/CORES=/'; "
         "fi"
     )
-    out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target, remote_cmd], timeout=10.0)
+    out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target, remote_cmd], timeout=12.0)
     if not out:
         return None
 
     os_raw = ""
     arch = ""
     nv_lines: List[str] = []
+    rocm_lines: List[str] = []
+    rocm_mem_lines: List[str] = []
+    amd_smi_lines: List[str] = []
+    pci_lines: List[str] = []
+    vram_bytes: List[int] = []
     mem_kb = 0
     mem_b = 0
+    cpu_brand = ""
     chip = ""
     gpu_cores = None
 
@@ -302,10 +425,22 @@ def detect_hardware_via_ssh(ssh_target: str) -> Optional[Dict[str, Any]]:
             arch = line[5:].strip().lower()
         elif line.startswith("NV="):
             nv_lines.append(line[3:].strip())
+        elif line.startswith("AMDSMI="):
+            amd_smi_lines.append(line[7:].strip())
+        elif line.startswith("ROCM="):
+            rocm_lines.append(line[5:].strip())
+        elif line.startswith("ROCMMEM="):
+            rocm_mem_lines.append(line[8:].strip())
+        elif line.startswith("PCI="):
+            pci_lines.append(line[4:].strip())
+        elif line.startswith("VRAM_B=") and line[7:].strip().isdigit():
+            vram_bytes.append(int(line[7:].strip()))
         elif line.startswith("MEMKB=") and line[6:].strip().isdigit():
             mem_kb = int(line[6:].strip())
         elif line.startswith("MEMB=") and line[5:].strip().isdigit():
             mem_b = int(line[5:].strip())
+        elif line.startswith("CPU="):
+            cpu_brand = line[4:].strip()
         elif line.startswith("CHIP="):
             chip = line[5:].strip()
         elif line.startswith("CORES="):
@@ -364,6 +499,35 @@ def detect_hardware_via_ssh(ssh_target: str) -> Optional[Dict[str, Any]]:
             "ram_channels": None,
             "os": os_name,
         }
+
+    if "ai max" in cpu_brand.lower() and "395" in cpu_brand.lower():
+        return {
+            "kind": "unified",
+            "hw_id": "aimax395",
+            "hw_raw": cpu_brand,
+            "gpu_count": 1,
+            "vram_gb": None,
+            "ram_gb": ram_gb,
+            "ram_type": "Unified",
+            "ram_channels": None,
+            "os": os_name,
+        }
+
+    non_nv = parse_linux_non_nvidia_gpus(rocm_lines, rocm_mem_lines, amd_smi_lines, pci_lines, vram_bytes)
+    if non_nv:
+        name, vram = non_nv[0]
+        return {
+            "kind": "gpu",
+            "hw_id": map_gpu_id(name, vram),
+            "hw_raw": name,
+            "gpu_count": len(non_nv),
+            "vram_gb": vram,
+            "ram_gb": ram_gb,
+            "ram_type": None,
+            "ram_channels": None,
+            "os": os_name,
+        }
+
     return None
 
 
@@ -474,6 +638,8 @@ def map_gpu_id(name: str, vram_gb: Optional[int]) -> Optional[str]:
     if "7900 xt" in s:
         return "rx7900xt"
     if "r9700" in s:
+        return "r9700"
+    if ("9070" in s or "navi 48" in s) and v >= 28:
         return "r9700"
     if "9070 xt" in s:
         return "rx9070xt"
@@ -734,23 +900,42 @@ def detect_hardware() -> Dict[str, Any]:
                 "os": os_name,
             }
     elif os_name == "linux":
-        rocm = run_cmd(["rocm-smi", "--showproductname", "--csv"])
-        if rocm:
-            lines = [l for l in rocm.splitlines() if l.strip() and not l.lower().startswith("device")]
-            if lines:
-                cols = [c.strip() for c in lines[0].split(",")]
-                name = cols[1] if len(cols) > 1 else cols[0]
-                return {
-                    "kind": "gpu",
-                    "hw_id": map_gpu_id(name, None),
-                    "hw_raw": name,
-                    "gpu_count": len(lines),
-                    "vram_gb": None,
-                    "ram_gb": ram_gb,
-                    "ram_type": None,
-                    "ram_channels": None,
-                    "os": os_name,
-                }
+        amd_smi = run_cmd(["amd-smi", "static", "--asic", "--vram", "--csv"]).splitlines()
+        rocm = run_cmd(["rocm-smi", "--showproductname", "--csv"]).splitlines()
+        rocm_mem = run_cmd(["rocm-smi", "--showmeminfo", "vram", "--csv"]).splitlines()
+        pci = [
+            l for l in run_cmd(["lspci"]).splitlines()
+            if re.search(r"VGA|3D|Display", l, re.IGNORECASE)
+        ]
+        vram_bytes: List[int] = []
+        try:
+            drm_dir = "/sys/class/drm"
+            if os.path.isdir(drm_dir):
+                for entry in sorted(os.listdir(drm_dir)):
+                    if not re.fullmatch(r"card\d+", entry):
+                        continue
+                    p = os.path.join(drm_dir, entry, "device", "mem_info_vram_total")
+                    if os.path.isfile(p):
+                        with open(p, "r", encoding="utf-8") as f:
+                            raw_b = f.read().strip()
+                            if raw_b.isdigit():
+                                vram_bytes.append(int(raw_b))
+        except Exception:
+            pass
+        non_nv = parse_linux_non_nvidia_gpus(rocm, rocm_mem, amd_smi, pci, vram_bytes)
+        if non_nv:
+            name, vram = non_nv[0]
+            return {
+                "kind": "gpu",
+                "hw_id": map_gpu_id(name, vram),
+                "hw_raw": name,
+                "gpu_count": len(non_nv),
+                "vram_gb": vram,
+                "ram_gb": ram_gb,
+                "ram_type": None,
+                "ram_channels": None,
+                "os": os_name,
+            }
 
     return {
         "kind": "gpu",

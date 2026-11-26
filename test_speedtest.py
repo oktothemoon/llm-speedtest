@@ -122,6 +122,35 @@ class MappingTests(unittest.TestCase):
             self.assertEqual(hw["os"], "linux")
             self.assertEqual(hw["gpu_count"], 1)
 
+        # AMD ROCm Linux host over SSH (Radeon AI PRO R9700 32GB via rocm-smi + sysfs VRAM)
+        fake_rocm = (
+            "OS=Linux\nARCH=x86_64\n"
+            "ROCM=device,Card Series,Card Model,Card Vendor,Card SKU\n"
+            "ROCM=card0,AMD Radeon AI PRO R9700,0x7550,Advanced Micro Devices,D70201\n"
+            "VRAM_B=34342961152\n"
+            "MEMKB=67108864\n"
+        )
+        with mock.patch.object(speedtest, "run_cmd", return_value=fake_rocm):
+            hw_amd = speedtest.detect_hardware_via_ssh("user@192.168.1.60")
+            self.assertEqual(hw_amd["hw_id"], "r9700")
+            self.assertEqual(hw_amd["hw_raw"], "AMD Radeon AI PRO R9700")
+            self.assertEqual(hw_amd["vram_gb"], 32)
+            self.assertEqual(hw_amd["ram_gb"], 64)
+            self.assertEqual(hw_amd["gpu_count"], 1)
+
+        # AMD Navi 48 generic lspci + 32GB VRAM -> maps to r9700 cleanly
+        fake_pci = (
+            "OS=Linux\nARCH=x86_64\n"
+            "PCI=03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT] (rev c0)\n"
+            "VRAM_B=34359738368\n"
+            "MEMKB=134217728\n"
+        )
+        with mock.patch.object(speedtest, "run_cmd", return_value=fake_pci):
+            hw_pci = speedtest.detect_hardware_via_ssh("user@192.168.1.61")
+            self.assertEqual(hw_pci["hw_id"], "r9700")
+            self.assertEqual(hw_pci["vram_gb"], 32)
+            self.assertEqual(hw_pci["ram_gb"], 128)
+
     def test_endpoint_candidates_flexible_inputs(self):
         # Bare IP -> tries reverse proxy + common ports with /v1 and without /v1
         c1 = speedtest.endpoint_candidates("192.168.31.88")
