@@ -1067,11 +1067,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-warmup", action="store_true", help="Skip the initial warmup request")
 
     # Upload / interaction / privacy controls
+    p.add_argument("--ui", action="store_true", help="Open the local browser web UI (default when run with no flags in a terminal)")
+    p.add_argument("--cli", action="store_true", help="Force terminal CLI mode instead of opening the local web UI")
+    p.add_argument("--ui-port", type=int, default=0, help="Port for local web UI (default: random free port on 127.0.0.1)")
     p.add_argument("--detect-only", action="store_true", help="Only print detected hardware JSON and exit")
     p.add_argument("--dry-run", action="store_true", help="Run benchmark and print JSON without uploading")
-    p.add_argument("--interactive", "-i", action="store_true", help="Force interactive step-by-step terminal wizard")
-    p.add_argument("--non-interactive", action="store_true", help="Disable interactive prompts (recommended for AI agents / scripts)")
-    p.add_argument("--yes", "-y", action="store_true", help="Upload without interactive confirmation prompt (also disables wizard)")
+    p.add_argument("--interactive", "-i", action="store_true", help="Force interactive terminal CLI mode")
+    p.add_argument("--non-interactive", action="store_true", help="Disable interactive prompts and web UI (recommended for AI agents / scripts)")
+    p.add_argument("--yes", "-y", action="store_true", help="Upload without interactive confirmation prompt (CLI mode)")
     p.add_argument("--submit-url", default=DEFAULT_SUBMIT_URL, help=f"Upload endpoint (default: {DEFAULT_SUBMIT_URL})")
     p.add_argument("--stats-url", default=DEFAULT_STATS_URL, help=f"Stats endpoint (default: {DEFAULT_STATS_URL})")
     return p.parse_args(argv)
@@ -1283,12 +1286,32 @@ def print_summary(payload: Dict[str, Any]) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(raw_argv)
 
     if args.detect_only:
         hw = resolve_hardware(args, remote=False)
         print(json.dumps(hw, indent=2, ensure_ascii=False))
         return 0
+
+    # Launch the local browser UI when explicitly asked (--ui) OR when a human runs `python3 speedtest.py` with no flags
+    launch_ui = args.ui or (
+        len(raw_argv) == 0
+        and sys.stdin.isatty()
+        and not args.cli
+        and not args.non_interactive
+        and not args.yes
+        and not args.dry_run
+        and not args.interactive
+    )
+    if launch_ui:
+        import ui as ui_mod
+        return ui_mod.serve_ui(
+            sys.modules[__name__],
+            submit_url=args.submit_url,
+            stats_url=args.stats_url,
+            port=args.ui_port,
+        )
 
     interactive = args.interactive or (sys.stdin.isatty() and not args.yes and not args.non_interactive)
 

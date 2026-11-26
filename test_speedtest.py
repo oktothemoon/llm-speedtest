@@ -278,6 +278,89 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["hardware"]["ram_type"], "DDR4")
         self.assertEqual(p["hardware"]["ram_channels"], 2)
 
+    def test_local_web_ui_end_to_end(self):
+        import urllib.error
+        import urllib.request
+        import ui
+
+        base = f"http://127.0.0.1:{self.port}"
+        ui_srv, token = ui.create_ui_server(
+            speedtest,
+            submit_url=f"{base}/api/llm-speedtest/submit",
+            stats_url=f"{base}/api/llm-speedtest/stats",
+            port=0,
+            gen_tokens_default=20,
+            no_warmup=True,
+        )
+        ui_port = ui_srv.server_address[1]
+        ui_base = f"http://127.0.0.1:{ui_port}"
+        t = threading.Thread(target=ui_srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            # 1. GET / serves HTML containing session token
+            with urllib.request.urlopen(f"{ui_base}/") as resp:
+                html = resp.read().decode("utf-8")
+                self.assertIn("llm-speedtest", html)
+                self.assertIn(token, html)
+
+            # 2. POST without token is rejected (403)
+            bad_req = urllib.request.Request(
+                f"{ui_base}/api/probe",
+                data=json.dumps({"endpoint": base}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(bad_req)
+            self.assertEqual(ctx.exception.code, 403)
+
+            hdrs = {"X-Speedtest-Token": token}
+            # 3. Probe mock inference server
+            probed = speedtest.http_json(f"{ui_base}/api/probe", payload={"endpoint": f"127.0.0.1:{self.port}"}, headers=hdrs)
+            self.assertEqual(probed["endpoint"], f"{base}/v1")
+            self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", probed["models"])
+
+            # 4. Start benchmark job and wait for completion
+            speedtest.http_json(f"{ui_base}/api/start", payload={
+                "endpoint": f"{base}/v1",
+                "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
+                "quant": "GSQ-RCO IQ3_S",
+                "engine": "strata",
+                "mtp": True,
+                "ctx": "1024",
+                "runs": 2,
+                "remote": True,
+                "hardware": {
+                    "kind": "gpu",
+                    "hw_id": "rtx4090-48",
+                    "hw_raw": "RTX 4090 48GB",
+                    "gpu_count": 1,
+                    "vram_gb": 48,
+                    "ram_gb": 64,
+                    "ram_type": "DDR4",
+                    "ram_channels": 2,
+                    "os": "linux",
+                },
+            }, headers=hdrs)
+
+            st = {}
+            for _ in range(50):
+                st = speedtest.http_json(f"{ui_base}/api/status")
+                if st["state"] in ("done", "error"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(st["state"], "done")
+            self.assertEqual(st["payload"]["results"][0]["tg_tps"], 170.5)
+
+            # 5. Upload through UI backend
+            up = speedtest.http_json(f"{ui_base}/api/upload", payload={"payload": st["payload"]}, headers=hdrs)
+            self.assertTrue(up["ok"])
+            self.assertEqual(len(self.uploaded), 1)
+            self.assertEqual(self.uploaded[0]["hardware"]["hw_id"], "rtx4090-48")
+        finally:
+            ui_srv.shutdown()
+            ui_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
