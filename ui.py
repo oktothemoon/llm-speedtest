@@ -814,27 +814,33 @@ def create_ui_server(
                 st_module.run_single_completion(endpoint, model, "Say OK.", 24, api_key=api_key)
 
             results: List[Dict[str, Any]] = []
+            cpt = 5.6
             for c in ctx_list:
                 lbl = st_module.format_ctx_label(c)
-                if ctx_limit and c + gen_tokens > ctx_limit and (results or c > ctx_limit):
-                    log(f"⏭️ 跳过 [{lbl}]（当前服务上下文上限 {ctx_limit} tokens）")
+                target = st_module.effective_ctx_target(c, gen_tokens, ctx_limit)
+                if target is None:
+                    log(f"跳过 [{lbl}]（当前服务上下文上限 {ctx_limit} tokens）")
                     continue
-                tier_runs = st_module.effective_runs_for_ctx(c, runs)
-                req_timeout = st_module.timeout_for_ctx(c)
+                tier_runs = st_module.effective_runs_for_ctx(target, runs)
+                req_timeout = st_module.timeout_for_ctx(target)
                 samples = []
                 try:
                     for i in range(tier_runs):
-                        nonce = f"{c}-{i}-{int(time.time() * 1000) % 100000}"
-                        prompt = st_module.build_prompt(c, nonce)
-                        log(f"[{lbl}] 正在跑第 {i + 1}/{tier_runs} 轮（ctx≈{c}）...")
+                        nonce = f"{target}-{i}-{int(time.time() * 1000) % 100000}"
+                        prompt = st_module.build_prompt(target, nonce, chars_per_token=cpt)
+                        log(f"[{lbl}] 正在跑第 {i + 1}/{tier_runs} 轮（目标 ≈{target}）...")
                         r = st_module.run_single_completion(
                             endpoint, model, prompt, gen_tokens, api_key=api_key, timeout=req_timeout
                         )
                         samples.append(r)
-                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（{r['source']}）")
+                        if r["prompt_tokens"] >= 200:
+                            measured_cpt = len(prompt) / float(r["prompt_tokens"])
+                            if 3.0 <= measured_cpt <= 8.0:
+                                cpt = measured_cpt
+                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（实际 {r['prompt_tokens']} tok, {r['source']}）")
                 except Exception as e:
                     if results:
-                        log(f"⚠️ [{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")
+                        log(f"[{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")
                         break
                     raise
                 results.append({

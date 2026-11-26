@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.3"
+CLIENT_VERSION = "0.3.4"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -130,13 +130,18 @@ _ANSI_ENABLED: Optional[bool] = None
 
 
 def configure_console() -> None:
-    """Ensure UTF-8 output and ANSI color support on Windows/macOS/Linux terminals."""
+    """Ensure UTF-8 output, readline line-editing on POSIX, and ANSI color support."""
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+    if os.name != "nt":
+        try:
+            import readline  # noqa: F401 - enables arrow/delete keys in input() on Linux/macOS
+        except Exception:
+            pass
 
 
 def _supports_color() -> bool:
@@ -177,7 +182,8 @@ def _c(text: str, code: str) -> str:
 def clean_public_text(val: Optional[str], max_chars: int) -> Optional[str]:
     if not val:
         return None
-    s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(val))
+    s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z~]", "", str(val))
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
         return None
@@ -242,16 +248,89 @@ def infer_engine_from_text(text: str) -> Optional[str]:
     return None
 
 
-def infer_engine_auto(endpoint: str, model_name: str) -> Optional[str]:
-    """Best-effort engine guess from port or model name."""
+def _detect_local_process_engine(port: Optional[int]) -> Optional[str]:
+    """Best-effort engine detection from local listening process name ONLY (no paths/args)."""
+    os_name = normalize_os()
+    if port:
+        if os_name == "linux":
+            ss_out = run_cmd(["ss", "-tlnp"], timeout=2.0)
+            for line in ss_out.splitlines():
+                if f":{port} " in line or f":{port}\t" in line:
+                    names = re.findall(r'\(\("([^"]+)"', line)
+                    for nm in names:
+                        eng = infer_engine_from_text(nm)
+                        if eng:
+                            return eng
+        elif os_name == "macos":
+            lsof_out = run_cmd(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], timeout=2.0)
+            for line in lsof_out.splitlines()[1:]:
+                parts = line.split()
+                if parts:
+                    eng = infer_engine_from_text(parts[0])
+                    if eng:
+                        return eng
+        elif os_name == "windows":
+            ps = run_cmd([
+                "powershell", "-NoProfile", "-Command",
+                f"(Get-NetTCPConnection -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | "
+                f"Select-Object -First 1 -ExpandProperty OwningProcess) | "
+                f"ForEach-Object {{ (Get-Process -Id $_ -ErrorAction SilentlyContinue).ProcessName }}",
+            ], timeout=3.0)
+            eng = infer_engine_from_text(ps)
+            if eng:
+                return eng
+    return None
+
+
+def _detect_http_engine(endpoint: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Inspect local server HTTP Server header or /props build_info for engine name."""
+    if not endpoint or not is_local_endpoint(endpoint):
+        return None
+    ep = endpoint.rstrip("/")
+    root = re.sub(r"/v1$", "", ep, flags=re.IGNORECASE)
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for url in (f"{root}/props", f"{ep}/models"):
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with _urlopen(req, timeout=1.5) as resp:
+                srv = resp.headers.get("Server") or resp.headers.get("X-Powered-By") or ""
+                eng = infer_engine_from_text(srv)
+                if eng:
+                    return eng
+                if url.endswith("/props"):
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict):
+                        for k in ("build_info", "server", "engine", "version"):
+                            v = obj.get(k)
+                            if isinstance(v, str):
+                                eng = infer_engine_from_text(v)
+                                if eng:
+                                    return eng
+        except Exception:
+            continue
+    return None
+
+
+def infer_engine_auto(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Best-effort engine detection from model name, local process name, HTTP headers, or port."""
+    if "gsq-rco" in (model_name or "").lower():
+        return "strata"
     try:
         port = urllib.parse.urlparse(endpoint).port
     except Exception:
         port = None
+    if endpoint and is_local_endpoint(endpoint):
+        proc_eng = _detect_local_process_engine(port)
+        if proc_eng:
+            return proc_eng
+        http_eng = _detect_http_engine(endpoint, api_key=api_key)
+        if http_eng:
+            return http_eng
     if port in (11434, 1234):
         return "llamacpp"
-    if "gsq-rco" in (model_name or "").lower():
-        return "strata"
     return None
 
 
@@ -663,19 +742,32 @@ def infer_quant(raw: str) -> Optional[str]:
     return val.lower() if val.lower().endswith("bit") else val.upper()
 
 
+STANDARD_RAM_GB = (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
+
+
+def snap_ram_gb(raw_gb: int) -> int:
+    """Snap OS-reported usable RAM (e.g. 61GB due to kernel/iGPU carveout) to physical installed RAM (64GB)."""
+    if raw_gb <= 0:
+        return raw_gb
+    for std in STANDARD_RAM_GB:
+        if std * 0.90 <= raw_gb <= std:
+            return std
+    return raw_gb
+
+
 def detect_ram_gb() -> Optional[int]:
     sys_name = normalize_os()
     if sys_name == "macos":
         out = run_cmd(["sysctl", "-n", "hw.memsize"])
         if out.isdigit():
-            return max(1, round(int(out) / (1024 ** 3)))
+            return snap_ram_gb(max(1, round(int(out) / (1024 ** 3))))
     elif sys_name == "linux":
         try:
             with open("/proc/meminfo", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
                         kb = int(line.split()[1])
-                        return max(1, round(kb / (1024 ** 2)))
+                        return snap_ram_gb(max(1, round(kb / (1024 ** 2))))
         except Exception:
             pass
     elif sys_name == "windows":
@@ -684,7 +776,7 @@ def detect_ram_gb() -> Optional[int]:
             "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
         ])
         if out.isdigit():
-            return max(1, round(int(out) / (1024 ** 3)))
+            return snap_ram_gb(max(1, round(int(out) / (1024 ** 3))))
     return None
 
 
@@ -1097,15 +1189,28 @@ def detect_server_ctx_limit(endpoint: str, api_key: Optional[str] = None) -> Opt
     return None
 
 
-def build_prompt(target_tokens: int, nonce: str) -> str:
+def effective_ctx_target(tier_ctx: int, gen_tokens: int, ctx_limit: Optional[int]) -> Optional[int]:
+    """Return actual prompt token target for a context tier, fitting within ctx_limit when tier == ctx_limit."""
+    if not ctx_limit or ctx_limit <= 0:
+        return tier_ctx
+    margin = gen_tokens + 128
+    if tier_ctx + margin <= ctx_limit:
+        return tier_ctx
+    if tier_ctx <= ctx_limit and ctx_limit > margin + 256:
+        # e.g. server n_ctx=262144 and tier=256k -> trim slightly to fit gen_tokens + chat template
+        return ctx_limit - margin
+    return None
+
+
+def build_prompt(target_tokens: int, nonce: str, chars_per_token: float = 5.6) -> str:
     # Unique nonce at the beginning prevents KV prefix-cache reuse between runs.
     header = (
         f"[Bench run {nonce}] Read the reference passage below, then write a clear, "
         f"detailed technical explanation of how memory bandwidth affects local LLM inference "
         f"without stopping early.\n\n"
     )
-    # Approximate ~4 characters per token for English prose.
-    target_chars = max(0, target_tokens * 4 - len(header))
+    cpt = max(3.0, min(8.0, float(chars_per_token or 5.6)))
+    target_chars = max(0, int(round(target_tokens * cpt)) - len(header))
     if target_chars <= 0:
         return header
     reps = (target_chars // len(FILLER_PARAGRAPH)) + 1
@@ -1221,28 +1326,35 @@ def benchmark_context(
     gen_tokens: int,
     runs: int,
     api_key: Optional[str] = None,
-) -> Dict[str, Any]:
+    chars_per_token: float = 5.6,
+    tier_label: Optional[str] = None,
+) -> Tuple[Dict[str, Any], float]:
     samples: List[Dict[str, Any]] = []
     tier_runs = effective_runs_for_ctx(ctx_prompt, runs)
     req_timeout = timeout_for_ctx(ctx_prompt)
-    ctx_lbl = format_ctx_label(ctx_prompt)
+    ctx_lbl = tier_label or format_ctx_label(ctx_prompt)
+    cpt = chars_per_token
     print(
-        _c(f"\n⚡ 开始测速 [{ctx_lbl}]（上下文 ≈{ctx_prompt} tokens，共 {tier_runs} 轮，每轮生成 {gen_tokens} tokens）：", "1;36"),
+        _c(f"\n>> 开始测速 [{ctx_lbl}]（目标 ≈{ctx_prompt} tokens，共 {tier_runs} 轮，每轮生成 {gen_tokens} tokens）：", "1;36"),
         file=sys.stderr,
     )
     for i in range(tier_runs):
         nonce = f"{ctx_prompt}-{i}-{int(time.time() * 1000) % 100000}"
-        prompt = build_prompt(ctx_prompt, nonce)
+        prompt = build_prompt(ctx_prompt, nonce, chars_per_token=cpt)
         r = run_single_completion(endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=req_timeout)
         samples.append(r)
+        if r["prompt_tokens"] >= 200:
+            measured_cpt = len(prompt) / float(r["prompt_tokens"])
+            if 3.0 <= measured_cpt <= 8.0:
+                cpt = measured_cpt
         src_lbl = "引擎 timings" if r["source"] == "timings" else "SSE 流式"
         print(
             f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33')} tok/s | "
-            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（{src_lbl}）",
+            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（实际 {r['prompt_tokens']} tok, {src_lbl}）",
             file=sys.stderr,
         )
 
-    return {
+    res = {
         "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
         "gen_tokens": int(round(statistics.median(s["gen_tokens"] for s in samples))),
         "tg_tps": round(statistics.median(s["tg_tps"] for s in samples), 2),
@@ -1252,6 +1364,7 @@ def benchmark_context(
         "runs": tier_runs,
         "source": "timings" if all(s["source"] == "timings" for s in samples) else "sse",
     }
+    return res, cpt
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -1451,7 +1564,7 @@ def run_interactive_wizard(
     if args.model:
         model_name = args.model
     elif len(models) > 1:
-        print("\n📦 检测到本机已加载多个模型，请选择要测速的模型：", file=sys.stderr)
+        print("\n◆ 检测到本机已加载多个模型，请选择要测速的模型：", file=sys.stderr)
         for idx, m in enumerate(models, 1):
             print(f"   {idx}) {m}", file=sys.stderr)
         pick = _ask_int("请输入模型编号", 1) or 1
@@ -1460,7 +1573,7 @@ def run_interactive_wizard(
         model_name = models[0]
 
     if not args.engine:
-        args.engine = infer_engine_auto(endpoint, model_name)
+        args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
     guessed_q = args.quant or infer_quant(model_name)
     ctx_str = args.ctx or DEFAULT_CTX_STR
 
@@ -1472,11 +1585,11 @@ def run_interactive_wizard(
     kv_part = f" | KV: {normalize_kv_cache(args.kv_cache)}" if args.kv_cache else ""
     lim_part = f"（服务上限 ≈{format_ctx_label(detected_ctx_limit)}，超限档位自动跳过）" if detected_ctx_limit else ""
     print(
-        f"\n🎯 即将测速：{_c(hw['hw_raw'] + vram_part, '1')} ×{hw['gpu_count']}{ram_part}{ddr_part}"
+        f"\n◆ 即将测速：{_c(hw['hw_raw'] + vram_part, '1')} ×{hw['gpu_count']}{ram_part}{ddr_part}"
         f" | 模型: {_c(model_name, '1')}{q_part}{eng_part}{kv_part}",
         file=sys.stderr,
     )
-    print(f"📐 测速上下文档位：{ctx_str}{lim_part}", file=sys.stderr)
+    print(f"▸ 测速上下文档位：{ctx_str}{lim_part}", file=sys.stderr)
 
     missing = []
     if not args.engine:
@@ -1488,7 +1601,7 @@ def run_interactive_wizard(
     if args.mtp is None:
         missing.append("开MTP/不开MTP")
     if missing:
-        extra = _ask(f"✏️  可选一句话补充（如 {'、'.join(missing)}；直接回车立即开始测速）")
+        extra = _ask(f"可选一句话补充（如 {'、'.join(missing)}；直接回车立即开始测速）")
         if extra:
             _apply_parsed(args, hw, parse_human_note(extra))
 
@@ -1502,25 +1615,25 @@ def print_summary(payload: Dict[str, Any]) -> None:
     ram_str = f"{hw.get('ram_gb') or '?'}GB" + (f" {hw['ram_type']}" if hw.get("ram_type") else "")
     vram_str = f" ({hw['vram_gb']}GB 显存)" if hw.get("vram_gb") else ""
     kv_str = f" | KV Cache：{sw['kv_cache']}" if sw.get("kv_cache") else ""
-    print(_c("\n╭────────────────────── 📊 测速成绩单 ──────────────────────╮", "36"), file=sys.stderr)
-    print(f"  🖥️  本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']} · 内存 {ram_str} · {hw.get('os') or ''}", file=sys.stderr)
-    print(f"  📦 测试模型：{mdl['model_raw']} | 量化：{mdl.get('quant') or '未填'} | 引擎：{sw.get('engine') or '未填'}{kv_str}", file=sys.stderr)
+    print(_c("\n╭─────────────────────── 测速成绩单 ───────────────────────╮", "36"), file=sys.stderr)
+    print(f"  ◆ 本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']} · 内存 {ram_str} · {hw.get('os') or ''}", file=sys.stderr)
+    print(f"  ◆ 测试模型：{mdl['model_raw']} | 量化：{mdl.get('quant') or '未填'} | 引擎：{sw.get('engine') or '未填'}{kv_str}", file=sys.stderr)
     if payload.get("nickname") or payload.get("note"):
         meta_parts = []
         if payload.get("nickname"):
             meta_parts.append(f"署名：{payload['nickname']}")
         if payload.get("note"):
             meta_parts.append(f"备注：{payload['note']}")
-        print(f"  🏷️  {' | '.join(meta_parts)}", file=sys.stderr)
+        print(f"  ◆ {' | '.join(meta_parts)}", file=sys.stderr)
     for r in payload["results"]:
         src_lbl = "引擎 timings" if r["source"] == "timings" else "SSE 流式"
         lbl = format_ctx_label(r["ctx_prompt"])
         print(
-            f"  ⚡ [{lbl:>4}] ctx≈{r['ctx_prompt']} → 生成 {_c(str(r['tg_tps']) + ' tok/s', '1;33')} | "
+            f"  ▸ [{lbl:>5}] ctx≈{r['ctx_prompt']} → 生成 {_c(str(r['tg_tps']) + ' tok/s', '1;33')} | "
             f"读题 {r.get('pp_tps') or '-'} tok/s | 首字 {r.get('ttft_ms') or '-'} ms（{r['runs']}轮, {src_lbl}）",
             file=sys.stderr,
         )
-    print(_c("╰───────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
+    print(_c("╰──────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
 
 
 def print_upload_ceremony(
@@ -1540,11 +1653,11 @@ def print_upload_ceremony(
 
     is_king = bool(ranking and ranking.get("same_hw_rank") == 1)
     title = (
-        "👑 新王登基！你的本机实测已登顶同款硬件榜首！ 👑"
+        "★ 新王登基！你的本机实测已登顶同款硬件榜首！ ★"
         if is_king
-        else ("🏆 恭喜上榜！实测成绩已载入速度天梯图 🏆" if ranking else "🎉 恭喜！你的本机实测已成功上榜 🎉")
+        else ("★ 恭喜上榜！实测成绩已载入速度天梯图 ★" if ranking else "★ 恭喜！你的本机实测已成功上榜 ★")
     )
-    badge = f"实测编号 #{rec_id} · 🔒 本机实采认证" if rec_id else "🔒 本机实采认证"
+    badge = f"实测编号 #{rec_id} · [本机实采认证]" if rec_id else "[本机实采认证]"
     cnt = f" ×{hw['gpu_count']}" if (hw.get("gpu_count") or 1) > 1 else ""
     ram = f" · {hw['ram_gb']}GB" if hw.get("ram_gb") else ""
     quant = f" · {mdl['quant']}" if mdl.get("quant") else ""
@@ -1553,32 +1666,32 @@ def print_upload_ceremony(
 
     print("", file=sys.stderr)
     print(_c("╔══════════════════════════════════════════════════════════════╗", "1;33"), file=sys.stderr)
-    print(_c(f"║  ✨🎊  {title}  🎊✨", "1;33"), file=sys.stderr)
+    print(_c(f"║   {title}", "1;33"), file=sys.stderr)
     print(_c("╠══════════════════════════════════════════════════════════════╣", "33"), file=sys.stderr)
-    print(f"  🎖️  {_c(badge, '1;36')}", file=sys.stderr)
-    print(f"  🖥️  硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{ram}", file=sys.stderr)
-    print(f"  📦 模型：{mdl.get('model_raw', '-')}{quant}{kv}", file=sys.stderr)
+    print(f"  ★ {_c(badge, '1;36')}", file=sys.stderr)
+    print(f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{ram}", file=sys.stderr)
+    print(f"  ◆ 模型：{mdl.get('model_raw', '-')}{quant}{kv}", file=sys.stderr)
     if len(results) == 1:
         print(
-            f"  🚀 成绩：生成 {_c(str(r0.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
+            f"  ▸ 成绩：生成 {_c(str(r0.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
             f"读题 {r0.get('pp_tps') or '-'} tok/s  |  署名：{author}",
             file=sys.stderr,
         )
     else:
-        print(f"  🚀 多档实测成绩（共 {len(results)} 档） · 署名：{author}", file=sys.stderr)
+        print(f"  ▸ 多档实测成绩（共 {len(results)} 档） · 署名：{author}", file=sys.stderr)
         for r in results:
             lbl = format_ctx_label(r.get("ctx_prompt") or 0)
             print(
-                f"     [{lbl:>4}] 生成 {_c(str(r.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
+                f"     [{lbl:>5}] 生成 {_c(str(r.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
                 f"读题 {r.get('pp_tps') or '-'} tok/s  |  首字 {r.get('ttft_ms') or '-'} ms",
                 file=sys.stderr,
             )
     if payload.get("note"):
-        print(f"  📝 备注：{payload['note']}", file=sys.stderr)
+        print(f"  ◆ 备注：{payload['note']}", file=sys.stderr)
 
     if ranking:
         gap = float(ranking.get("gap_to_first") or 0)
-        gap_txt = "👑 当前同卡第一！" if gap <= 0.05 else f"🔥 距同卡第一仅差 {gap:g} tok/s，调优后再冲一次！"
+        gap_txt = "★ 当前同卡第一！" if gap <= 0.05 else f"距同卡第一仅差 {gap:g} tok/s，调优后再冲一次！"
         vs_med = ranking.get("vs_median_pct")
         med_txt = (
             f"（较同卡中位 {ranking.get('same_hw_median')} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
@@ -1587,23 +1700,23 @@ def print_upload_ceremony(
         )
         print(_c("╟──────────────────────────────────────────────────────────────╢", "33"), file=sys.stderr)
         print(
-            f"  🏆 同款硬件排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}",
+            f"  ★ 同款硬件排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}",
             file=sys.stderr,
         )
         print(
-            f"  🌍 全榜综合排名：第 {_c(str(ranking.get('overall_rank')), '1;36')} / {ranking.get('overall_total')} 名 · {gap_txt}",
+            f"  ★ 全榜综合排名：第 {_c(str(ranking.get('overall_rank')), '1;36')} / {ranking.get('overall_total')} 名 · {gap_txt}",
             file=sys.stderr,
         )
 
     if resp.get("total_contributors"):
         print(
-            f"  🤝 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！",
+            f"  ◆ 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！",
             file=sys.stderr,
         )
     if stats and isinstance(stats.get("group"), dict) and stats["group"].get("contributors"):
         g = stats["group"]
         print(
-            f"  📈 同配置社区区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位同好）",
+            f"  ◆ 同配置社区区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位同好）",
             file=sys.stderr,
         )
 
@@ -1611,7 +1724,7 @@ def print_upload_ceremony(
         f"https://itbanana.com/llm-speed?highlight={rec_id}" if rec_id else "https://itbanana.com/llm-speed"
     )
     print(_c("╟──────────────────────────────────────────────────────────────╢", "33"), file=sys.stderr)
-    print(f"  🔗 直达天梯图高亮我的成绩：{_c(ladder_url, '1;4;36')}", file=sys.stderr)
+    print(f"  → 直达天梯图高亮我的成绩：{_c(ladder_url, '1;4;36')}", file=sys.stderr)
     print(_c("╚══════════════════════════════════════════════════════════════╝", "1;33"), file=sys.stderr)
 
 
@@ -1740,34 +1853,46 @@ def main(argv: Optional[List[str]] = None) -> int:
         model_name = args.model or models[0]
         ctx_str = args.ctx or DEFAULT_CTX_STR
         if not args.engine:
-            args.engine = infer_engine_auto(endpoint, model_name)
+            args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
 
     if not args.no_warmup:
-        print("\n🔥 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
+        print("\n▸ 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
         run_single_completion(endpoint, model_name, "Say OK.", 24, api_key=args.api_key)
 
     ctx_list = parse_ctx_list(ctx_str)
     results: List[Dict[str, Any]] = []
+    cpt = 5.6
     for c in ctx_list:
-        if effective_ctx_limit and c + args.gen_tokens > effective_ctx_limit and (results or c > effective_ctx_limit):
+        target = effective_ctx_target(c, args.gen_tokens, effective_ctx_limit)
+        if target is None:
             print(
-                f"⏭️  跳过 [{format_ctx_label(c)}]（当前服务上下文上限 {effective_ctx_limit} tokens，不足以测 {c} + {args.gen_tokens}）",
+                f"▸ 跳过 [{format_ctx_label(c)}]（当前服务上下文上限 {effective_ctx_limit} tokens）",
                 file=sys.stderr,
             )
             continue
         try:
-            results.append(benchmark_context(endpoint, model_name, c, args.gen_tokens, args.runs, api_key=args.api_key))
+            res, cpt = benchmark_context(
+                endpoint,
+                model_name,
+                target,
+                args.gen_tokens,
+                args.runs,
+                api_key=args.api_key,
+                chars_per_token=cpt,
+                tier_label=format_ctx_label(c),
+            )
+            results.append(res)
         except Exception as e:
             if results:
                 print(
-                    _c(f"⚠️  [{format_ctx_label(c)}] 测速失败（可能超出当前上下文上限或显存不足：{e}），已保留已完成档位成绩并停止更高档位。", "33"),
+                    _c(f"! [{format_ctx_label(c)}] 测速失败（可能超出当前上下文上限或显存不足：{e}），已保留已完成档位成绩并停止更高档位。", "33"),
                     file=sys.stderr,
                 )
                 break
             raise
 
     if not results:
-        print(_c("❌ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)
+        print(_c("✗ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)
         return 1
 
     payload: Dict[str, Any] = {
@@ -1801,18 +1926,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # In interactive mode (not dry-run / not --yes), allow optional nickname & tuning note before final JSON review
     if interactive and not args.dry_run and not args.yes and not nickname and not note:
-        in_nick = clean_public_text(_ask("🏷️  天梯图公开署名（选填，≤20字，直接回车保持匿名）"), 20)
+        in_nick = clean_public_text(_ask("天梯图公开署名（选填，≤20字，直接回车保持匿名）"), 20)
         if in_nick:
             payload["nickname"] = in_nick
-        in_note = clean_public_text(_ask("📝 一句话调优备注（选填，≤120字，方便同卡抄作业，直接回车跳过）"), 120)
+        in_note = clean_public_text(_ask("一句话调优备注（选填，≤120字，方便同卡抄作业，直接回车跳过）"), 120)
         if in_note:
             payload["note"] = in_note
 
-    print("\n📋 即将上传的完整明文 JSON（零个人隐私，请核对）：")
+    print("\n--- 即将上传的完整明文 JSON（零个人隐私，请核对） ---")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
     if args.dry_run:
-        print(_c("\n✅ 试运行完成（--dry-run 模式，未上传数据）。", "32"), file=sys.stderr)
+        print(_c("\n✓ 试运行完成（--dry-run 模式，未上传数据）。", "32"), file=sys.stderr)
         return 0
 
     if not args.yes:
@@ -1828,15 +1953,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
             return 0
 
-    print("\n⏳ 正在将实测成绩刻入 itbanana.com 速度天梯图...", file=sys.stderr)
+    print("\n▸ 正在将实测成绩刻入 itbanana.com 速度天梯图...", file=sys.stderr)
     try:
         resp = http_json(args.submit_url, payload=payload, timeout=15.0)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
-        print(_c(f"\n❌ 上传失败（HTTP {e.code}）：{detail}", "1;31"), file=sys.stderr)
+        print(_c(f"\n✗ 上传失败（HTTP {e.code}）：{detail}", "1;31"), file=sys.stderr)
         return 1
     except Exception as e:
-        print(_c(f"\n❌ 上传失败：{e}", "1;31"), file=sys.stderr)
+        print(_c(f"\n✗ 上传失败：{e}", "1;31"), file=sys.stderr)
         return 1
 
     # Optionally fetch aggregate stats for this hardware + model

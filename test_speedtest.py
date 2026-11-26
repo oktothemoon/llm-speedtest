@@ -91,6 +91,16 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(speedtest.normalize_kv_cache("int8"), "int8")
         self.assertEqual(speedtest.normalize_kv_cache("q8"), "q8_0")
         self.assertEqual(speedtest.normalize_kv_cache("q8_0/q4_0"), "q8_0/q4_0")
+        # RAM snapping (e.g. 61GB usable Linux MemTotal -> 64GB physical)
+        self.assertEqual(speedtest.snap_ram_gb(61), 64)
+        self.assertEqual(speedtest.snap_ram_gb(31), 32)
+        self.assertEqual(speedtest.snap_ram_gb(125), 128)
+        self.assertEqual(speedtest.snap_ram_gb(48), 48)
+        # 256k tier on a 256k (262144) server trims slightly instead of skipping
+        self.assertEqual(speedtest.effective_ctx_target(262144, 256, 262144), 262144 - 384)
+        self.assertIsNone(speedtest.effective_ctx_target(262144, 256, 131072))
+        # ANSI escape sequences from arrow/delete keys are stripped from public notes
+        self.assertEqual(speedtest.clean_public_text("测试 \x1b[D\x1b[3~ beta", 120), "测试 beta")
 
     def test_parse_linux_non_nvidia_gpus(self):
         rocm = [
@@ -167,7 +177,7 @@ class EndToEndMockTests(unittest.TestCase):
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 if self.path == "/v1/chat/completions":
-                    prompt_len = max(1, round(len(body["messages"][0]["content"]) / 4))
+                    prompt_len = max(1, round(len(body["messages"][0]["content"]) / 5.6))
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
