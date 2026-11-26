@@ -147,7 +147,9 @@ class MappingTests(unittest.TestCase):
 class EndToEndMockTests(unittest.TestCase):
     def setUp(self):
         self.uploaded: List[Dict[str, Any]] = []
+        self.user_agents: List[str] = []
         uploaded_ref = self.uploaded
+        ua_ref = self.user_agents
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -195,6 +197,7 @@ class EndToEndMockTests(unittest.TestCase):
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 elif self.path == "/api/llm-speedtest/submit":
+                    ua_ref.append(self.headers.get("User-Agent") or "")
                     uploaded_ref.append(body)
                     rec_id = len(uploaded_ref)
                     self._send_json(200, {
@@ -275,6 +278,7 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["results"][0]["source"], "timings")
         self.assertEqual(p["nickname"], "老曹")
         self.assertEqual(p["note"], "Strata 0.2.15 + fa=on")
+        self.assertTrue(self.user_agents and self.user_agents[0].startswith("llm-speedtest/"))
 
     def test_interactive_wizard_flow(self):
         base = f"http://127.0.0.1:{self.port}"

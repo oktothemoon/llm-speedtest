@@ -25,7 +25,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.2.0"
+CLIENT_VERSION = "0.2.1"
+USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
 DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
@@ -765,7 +766,7 @@ def detect_hardware() -> Dict[str, Any]:
 
 
 def http_json(url: str, payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None, timeout: float = 15.0) -> Any:
-    hdrs = {"Accept": "application/json"}
+    hdrs = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
     data = None
@@ -925,7 +926,7 @@ def run_single_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
