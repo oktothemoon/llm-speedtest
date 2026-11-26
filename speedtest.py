@@ -59,6 +59,196 @@ HW_ID_LABELS = {
     "aimax395": "AMD Ryzen AI Max+ 395", "dgxspark": "NVIDIA DGX Spark",
 }
 
+HW_DEFAULT_VRAM = {
+    "rtx5090": 32, "rtx5080": 16, "rtx5070ti": 16, "rtx5070": 12, "rtx5060ti16": 16, "rtx5060": 8,
+    "rtx4090": 24, "rtx4090-48": 48, "rtx4080s": 16, "rtx4080s-32": 32,
+    "rtx4070tis": 16, "rtx4070ti": 12, "rtx4070s": 12, "rtx4070": 12, "rtx4060ti16": 16,
+    "rtx3090": 24, "rtx3080-20": 20, "rtx3080ti": 12, "rtx3060": 12, "rtx2080ti-22": 22,
+    "rtxpro6000": 96, "rtxpro5000-72": 72, "rtxpro5000": 48, "rtxpro4500": 32, "rtxpro4000": 24,
+    "v100-16": 16, "v100-32": 32,
+    "rx7900xtx": 24, "rx7900xt": 20, "r9700": 32, "rx9070xt": 16, "rx9070": 16, "rx9060xt16": 16,
+    "w7900": 48, "w7800-48": 48, "mi50": 16,
+    "arcprob70": 32, "arcprob60": 24, "arcb580": 12, "arca770": 16,
+}
+
+
+def parse_human_hardware(text: str) -> Dict[str, Any]:
+    """Parse casual Chinese/English hardware text like '4090 48G', '双 7900 XTX', 'M5 Ultra 256G'."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    low = raw.lower()
+    if low in HW_ID_LABELS or low in UNIFIED_IDS:
+        is_uni = low in UNIFIED_IDS
+        out: Dict[str, Any] = {
+            "kind": "unified" if is_uni else "gpu",
+            "hw_id": low,
+            "hw_raw": HW_ID_LABELS.get(low, low),
+        }
+        if not is_uni and low in HW_DEFAULT_VRAM:
+            out["vram_gb"] = HW_DEFAULT_VRAM[low]
+        if is_uni:
+            out["ram_type"] = "Unified"
+            if low.startswith("m"):
+                out["os"] = "macos"
+        return out
+
+    # Detect GPU count from casual forms: "双 3090", "4卡 5090", "2x 7900 XTX", "7900xtx*2"
+    gpu_count = None
+    if re.search(r"(?:^|\s)双\s*", raw):
+        gpu_count = 2
+    else:
+        m_cnt = re.search(r"(?:^|\s)(\d+)\s*(?:卡|张|[xX×*])\s*", raw) or re.search(r"[xX×*]\s*(\d+)(?:\s|$)", raw)
+        if m_cnt:
+            c = int(m_cnt.group(1))
+            if 1 <= c <= 16:
+                gpu_count = c
+
+    # Extract explicit GB number (e.g. "48G", "48GB", "256g")
+    gb_val = None
+    m_gb = re.search(r"(\d{2,4})\s*g(?:b)?\b", low)
+    if m_gb:
+        gb_val = int(m_gb.group(1))
+
+    # Normalize common shorthands before mapping
+    norm = re.sub(r"4080\s*s\b", "4080 super", low)
+    norm = re.sub(r"4070\s*ti\s*s\b", "4070 ti super", norm)
+    norm = re.sub(r"4070\s*s\b", "4070 super", norm)
+    norm = re.sub(r"7900\s*xtx", "7900 xtx", norm)
+    norm = re.sub(r"7900\s*xt\b", "7900 xt", norm)
+    norm = re.sub(r"2080\s*ti", "2080 ti", norm)
+    norm = re.sub(r"3080\s*ti", "3080 ti", norm)
+    norm = re.sub(r"5070\s*ti", "5070 ti", norm)
+    norm = re.sub(r"5060\s*ti", "5060 ti", norm)
+    norm = re.sub(r"4060\s*ti", "4060 ti", norm)
+
+    hw_id = None
+    if "ai max" in norm and "395" in norm:
+        hw_id = "aimax395"
+    elif "dgx" in norm and "spark" in norm or "gb10" in norm:
+        hw_id = "dgxspark"
+    else:
+        hw_id = map_apple_id(norm, None) or map_gpu_id(norm, gb_val)
+
+    is_uni = bool(hw_id and hw_id in UNIFIED_IDS)
+    result: Dict[str, Any] = {
+        "kind": "unified" if is_uni else "gpu",
+        "hw_id": hw_id,
+        "hw_raw": HW_ID_LABELS.get(hw_id, raw) if hw_id else raw,
+    }
+    if gpu_count:
+        result["gpu_count"] = gpu_count
+    if is_uni:
+        result["ram_type"] = "Unified"
+        if gb_val:
+            result["ram_gb"] = gb_val
+        if hw_id and hw_id.startswith("m"):
+            result["os"] = "macos"
+    else:
+        if gb_val:
+            result["vram_gb"] = gb_val
+        elif hw_id and hw_id in HW_DEFAULT_VRAM:
+            result["vram_gb"] = HW_DEFAULT_VRAM[hw_id]
+    return result
+
+
+def detect_hardware_via_ssh(ssh_target: str) -> Optional[Dict[str, Any]]:
+    """Read-only hardware spec detection over SSH (no hostname, username, or paths collected)."""
+    remote_cmd = (
+        "echo OS=$(uname -s); echo ARCH=$(uname -m); "
+        "if command -v nvidia-smi >/dev/null 2>&1; then "
+        "  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null | sed 's/^/NV=/'; "
+        "fi; "
+        "if [ -r /proc/meminfo ]; then grep '^MemTotal:' /proc/meminfo | awk '{print \"MEMKB=\"$2}'; fi; "
+        "if [ \"$(uname -s)\" = \"Darwin\" ]; then "
+        "  echo CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null); "
+        "  echo MEMB=$(sysctl -n hw.memsize 2>/dev/null); "
+        "  system_profiler SPDisplaysDataType 2>/dev/null | grep 'Total Number of Cores' | head -n 1 | sed 's/^/CORES=/'; "
+        "fi"
+    )
+    out = run_cmd(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_target, remote_cmd], timeout=10.0)
+    if not out:
+        return None
+
+    os_raw = ""
+    arch = ""
+    nv_lines: List[str] = []
+    mem_kb = 0
+    mem_b = 0
+    chip = ""
+    gpu_cores = None
+
+    for line in out.splitlines():
+        if line.startswith("OS="):
+            os_raw = line[3:].strip().lower()
+        elif line.startswith("ARCH="):
+            arch = line[5:].strip().lower()
+        elif line.startswith("NV="):
+            nv_lines.append(line[3:].strip())
+        elif line.startswith("MEMKB=") and line[6:].strip().isdigit():
+            mem_kb = int(line[6:].strip())
+        elif line.startswith("MEMB=") and line[5:].strip().isdigit():
+            mem_b = int(line[5:].strip())
+        elif line.startswith("CHIP="):
+            chip = line[5:].strip()
+        elif line.startswith("CORES="):
+            m = re.search(r"(\d+)", line)
+            if m:
+                gpu_cores = int(m.group(1))
+
+    os_name = "macos" if os_raw == "darwin" else ("windows" if os_raw.startswith(("mingw", "msys", "cygwin")) else "linux")
+    ram_gb = max(1, round(mem_b / (1024 ** 3))) if mem_b else (max(1, round(mem_kb / (1024 ** 2))) if mem_kb else None)
+
+    if os_name == "macos" and arch == "arm64":
+        hw_raw = f"{chip} ({gpu_cores}-core GPU)" if (chip and gpu_cores) else (chip or "Apple Silicon")
+        return {
+            "kind": "unified",
+            "hw_id": map_apple_id(chip, gpu_cores),
+            "hw_raw": hw_raw,
+            "gpu_count": 1,
+            "vram_gb": None,
+            "ram_gb": ram_gb,
+            "ram_type": "Unified",
+            "ram_channels": None,
+            "os": "macos",
+        }
+
+    gpus: List[Tuple[str, int]] = []
+    for nv in nv_lines:
+        parts = [p.strip() for p in nv.split(",")]
+        if len(parts) >= 2:
+            try:
+                vram = max(1, round(float(parts[1]) / 1024))
+            except ValueError:
+                vram = 0
+            gpus.append((parts[0], vram))
+    if gpus:
+        name, vram = gpus[0]
+        if "gb10" in name.lower():
+            return {
+                "kind": "unified",
+                "hw_id": "dgxspark",
+                "hw_raw": name,
+                "gpu_count": len(gpus),
+                "vram_gb": None,
+                "ram_gb": ram_gb or 128,
+                "ram_type": "Unified",
+                "ram_channels": None,
+                "os": os_name,
+            }
+        return {
+            "kind": "gpu",
+            "hw_id": map_gpu_id(name, vram),
+            "hw_raw": name,
+            "gpu_count": len(gpus),
+            "vram_gb": vram or None,
+            "ram_gb": ram_gb,
+            "ram_type": None,
+            "ram_channels": None,
+            "os": os_name,
+        }
+    return None
+
 
 def is_local_endpoint(endpoint: str) -> bool:
     """Return True if endpoint points to the local machine (loopback)."""
@@ -660,6 +850,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--fit", choices=["gpu", "hybrid"], help="Whether model fits fully in VRAM (gpu) or spills to RAM (hybrid)")
 
     # Hardware overrides (required for LAN/remote endpoints; optional overrides locally)
+    p.add_argument("--ssh", help="Optional SSH target (e.g. user@192.168.1.50) to auto-detect LAN server hardware (never uploaded)")
     p.add_argument("--hw-kind", choices=["gpu", "unified"], help="Override hardware kind (gpu or unified)")
     p.add_argument("--hw-id", help="Override canonical hardware ID (e.g. rtx4090-48)")
     p.add_argument("--hw-raw", help="Override raw hardware description")
@@ -768,23 +959,73 @@ def _ask_int(prompt_text: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
-def prompt_remote_hardware(args: argparse.Namespace) -> None:
-    """Interactively collect remote/LAN server specs without touching local hardware."""
-    print("\n检测到你连接的是局域网/远程推理服务，已关闭本机硬件探测，请填写【目标推理机】配置：", file=sys.stderr)
-    raw_in = _ask("  显卡/芯片型号（如 RTX 4090 / rtx4090-48 / M5 Ultra）")
-    if raw_in:
-        low = raw_in.lower().strip()
-        if low in HW_ID_LABELS or low in UNIFIED_IDS:
-            args.hw_id = low
-        else:
-            args.hw_raw = raw_in
-    if not args.hw_id or args.hw_id not in UNIFIED_IDS:
-        args.gpu_count = args.gpu_count or _ask_int("  显卡张数", 1)
-        args.vram_gb = args.vram_gb or _ask_int("  单卡显存 GB（不知道可回车跳过）")
-    args.ram_gb = args.ram_gb or _ask_int("  目标机系统/统一内存 GB（如 64 / 128，回车跳过）")
-    os_ans = _ask("  目标机系统 (linux / windows / macos，回车跳过)").lower()
-    if os_ans in ("linux", "windows", "macos"):
-        args.target_os = os_ans
+def prompt_remote_hardware(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Interactively collect remote/LAN server specs using friendly menu or casual text."""
+    print("\n检测到你连接的是局域网/远程推理服务，已关闭本机硬件探测，以免填错电脑配置。", file=sys.stderr)
+    ssh_in = _ask("如果能免密 SSH 登录那台机器，可输入 user@ip 自动识别硬件（不会上传）；否则直接回车手动选")
+    if ssh_in:
+        detected = detect_hardware_via_ssh(ssh_in)
+        if detected:
+            print(f"已通过 SSH 自动识别到：{detected['hw_raw']} ×{detected['gpu_count']} (RAM {detected.get('ram_gb') or '?'}GB)", file=sys.stderr)
+            return detected
+        print("SSH 未能自动识别（可能未配置免密登录），改为手动选择：", file=sys.stderr)
+
+    presets = [
+        ("1", "rtx4090-48", "RTX 4090 48GB（魔改）"),
+        ("2", "rtx5090", "RTX 5090 (32GB)"),
+        ("3", "rtx5080", "RTX 5080 (16GB)"),
+        ("4", "rx7900xtx", "RX 7900 XTX (24GB)"),
+        ("5", "r9700", "Radeon AI PRO R9700 (32GB)"),
+        ("6", "rtx3090", "RTX 3090 (24GB)"),
+        ("7", "rtx4080s-32", "RTX 4080 Super 32GB（魔改）"),
+        ("8", "m5ultra", "Mac M5 Ultra (80核)"),
+        ("9", "m5max40", "Mac M5 Max (40核)"),
+    ]
+    print("\n请选择目标推理机的显卡/芯片（选编号，或直接打字如「4090 48G」「双 7900 XTX」「M5 Ultra 256G」）：", file=sys.stderr)
+    print("  1) RTX 4090 48GB   2) RTX 5090        3) RTX 5080", file=sys.stderr)
+    print("  4) RX 7900 XTX     5) R9700 (32GB)    6) RTX 3090", file=sys.stderr)
+    print("  7) RTX 4080S 32GB  8) Mac M5 Ultra    9) Mac M5 Max", file=sys.stderr)
+
+    preset_map = {k: hid for k, hid, _ in presets}
+    raw_in = _ask("输入编号或硬件名称")
+    parsed: Dict[str, Any] = {}
+    if raw_in in preset_map:
+        parsed = parse_human_hardware(preset_map[raw_in])
+    elif raw_in:
+        parsed = parse_human_hardware(raw_in)
+
+    if parsed.get("hw_id"):
+        args.hw_id = parsed["hw_id"]
+    if parsed.get("hw_raw"):
+        args.hw_raw = parsed["hw_raw"]
+    if parsed.get("kind"):
+        args.hw_kind = parsed["kind"]
+    if parsed.get("gpu_count"):
+        args.gpu_count = parsed["gpu_count"]
+    if parsed.get("vram_gb"):
+        args.vram_gb = parsed["vram_gb"]
+    if parsed.get("ram_gb"):
+        args.ram_gb = parsed["ram_gb"]
+    if parsed.get("ram_type"):
+        args.ram_type = parsed["ram_type"]
+    if parsed.get("os"):
+        args.target_os = parsed["os"]
+
+    is_uni = args.hw_kind == "unified" or (args.hw_id in UNIFIED_IDS if args.hw_id else False)
+    if not is_uni:
+        if not args.gpu_count:
+            args.gpu_count = _ask_int("  几张卡", 1)
+        if not args.vram_gb:
+            args.vram_gb = _ask_int("  单卡显存 GB（不知道可回车跳过）")
+    if not args.ram_gb:
+        label = "  统一内存 GB（如 64 / 128 / 256）" if is_uni else "  系统内存 GB（如 64 / 128，不知道可回车跳过）"
+        args.ram_gb = _ask_int(label)
+    if not args.target_os:
+        os_ans = _ask("  目标机系统 (1=Linux / 2=Windows / 3=macOS，回车跳过)").lower()
+        os_map = {"1": "linux", "2": "windows", "3": "macos", "linux": "linux", "windows": "windows", "macos": "macos"}
+        if os_ans in os_map:
+            args.target_os = os_map[os_ans]
+    return None
 
 
 def run_interactive_wizard(args: argparse.Namespace, hw: Dict[str, Any], models: List[str]) -> Tuple[str, str]:
@@ -908,14 +1149,42 @@ def main(argv: Optional[List[str]] = None) -> int:
             models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
 
     remote = not is_local_endpoint(endpoint)
-    if remote and interactive and not args.hw_id and not args.hw_raw:
-        prompt_remote_hardware(args)
+    ssh_hw: Optional[Dict[str, Any]] = None
+    if remote and args.ssh:
+        ssh_hw = detect_hardware_via_ssh(args.ssh)
+        if ssh_hw:
+            print(f"已通过 SSH 自动识别远端硬件：{ssh_hw['hw_raw']} ×{ssh_hw['gpu_count']}", file=sys.stderr)
+        else:
+            print(f"Warning: 无法通过 SSH ({args.ssh}) 自动识别硬件。", file=sys.stderr)
+    if remote and interactive and not ssh_hw and not args.hw_id and not args.hw_raw:
+        ssh_hw = prompt_remote_hardware(args)
 
-    try:
-        hw = resolve_hardware(args, remote=remote)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
+    if ssh_hw:
+        hw = ssh_hw
+        if args.hw_kind:
+            hw["kind"] = args.hw_kind
+        if args.hw_id:
+            hw["hw_id"] = args.hw_id.lower()
+        if args.hw_raw:
+            hw["hw_raw"] = args.hw_raw
+        if args.gpu_count:
+            hw["gpu_count"] = args.gpu_count
+        if args.vram_gb:
+            hw["vram_gb"] = args.vram_gb
+        if args.ram_gb:
+            hw["ram_gb"] = args.ram_gb
+        if args.ram_type:
+            hw["ram_type"] = args.ram_type
+        if args.ram_channels:
+            hw["ram_channels"] = args.ram_channels
+        if args.target_os:
+            hw["os"] = args.target_os
+    else:
+        try:
+            hw = resolve_hardware(args, remote=remote)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
 
     if not models and not args.model:
         print("Error: could not determine model name. Pass --model <name>.", file=sys.stderr)

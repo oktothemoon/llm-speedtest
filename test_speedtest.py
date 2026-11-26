@@ -70,6 +70,41 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(hw["ram_gb"], 64)
         self.assertEqual(hw["os"], "linux")
 
+    def test_parse_human_hardware_casual_inputs(self):
+        r1 = speedtest.parse_human_hardware("4090 48G")
+        self.assertEqual(r1["hw_id"], "rtx4090-48")
+        self.assertEqual(r1["vram_gb"], 48)
+        self.assertEqual(r1["kind"], "gpu")
+
+        r2 = speedtest.parse_human_hardware("双 7900 XTX")
+        self.assertEqual(r2["hw_id"], "rx7900xtx")
+        self.assertEqual(r2["gpu_count"], 2)
+        self.assertEqual(r2["vram_gb"], 24)
+
+        r3 = speedtest.parse_human_hardware("2x 3090")
+        self.assertEqual(r3["hw_id"], "rtx3090")
+        self.assertEqual(r3["gpu_count"], 2)
+
+        r4 = speedtest.parse_human_hardware("M5 Ultra 256G")
+        self.assertEqual(r4["hw_id"], "m5ultra")
+        self.assertEqual(r4["kind"], "unified")
+        self.assertEqual(r4["ram_gb"], 256)
+        self.assertEqual(r4["os"], "macos")
+
+        r5 = speedtest.parse_human_hardware("4080S 32G")
+        self.assertEqual(r5["hw_id"], "rtx4080s-32")
+        self.assertEqual(r5["vram_gb"], 32)
+
+    def test_detect_hardware_via_ssh(self):
+        fake_linux = "OS=Linux\nARCH=x86_64\nNV=NVIDIA GeForce RTX 4090, 49152\nMEMKB=67108864\n"
+        with mock.patch.object(speedtest, "run_cmd", return_value=fake_linux):
+            hw = speedtest.detect_hardware_via_ssh("user@192.168.1.50")
+            self.assertEqual(hw["hw_id"], "rtx4090-48")
+            self.assertEqual(hw["vram_gb"], 48)
+            self.assertEqual(hw["ram_gb"], 64)
+            self.assertEqual(hw["os"], "linux")
+            self.assertEqual(hw["gpu_count"], 1)
+
 
 class EndToEndMockTests(unittest.TestCase):
     def setUp(self):
