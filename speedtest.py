@@ -1816,9 +1816,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if not args.yes:
-        ans = _ask(f"\n🚀 确认将这份实测成绩上传至 itbanana.com 速度天梯图吗？[y/N]", "N").lower()
-        if ans not in ("y", "yes"):
-            print("👋 已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
+        if not interactive:
+            print("未传入 --yes，跳过上传（如需自动上传请加 --yes）。", file=sys.stderr)
+            return 0
+        try:
+            ans = input("\n确认将这份实测成绩上传至 itbanana.com 速度天梯图？[Y/n，直接回车立即上榜]：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
+            return 0
+        if ans and ans not in ("y", "yes"):
+            print("已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
             return 0
 
     print("\n⏳ 正在将实测成绩刻入 itbanana.com 速度天梯图...", file=sys.stderr)

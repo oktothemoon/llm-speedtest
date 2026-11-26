@@ -301,8 +301,8 @@ class EndToEndMockTests(unittest.TestCase):
 
     def test_interactive_wizard_flow_and_ceremony(self):
         base = f"http://127.0.0.1:{self.port}"
-        # Pick model #2, one optional note line with kv int8, nickname, tuning note, confirm upload=y
-        answers = iter(["2", "DDR4 双通道 开MTP kv int8", "老曹", "Strata 0.2.15 + fa=on", "y"])
+        # Pick model #2, one optional note line with kv int8, nickname, tuning note, press Enter (default Y) to upload
+        answers = iter(["2", "DDR4 双通道 开MTP kv int8", "老曹", "Strata 0.2.15 + fa=on", ""])
         err_buf = io.StringIO()
         with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)), \
              mock.patch("sys.stderr", err_buf):
