@@ -15,43 +15,23 @@
 请先拉取或查看 https://github.com/oktothemoon/llm-speedtest 里的 SKILL.md，按里面的步骤帮我测一下我本地（或局域网）正在运行的本地大模型速度。先用 --non-interactive --dry-run 跑完，把成绩单和完整 JSON 发我确认后再决定是否上传。
 ```
 
-### 方式二：自己直接运行（带终端交互向导）
+### 方式二：自己直接运行（极简交互，基本只需回车）
 ```bash
 git clone https://github.com/oktothemoon/llm-speedtest.git
 cd llm-speedtest
 python3 speedtest.py
 ```
-在终端直接运行即可进入分步引导（自动识别显卡与本机服务，多模型可选、一路回车可用默认值，测完展示成绩单和明文 JSON 后再确认上传）。
+- **在本机跑**：自动识别显卡、内存、端口、模型与量化 → 按一下回车直接开始测速 → 测完看成绩单和明文 JSON，按 `y` 上传。
+- **测局域网另一台电脑**：直接跑 `python3 speedtest.py --endpoint <局域网IP或地址>`（只输纯 IP 也行，脚本会自动试常见端口和路径），然后**用一句话说清推理机配置**即可，例如：
+  - `4090 48G + 64G DDR4 Strata`
+  - `双 7900 XTX 128G DDR5`
+  - `M5 Ultra 256G`
+  - 或者填 `user@局域网IP`（免密 SSH 自动识别远端硬件，不会上传 SSH 地址）
 
-只想先本地跑一遍不上传，加 `--dry-run`：
+只想本地测完看看不上传，加 `--dry-run`：
 ```bash
 python3 speedtest.py --dry-run
 ```
-也可以全部用命令行参数传完直接跑（加 `--non-interactive` 或 `--yes` 跳过向导）：
-```bash
-python3 speedtest.py \
-  --endpoint http://127.0.0.1:8080/v1 \
-  --engine strata \
-  --quant "GSQ-RCO IQ3_S" \
-  --mtp true \
-  --ram-type DDR4 \
-  --ram-channels 2
-```
-
-### 跨局域网测另一台电脑（不用记任何参数）
-如果你的大模型跑在局域网另一台主机（把下面的地址换成你那台电脑的实际局域网 IP 即可），3 种方式任选：
-
-1. **直接交给你的 AI（最省事）**：把局域网地址和那台机器大概是什么卡告诉 AI，剩下的让 AI 帮你完成。
-2. **交互向导手动选（不用背参数，地址格式随便写）**：只输 IP、输 `IP:端口`、或者把聊天软件里配的完整地址（甚至带 `/chat/completions` 或自定义路径，不一定非得是 `/v1`）直接贴进来都行，脚本会自动探测常见端口和路径：
-   ```bash
-   python3 speedtest.py --endpoint <你的局域网IP或完整地址>
-   # 举例：--endpoint 192.168.31.88  或  --endpoint 192.168.31.88:11434  或  --endpoint http://10.0.0.5:9000/api/v1
-   ```
-   连上后按中文菜单选编号，或直接打人话（比如 `4090 48G`、`双 7900 XTX`、`M5 Ultra 256G`）即可。
-3. **配了 SSH 免密登录（全自动识别硬件）**：加上 `--ssh`，脚本自动通过只读命令识别远端硬件（SSH 地址不会被上传）：
-   ```bash
-   python3 speedtest.py --endpoint <你的局域网IP或完整地址> --ssh user@<你的局域网IP>
-   ```
 
 > 脚本检测到非本机地址时会自动关闭本机硬件探测，绝不会把你手里笔记本的配置错记成推理机配置。
 

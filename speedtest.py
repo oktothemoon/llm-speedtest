@@ -72,12 +72,98 @@ HW_DEFAULT_VRAM = {
 }
 
 
-def parse_human_hardware(text: str) -> Dict[str, Any]:
-    """Parse casual Chinese/English hardware text like '4090 48G', '双 7900 XTX', 'M5 Ultra 256G'."""
+def infer_engine_from_text(text: str) -> Optional[str]:
+    low = (text or "").lower()
+    if re.search(r"\bstrata\b", low):
+        return "strata"
+    if re.search(r"\b(?:llama\.?cpp|llamacpp|llama-server|ollama|lm\s*studio)\b", low):
+        return "llamacpp"
+    if re.search(r"\bvllm\b", low):
+        return "vllm"
+    if re.search(r"\bsglang\b", low):
+        return "sglang"
+    if re.search(r"\b(?:mlx|omlx|mlx-serve)\b", low):
+        return "mlx"
+    if re.search(r"\bmaya\b", low):
+        return "maya"
+    return None
+
+
+def infer_engine_auto(endpoint: str, model_name: str) -> Optional[str]:
+    """Best-effort engine guess from port or model name."""
+    try:
+        port = urllib.parse.urlparse(endpoint).port
+    except Exception:
+        port = None
+    if port in (11434, 1234):
+        return "llamacpp"
+    if "gsq-rco" in (model_name or "").lower():
+        return "strata"
+    return None
+
+
+def parse_human_note(text: str) -> Dict[str, Any]:
+    """Parse optional natural-language notes: RAM, DDR, channels, OS, engine, quant, MTP."""
     raw = (text or "").strip()
     if not raw:
         return {}
     low = raw.lower()
+    out: Dict[str, Any] = {}
+
+    eng = infer_engine_from_text(raw)
+    if eng:
+        out["engine"] = eng
+
+    q = infer_quant(raw)
+    if q:
+        out["quant"] = q
+
+    if re.search(r"(?:不开|关闭|关|no\s*|without\s*)mtp|mtp\s*=\s*(?:false|0|off)", low):
+        out["mtp"] = "false"
+    elif re.search(r"(?:开|开启)?\bmtp\b|开\s*mtp|mtp\s*=\s*(?:true|1|on)", low):
+        out["mtp"] = "true"
+
+    m_ddr = re.search(r"\b(ddr[345]|lpddr5x?)\b", low)
+    if m_ddr:
+        out["ram_type"] = m_ddr.group(1).upper()
+    elif "x99" in low:
+        out["ram_type"] = "DDR4"
+
+    if re.search(r"十二通道|12\s*(?:通道|ch)", low):
+        out["ram_channels"] = 12
+    elif re.search(r"八通道|8\s*(?:通道|ch)", low):
+        out["ram_channels"] = 8
+    elif re.search(r"四通道|4\s*(?:通道|ch)|\bx99\b|\bx299\b|quad", low):
+        out["ram_channels"] = 4
+    elif re.search(r"双通道|2\s*(?:通道|ch)|dual", low):
+        out["ram_channels"] = 2
+
+    if re.search(r"\b(?:linux|ubuntu|debian|arch|fedora|centos)\b", low):
+        out["os"] = "linux"
+    elif re.search(r"\b(?:win|windows|win11|win10)\b", low):
+        out["os"] = "windows"
+    elif re.search(r"\b(?:mac|macos|osx)\b", low):
+        out["os"] = "macos"
+
+    # Extract RAM GB when tied to DDR / RAM / 内存 / '+'
+    m_ram = (
+        re.search(r"(?:ddr[345]|lpddr5x?|内存|ram)\s*[:：]?\s*(\d{2,4})\s*g(?:b)?\b", low)
+        or re.search(r"(\d{2,4})\s*g(?:b)?\s*(?:ddr[345]|lpddr5x?|内存|ram)", low)
+        or re.search(r"[+＋]\s*(?:(?:ddr[345]|x99|x299|双通道|四通道|八通道)\s*)*(\d{2,4})\s*g(?:b)?\b", low)
+    )
+    if m_ram:
+        out["ram_gb"] = int(m_ram.group(1))
+    return out
+
+
+def parse_human_hardware(text: str) -> Dict[str, Any]:
+    """Parse a single casual line like '4090 48G + DDR4 64G Strata', '双 7900 XTX 128G', 'M5 Ultra 256G'."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    low = raw.lower()
+    note = parse_human_note(raw)
+
     if low in HW_ID_LABELS or low in UNIFIED_IDS:
         is_uni = low in UNIFIED_IDS
         out: Dict[str, Any] = {
@@ -104,14 +190,17 @@ def parse_human_hardware(text: str) -> Dict[str, Any]:
             if 1 <= c <= 16:
                 gpu_count = c
 
-    # Extract explicit GB number (e.g. "48G", "48GB", "256g")
-    gb_val = None
-    m_gb = re.search(r"(\d{2,4})\s*g(?:b)?\b", low)
-    if m_gb:
-        gb_val = int(m_gb.group(1))
+    # Remove explicit RAM segment before guessing GPU VRAM size so '5080 + 128G DDR5' doesn't treat 128 as VRAM
+    gpu_part = re.split(r"[+＋]", low, maxsplit=1)[0]
+    gpu_part_no_ram = re.sub(
+        r"(?:(?:ddr[345]|lpddr5x?|内存|ram)\s*\d{2,4}\s*g(?:b)?|\d{2,4}\s*g(?:b)?\s*(?:ddr[345]|lpddr5x?|内存|ram))",
+        " ",
+        gpu_part,
+    )
+    all_gbs = [int(x) for x in re.findall(r"(\d{2,4})\s*g(?:b)?\b", gpu_part_no_ram)]
 
     # Normalize common shorthands before mapping
-    norm = re.sub(r"4080\s*s\b", "4080 super", low)
+    norm = re.sub(r"4080\s*s\b", "4080 super", gpu_part)
     norm = re.sub(r"4070\s*ti\s*s\b", "4070 ti super", norm)
     norm = re.sub(r"4070\s*s\b", "4070 super", norm)
     norm = re.sub(r"7900\s*xtx", "7900 xtx", norm)
@@ -122,33 +211,50 @@ def parse_human_hardware(text: str) -> Dict[str, Any]:
     norm = re.sub(r"5060\s*ti", "5060 ti", norm)
     norm = re.sub(r"4060\s*ti", "4060 ti", norm)
 
+    # Decide VRAM candidate vs leftover RAM candidate
+    vram_cand = None
+    extra_ram = None
+    if len(all_gbs) >= 2:
+        vram_cand, extra_ram = all_gbs[0], all_gbs[1]
+    elif len(all_gbs) == 1:
+        g0 = all_gbs[0]
+        # Modded/variant VRAM sizes are <= 96GB; e.g. '5080 128G' means 128G RAM
+        if g0 <= 96 and not ("7900" in norm and g0 >= 64) and not ("3090" in norm and g0 >= 64) and not ("5080" in norm and g0 >= 64) and not ("5090" in norm and g0 >= 64) and not ("r9700" in norm and g0 >= 64):
+            vram_cand = g0
+        else:
+            extra_ram = g0
+
     hw_id = None
     if "ai max" in norm and "395" in norm:
         hw_id = "aimax395"
-    elif "dgx" in norm and "spark" in norm or "gb10" in norm:
+    elif ("dgx" in norm and "spark" in norm) or "gb10" in norm:
         hw_id = "dgxspark"
     else:
-        hw_id = map_apple_id(norm, None) or map_gpu_id(norm, gb_val)
+        hw_id = map_apple_id(norm, None) or map_gpu_id(norm, vram_cand)
 
     is_uni = bool(hw_id and hw_id in UNIFIED_IDS)
-    result: Dict[str, Any] = {
-        "kind": "unified" if is_uni else "gpu",
-        "hw_id": hw_id,
-        "hw_raw": HW_ID_LABELS.get(hw_id, raw) if hw_id else raw,
-    }
+    result: Dict[str, Any] = dict(note)
+    result["kind"] = "unified" if is_uni else "gpu"
+    result["hw_id"] = hw_id
+    result["hw_raw"] = HW_ID_LABELS.get(hw_id, raw) if hw_id else raw
     if gpu_count:
         result["gpu_count"] = gpu_count
     if is_uni:
         result["ram_type"] = "Unified"
-        if gb_val:
-            result["ram_gb"] = gb_val
+        if not result.get("ram_gb"):
+            if all_gbs:
+                result["ram_gb"] = all_gbs[0]
+            elif extra_ram:
+                result["ram_gb"] = extra_ram
         if hw_id and hw_id.startswith("m"):
             result["os"] = "macos"
     else:
-        if gb_val:
-            result["vram_gb"] = gb_val
+        if vram_cand:
+            result["vram_gb"] = vram_cand
         elif hw_id and hw_id in HW_DEFAULT_VRAM:
             result["vram_gb"] = HW_DEFAULT_VRAM[hw_id]
+        if not result.get("ram_gb") and extra_ram:
+            result["ram_gb"] = extra_ram
     return result
 
 
@@ -1052,147 +1158,112 @@ def _ask_int(prompt_text: str, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
-def prompt_remote_hardware(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
-    """Interactively collect remote/LAN server specs using friendly menu or casual text."""
-    print("\n检测到你连接的是局域网/远程推理服务，已关闭本机硬件探测，以免填错电脑配置。", file=sys.stderr)
-    ssh_in = _ask("如果能免密 SSH 登录那台机器，可输入 user@ip 自动识别硬件（不会上传）；否则直接回车手动选")
-    if ssh_in:
-        detected = detect_hardware_via_ssh(ssh_in)
-        if detected:
-            print(f"已通过 SSH 自动识别到：{detected['hw_raw']} ×{detected['gpu_count']} (RAM {detected.get('ram_gb') or '?'}GB)", file=sys.stderr)
-            return detected
-        print("SSH 未能自动识别（可能未配置免密登录），改为手动选择：", file=sys.stderr)
-
-    presets = [
-        ("1", "rtx4090-48", "RTX 4090 48GB（魔改）"),
-        ("2", "rtx5090", "RTX 5090 (32GB)"),
-        ("3", "rtx5080", "RTX 5080 (16GB)"),
-        ("4", "rx7900xtx", "RX 7900 XTX (24GB)"),
-        ("5", "r9700", "Radeon AI PRO R9700 (32GB)"),
-        ("6", "rtx3090", "RTX 3090 (24GB)"),
-        ("7", "rtx4080s-32", "RTX 4080 Super 32GB（魔改）"),
-        ("8", "m5ultra", "Mac M5 Ultra (80核)"),
-        ("9", "m5max40", "Mac M5 Max (40核)"),
-    ]
-    print("\n请选择目标推理机的显卡/芯片（选编号，或直接打字如「4090 48G」「双 7900 XTX」「M5 Ultra 256G」）：", file=sys.stderr)
-    print("  1) RTX 4090 48GB   2) RTX 5090        3) RTX 5080", file=sys.stderr)
-    print("  4) RX 7900 XTX     5) R9700 (32GB)    6) RTX 3090", file=sys.stderr)
-    print("  7) RTX 4080S 32GB  8) Mac M5 Ultra    9) Mac M5 Max", file=sys.stderr)
-
-    preset_map = {k: hid for k, hid, _ in presets}
-    raw_in = _ask("输入编号或硬件名称")
-    parsed: Dict[str, Any] = {}
-    if raw_in in preset_map:
-        parsed = parse_human_hardware(preset_map[raw_in])
-    elif raw_in:
-        parsed = parse_human_hardware(raw_in)
-
-    if parsed.get("hw_id"):
+def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed: Dict[str, Any]) -> None:
+    if parsed.get("hw_id") and not args.hw_id:
         args.hw_id = parsed["hw_id"]
-    if parsed.get("hw_raw"):
+    if parsed.get("hw_raw") and not args.hw_raw:
         args.hw_raw = parsed["hw_raw"]
-    if parsed.get("kind"):
+    if parsed.get("kind") and not args.hw_kind:
         args.hw_kind = parsed["kind"]
-    if parsed.get("gpu_count"):
+    if parsed.get("gpu_count") and not args.gpu_count:
         args.gpu_count = parsed["gpu_count"]
-    if parsed.get("vram_gb"):
+    if parsed.get("vram_gb") and not args.vram_gb:
         args.vram_gb = parsed["vram_gb"]
-    if parsed.get("ram_gb"):
+    if parsed.get("ram_gb") and not args.ram_gb:
         args.ram_gb = parsed["ram_gb"]
-    if parsed.get("ram_type"):
+        if hw is not None and not hw.get("ram_gb"):
+            hw["ram_gb"] = parsed["ram_gb"]
+    if parsed.get("ram_type") and not args.ram_type:
         args.ram_type = parsed["ram_type"]
-    if parsed.get("os"):
+        if hw is not None and not hw.get("ram_type"):
+            hw["ram_type"] = parsed["ram_type"]
+    if parsed.get("ram_channels") and not args.ram_channels:
+        args.ram_channels = parsed["ram_channels"]
+        if hw is not None and not hw.get("ram_channels"):
+            hw["ram_channels"] = parsed["ram_channels"]
+    if parsed.get("os") and not args.target_os:
         args.target_os = parsed["os"]
+        if hw is not None and not hw.get("os"):
+            hw["os"] = parsed["os"]
+    if parsed.get("engine") and not args.engine:
+        args.engine = parsed["engine"]
+    if parsed.get("quant") and not args.quant:
+        args.quant = parsed["quant"]
+    if parsed.get("mtp") is not None and args.mtp is None:
+        args.mtp = parsed["mtp"]
 
-    is_uni = args.hw_kind == "unified" or (args.hw_id in UNIFIED_IDS if args.hw_id else False)
-    if not is_uni:
-        if not args.gpu_count:
-            args.gpu_count = _ask_int("  几张卡", 1)
-        if not args.vram_gb:
-            args.vram_gb = _ask_int("  单卡显存 GB（不知道可回车跳过）")
-    if not args.ram_gb:
-        label = "  统一内存 GB（如 64 / 128 / 256）" if is_uni else "  系统内存 GB（如 64 / 128，不知道可回车跳过）"
-        args.ram_gb = _ask_int(label)
-    if not args.target_os:
-        os_ans = _ask("  目标机系统 (1=Linux / 2=Windows / 3=macOS，回车跳过)").lower()
-        os_map = {"1": "linux", "2": "windows", "3": "macos", "linux": "linux", "windows": "windows", "macos": "macos"}
-        if os_ans in os_map:
-            args.target_os = os_map[os_ans]
+
+def prompt_remote_hardware(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Minimal one-line prompt for LAN/remote server specs (supports casual sentence or user@ip SSH)."""
+    print("\n检测到是局域网/远程服务（已关闭本机硬件探测，避免填错成你手里这台电脑）。", file=sys.stderr)
+    raw_in = _ask(
+        "一句话描述推理机配置即可（例：4090 48G + 64G DDR4 Strata / 双 7900 XTX 128G / M5 Ultra 256G；或填 user@ip 自动读取）"
+    )
+    if not raw_in:
+        return None
+    # Detect SSH target like 'user@192.168.1.50'
+    if re.match(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$", raw_in):
+        detected = detect_hardware_via_ssh(raw_in)
+        if detected:
+            print(f"已自动识别远端硬件：{detected['hw_raw']} ×{detected['gpu_count']} (RAM {detected.get('ram_gb') or '?'}GB)", file=sys.stderr)
+            return detected
+        print("SSH 未能免密读取，改为一句话手动填：", file=sys.stderr)
+        raw_in = _ask("一句话描述推理机配置（例：4090 48G + 64G DDR4）")
+        if not raw_in:
+            return None
+
+    parsed = parse_human_hardware(raw_in)
+    _apply_parsed(args, None, parsed)
     return None
 
 
-def run_interactive_wizard(args: argparse.Namespace, hw: Dict[str, Any], models: List[str]) -> Tuple[str, str]:
-    """Fill in optional benchmark metadata interactively (Enter accepts defaults)."""
-    print("\n=== llm-speedtest 交互向导（一路回车可使用默认值） ===", file=sys.stderr)
-    vram_part = f", VRAM={hw['vram_gb']}GB" if hw.get("vram_gb") else ""
-    ram_part = f", RAM={hw['ram_gb']}GB" if hw.get("ram_gb") else ""
-    print(
-        f"硬件：{hw['hw_raw']} (id={hw['hw_id'] or '未收录'}, x{hw['gpu_count']}{vram_part}{ram_part})",
-        file=sys.stderr,
-    )
-
-    # 1. Model selection if multiple models are exposed
+def run_interactive_wizard(
+    args: argparse.Namespace, hw: Dict[str, Any], models: List[str], endpoint: str, remote: bool
+) -> Tuple[str, str]:
+    """Ultra-light interactive confirmation: at most 1–2 keypresses to start benchmarking."""
+    # 1. Pick model only if server exposes multiple models
     if args.model:
         model_name = args.model
     elif len(models) > 1:
-        print("\n检测到多个已加载模型，请选择要测速的模型：", file=sys.stderr)
+        print("\n检测到多个已加载模型，请选择：", file=sys.stderr)
         for idx, m in enumerate(models, 1):
             print(f"  {idx}) {m}", file=sys.stderr)
         pick = _ask_int("输入编号", 1) or 1
-        pick = min(max(1, pick), len(models))
-        model_name = models[pick - 1]
+        model_name = models[min(max(1, pick), len(models)) - 1]
     else:
         model_name = models[0]
-        print(f"模型：{model_name}", file=sys.stderr)
 
-    # 2. Engine
+    # Best-effort auto fill engine & quant so user doesn't have to type them
     if not args.engine:
-        eng_choices = ["strata", "llamacpp", "vllm", "sglang", "mlx", "maya"]
-        print("\n推理引擎（回车跳过）：", file=sys.stderr)
-        print("  1) strata   2) llamacpp (llama.cpp/Ollama/LM Studio)   3) vllm", file=sys.stderr)
-        print("  4) sglang   5) mlx   6) maya   或直接输入其他引擎名", file=sys.stderr)
-        ans = _ask("选择编号或输入名称")
-        if ans.isdigit() and 1 <= int(ans) <= len(eng_choices):
-            args.engine = eng_choices[int(ans) - 1]
-        elif ans:
-            args.engine = ans
+        args.engine = infer_engine_auto(endpoint, model_name)
+    guessed_q = args.quant or infer_quant(model_name)
 
-    # 3. Quant
-    if not args.quant:
-        guessed_q = infer_quant(model_name) or ""
-        q_ans = _ask("量化版本（如 GSQ-RCO IQ3_S / Q4_K_M / FP8，回车保留默认或跳过）", guessed_q)
-        if q_ans:
-            args.quant = q_ans
+    vram_part = f" {hw['vram_gb']}GB" if hw.get("vram_gb") and str(hw["vram_gb"]) not in str(hw.get("hw_raw", "")) else ""
+    ram_part = f" + {hw['ram_gb']}GB" if hw.get("ram_gb") else ""
+    ddr_part = f" {hw['ram_type']}" if hw.get("ram_type") else ""
+    eng_part = f" | 引擎: {args.engine}" if args.engine else ""
+    q_part = f" | 量化: {guessed_q}" if guessed_q else ""
+    print(
+        f"\n即将测速：{hw['hw_raw']}{vram_part} ×{hw['gpu_count']}{ram_part}{ddr_part} | 模型: {model_name}{q_part}{eng_part}",
+        file=sys.stderr,
+    )
 
-    # 4. MTP / speculative decoding
-    if args.mtp is None:
-        mtp_ans = _ask("是否开启 MTP / 推测解码？(y=开启 / n=关闭 / 回车跳过)").lower()
-        if mtp_ans in ("y", "yes", "true", "1"):
-            args.mtp = "true"
-        elif mtp_ans in ("n", "no", "false", "0"):
-            args.mtp = "false"
+    # For remote, user just gave a one-line description — start straight away without nagging!
+    # For local, offer ONE optional single-line supplement (Enter starts immediately).
+    if not remote:
+        missing = []
+        if not args.engine:
+            missing.append("引擎如 Strata/llama.cpp")
+        if hw.get("kind") == "gpu" and not hw.get("ram_type"):
+            missing.append("内存如 DDR4/DDR5")
+        if args.mtp is None:
+            missing.append("开MTP/不开MTP")
+        if missing:
+            extra = _ask(f"可选补充（如 {'、'.join(missing)}；直接回车立即开始测速）")
+            if extra:
+                _apply_parsed(args, hw, parse_human_note(extra))
 
-    # 5. RAM type & channels (for discrete GPUs when not already provided)
-    if hw.get("kind") == "gpu" and not hw.get("ram_type"):
-        print("\n系统内存规格（显存溢出时对速度影响很大，回车跳过）：", file=sys.stderr)
-        print("  1) DDR4 双通道   2) DDR5 双通道   3) X99/X299 四通道 DDR4", file=sys.stderr)
-        print("  4) X99 四通道 DDR3   5) 八通道 DDR4   6) 八通道 DDR5", file=sys.stderr)
-        ram_presets = {
-            "1": ("DDR4", 2), "2": ("DDR5", 2), "3": ("DDR4", 4),
-            "4": ("DDR3", 4), "5": ("DDR4", 8), "6": ("DDR5", 8),
-        }
-        r_ans = _ask("选择编号（或直接输入如 DDR4 / DDR5）")
-        if r_ans in ram_presets:
-            hw["ram_type"], hw["ram_channels"] = ram_presets[r_ans]
-        elif r_ans:
-            hw["ram_type"] = r_ans.upper()
-            ch = _ask_int("  内存通道数（如 2 / 4 / 8，回车跳过）")
-            if ch:
-                hw["ram_channels"] = ch
-
-    # 6. Context sizes
-    ctx_str = args.ctx if args.ctx is not None else _ask("测速上下文档位（多档用逗号分隔，如 1024,32768）", "1024")
-    return model_name, ctx_str or "1024"
+    return model_name, args.ctx or "1024"
 
 
 def print_summary(payload: Dict[str, Any]) -> None:
@@ -1288,10 +1359,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     if interactive:
-        model_name, ctx_str = run_interactive_wizard(args, hw, models)
+        model_name, ctx_str = run_interactive_wizard(args, hw, models, endpoint, remote)
     else:
         model_name = args.model or models[0]
         ctx_str = args.ctx or "1024"
+        if not args.engine:
+            args.engine = infer_engine_auto(endpoint, model_name)
 
     print(f"\nEndpoint: {endpoint}", file=sys.stderr)
     print(f"Model:    {model_name}", file=sys.stderr)

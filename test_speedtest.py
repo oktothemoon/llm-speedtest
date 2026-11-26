@@ -95,6 +95,23 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(r5["hw_id"], "rtx4080s-32")
         self.assertEqual(r5["vram_gb"], 32)
 
+        r6 = speedtest.parse_human_hardware("4090 48G + DDR4 64G 双通道 Strata 开MTP Linux")
+        self.assertEqual(r6["hw_id"], "rtx4090-48")
+        self.assertEqual(r6["vram_gb"], 48)
+        self.assertEqual(r6["ram_gb"], 64)
+        self.assertEqual(r6["ram_type"], "DDR4")
+        self.assertEqual(r6["ram_channels"], 2)
+        self.assertEqual(r6["engine"], "strata")
+        self.assertEqual(r6["mtp"], "true")
+        self.assertEqual(r6["os"], "linux")
+
+        r7 = speedtest.parse_human_hardware("5080 128G DDR5 不开MTP")
+        self.assertEqual(r7["hw_id"], "rtx5080")
+        self.assertEqual(r7["vram_gb"], 16)
+        self.assertEqual(r7["ram_gb"], 128)
+        self.assertEqual(r7["ram_type"], "DDR5")
+        self.assertEqual(r7["mtp"], "false")
+
     def test_detect_hardware_via_ssh(self):
         fake_linux = "OS=Linux\nARCH=x86_64\nNV=NVIDIA GeForce RTX 4090, 49152\nMEMKB=67108864\n"
         with mock.patch.object(speedtest, "run_cmd", return_value=fake_linux):
@@ -235,8 +252,8 @@ class EndToEndMockTests(unittest.TestCase):
 
     def test_interactive_wizard_flow(self):
         base = f"http://127.0.0.1:{self.port}"
-        # Answers: model #2, engine #1 (strata), accept default quant, mtp=y, ram #1 (DDR4 2ch), ctx default, confirm upload=y
-        answers = iter(["2", "1", "", "y", "1", "", "y"])
+        # Minimalist flow: pick model #2, one optional note line ("DDR4 双通道 开MTP"), confirm upload=y
+        answers = iter(["2", "DDR4 双通道 开MTP", "y"])
         with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)):
             rc = speedtest.main([
                 "--endpoint", f"{base}/v1",
