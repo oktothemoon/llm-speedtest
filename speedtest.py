@@ -1083,10 +1083,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def resolve_hardware(args: argparse.Namespace, remote: bool) -> Dict[str, Any]:
     """Build hardware spec. For remote/LAN endpoints, never mix in local machine hardware."""
     if remote:
-        hw: Dict[str, Any] = {
+        hw = {
             "kind": None,
             "hw_id": None,
             "hw_raw": None,
+            "detected_by": "manual",
             "gpu_count": 1,
             "vram_gb": None,
             "ram_gb": None,
@@ -1096,6 +1097,7 @@ def resolve_hardware(args: argparse.Namespace, remote: bool) -> Dict[str, Any]:
         }
     else:
         hw = detect_hardware()
+        hw["detected_by"] = "manual" if (args.hw_id or args.hw_raw) else "local"
 
     if args.hw_kind:
         hw["kind"] = args.hw_kind
@@ -1315,6 +1317,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     interactive = args.interactive or (sys.stdin.isatty() and not args.yes and not args.non_interactive)
 
+    print(
+        "🔒 隐私承诺：100% 开源零依赖，绝不收集用户名/主机名/路径/IP/SSH 账号/API Key；"
+        "上传前完整打印明文 JSON，欢迎让你的 AI 先检查源码。",
+        file=sys.stderr,
+    )
+
     # 1. Discover or confirm endpoint first (so we know whether it's local or LAN/remote)
     if args.endpoint:
         try:
@@ -1352,6 +1360,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if ssh_hw:
         hw = ssh_hw
+        hw["detected_by"] = "manual" if (args.hw_id or args.hw_raw) else "ssh"
         if args.hw_kind:
             hw["kind"] = args.hw_kind
         if args.hw_id:

@@ -320,7 +320,7 @@ class EndToEndMockTests(unittest.TestCase):
             self.assertEqual(probed["endpoint"], f"{base}/v1")
             self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", probed["models"])
 
-            # 4. Start benchmark job and wait for completion
+            # 4. Start benchmark job in local mode -> server MUST lock hardware to local auto-detect
             speedtest.http_json(f"{ui_base}/api/start", payload={
                 "endpoint": f"{base}/v1",
                 "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
@@ -329,18 +329,8 @@ class EndToEndMockTests(unittest.TestCase):
                 "mtp": True,
                 "ctx": "1024",
                 "runs": 2,
-                "remote": True,
-                "hardware": {
-                    "kind": "gpu",
-                    "hw_id": "rtx4090-48",
-                    "hw_raw": "RTX 4090 48GB",
-                    "gpu_count": 1,
-                    "vram_gb": 48,
-                    "ram_gb": 64,
-                    "ram_type": "DDR4",
-                    "ram_channels": 2,
-                    "os": "linux",
-                },
+                "remote": False,
+                "manual_hardware": {"hw_id": "rtx5090", "hw_raw": "Fake Tampered GPU"},
             }, headers=hdrs)
 
             st = {}
@@ -350,13 +340,45 @@ class EndToEndMockTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertEqual(st["state"], "done")
+            self.assertEqual(st["payload"]["hardware"]["detected_by"], "local")
+            self.assertNotEqual(st["payload"]["hardware"]["hw_raw"], "Fake Tampered GPU")
             self.assertEqual(st["payload"]["results"][0]["tg_tps"], 170.5)
 
-            # 5. Upload through UI backend
+            # 5. LAN mode via SSH -> server locks SSH hardware with detected_by='ssh'
+            fake_linux = "OS=Linux\nARCH=x86_64\nNV=NVIDIA GeForce RTX 4090, 49152\nMEMKB=67108864\n"
+            with mock.patch.object(speedtest, "run_cmd", return_value=fake_linux):
+                ssh_res = speedtest.http_json(f"{ui_base}/api/ssh-detect", payload={"ssh": "user@192.168.1.50"}, headers=hdrs)
+                self.assertEqual(ssh_res["hw"]["hw_id"], "rtx4090-48")
+                self.assertEqual(ssh_res["hw"]["detected_by"], "ssh")
+
+            speedtest.http_json(f"{ui_base}/api/start", payload={
+                "endpoint": f"{base}/v1",
+                "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
+                "quant": "GSQ-RCO IQ3_S",
+                "engine": "strata",
+                "mtp": True,
+                "ctx": "1024",
+                "runs": 2,
+                "remote": True,
+                "ram_type": "DDR4",
+                "ram_channels": 2,
+            }, headers=hdrs)
+            for _ in range(50):
+                st = speedtest.http_json(f"{ui_base}/api/status")
+                if st["state"] in ("done", "error"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(st["state"], "done")
+            self.assertEqual(st["payload"]["hardware"]["hw_id"], "rtx4090-48")
+            self.assertEqual(st["payload"]["hardware"]["detected_by"], "ssh")
+            self.assertEqual(st["payload"]["hardware"]["ram_type"], "DDR4")
+
+            # 6. Upload through UI backend
             up = speedtest.http_json(f"{ui_base}/api/upload", payload={"payload": st["payload"]}, headers=hdrs)
             self.assertTrue(up["ok"])
             self.assertEqual(len(self.uploaded), 1)
             self.assertEqual(self.uploaded[0]["hardware"]["hw_id"], "rtx4090-48")
+            self.assertEqual(self.uploaded[0]["hardware"]["detected_by"], "ssh")
         finally:
             ui_srv.shutdown()
             ui_srv.server_close()
