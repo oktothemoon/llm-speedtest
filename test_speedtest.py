@@ -2,6 +2,7 @@
 """Unit & end-to-end mock server tests for llm-speedtest."""
 
 import http.server
+import io
 import json
 import threading
 import time
@@ -42,7 +43,7 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(speedtest.map_model_id("DeepSeek-V4.1-Flash-UD-IQ4_XS"), "ds-v41-flash")
         self.assertEqual(speedtest.infer_quant("DeepSeek-V4.1-Flash-UD-IQ4_XS"), "UD-IQ4_XS")
 
-    def test_remote_endpoint_guard(self):
+    def test_local_only_endpoint_guard(self):
         self.assertTrue(speedtest.is_local_endpoint("http://127.0.0.1:8080/v1"))
         self.assertTrue(speedtest.is_local_endpoint("http://localhost:11434/v1"))
         self.assertTrue(speedtest.is_local_endpoint("http://[::1]:8080/v1"))
@@ -50,127 +51,87 @@ class MappingTests(unittest.TestCase):
         self.assertFalse(speedtest.is_local_endpoint("http://10.0.0.8:8000/v1"))
         self.assertFalse(speedtest.is_local_endpoint("http://gpu-box.local:8080/v1"))
 
-        # Remote endpoint without explicit hardware must be rejected in non-interactive mode
-        with mock.patch.object(speedtest, "resolve_endpoint", return_value=("http://192.168.1.50:8080/v1", ["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"])):
-            rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--non-interactive", "--dry-run"])
-            self.assertEqual(rc, 2)
+        # Any LAN / remote endpoint MUST be rejected with exit code 2
+        rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--non-interactive", "--dry-run"])
+        self.assertEqual(rc, 2)
 
-        # Remote endpoint WITH explicit hardware must not leak local OS / RAM
-        args = speedtest.parse_args([
-            "--endpoint", "http://192.168.1.50:8080/v1",
-            "--hw-id", "rtx4090-48",
-            "--ram-gb", "64",
-            "--ram-type", "DDR4",
-            "--os", "linux",
-        ])
-        hw = speedtest.resolve_hardware(args, remote=True)
-        self.assertEqual(hw["kind"], "gpu")
-        self.assertEqual(hw["hw_id"], "rtx4090-48")
-        self.assertEqual(hw["hw_raw"], "RTX 4090 48GB")
-        self.assertEqual(hw["ram_gb"], 64)
-        self.assertEqual(hw["os"], "linux")
+        with self.assertRaises(ValueError):
+            speedtest.resolve_endpoint("192.168.1.50:8080")
 
-    def test_parse_human_hardware_casual_inputs(self):
-        r1 = speedtest.parse_human_hardware("4090 48G")
-        self.assertEqual(r1["hw_id"], "rtx4090-48")
-        self.assertEqual(r1["vram_gb"], 48)
-        self.assertEqual(r1["kind"], "gpu")
+    def test_parse_human_note(self):
+        n1 = speedtest.parse_human_note("DDR4 双通道 Strata 开MTP kv int8")
+        self.assertEqual(n1["ram_type"], "DDR4")
+        self.assertEqual(n1["ram_channels"], 2)
+        self.assertEqual(n1["engine"], "strata")
+        self.assertEqual(n1["mtp"], "true")
+        self.assertEqual(n1["kv_cache"], "int8")
 
-        r2 = speedtest.parse_human_hardware("双 7900 XTX")
-        self.assertEqual(r2["hw_id"], "rx7900xtx")
-        self.assertEqual(r2["gpu_count"], 2)
-        self.assertEqual(r2["vram_gb"], 24)
+        n2 = speedtest.parse_human_note("DDR5 四通道 不开MTP llama.cpp Q4_K_M fp8 kv")
+        self.assertEqual(n2["ram_type"], "DDR5")
+        self.assertEqual(n2["ram_channels"], 4)
+        self.assertEqual(n2["engine"], "llamacpp")
+        self.assertEqual(n2["quant"], "Q4_K_M")
+        self.assertEqual(n2["mtp"], "false")
+        self.assertEqual(n2["kv_cache"], "fp8")
 
-        r3 = speedtest.parse_human_hardware("2x 3090")
-        self.assertEqual(r3["hw_id"], "rtx3090")
-        self.assertEqual(r3["gpu_count"], 2)
-
-        r4 = speedtest.parse_human_hardware("M5 Ultra 256G")
-        self.assertEqual(r4["hw_id"], "m5ultra")
-        self.assertEqual(r4["kind"], "unified")
-        self.assertEqual(r4["ram_gb"], 256)
-        self.assertEqual(r4["os"], "macos")
-
-        r5 = speedtest.parse_human_hardware("4080S 32G")
-        self.assertEqual(r5["hw_id"], "rtx4080s-32")
-        self.assertEqual(r5["vram_gb"], 32)
-
-        r6 = speedtest.parse_human_hardware("4090 48G + DDR4 64G 双通道 Strata 开MTP Linux")
-        self.assertEqual(r6["hw_id"], "rtx4090-48")
-        self.assertEqual(r6["vram_gb"], 48)
-        self.assertEqual(r6["ram_gb"], 64)
-        self.assertEqual(r6["ram_type"], "DDR4")
-        self.assertEqual(r6["ram_channels"], 2)
-        self.assertEqual(r6["engine"], "strata")
-        self.assertEqual(r6["mtp"], "true")
-        self.assertEqual(r6["os"], "linux")
-
-        r7 = speedtest.parse_human_hardware("5080 128G DDR5 不开MTP")
-        self.assertEqual(r7["hw_id"], "rtx5080")
-        self.assertEqual(r7["vram_gb"], 16)
-        self.assertEqual(r7["ram_gb"], 128)
-        self.assertEqual(r7["ram_type"], "DDR5")
-        self.assertEqual(r7["mtp"], "false")
-
-    def test_detect_hardware_via_ssh(self):
-        fake_linux = "OS=Linux\nARCH=x86_64\nNV=NVIDIA GeForce RTX 4090, 49152\nMEMKB=67108864\n"
-        with mock.patch.object(speedtest, "run_cmd", return_value=fake_linux):
-            hw = speedtest.detect_hardware_via_ssh("user@192.168.1.50")
-            self.assertEqual(hw["hw_id"], "rtx4090-48")
-            self.assertEqual(hw["vram_gb"], 48)
-            self.assertEqual(hw["ram_gb"], 64)
-            self.assertEqual(hw["os"], "linux")
-            self.assertEqual(hw["gpu_count"], 1)
-
-        # AMD ROCm Linux host over SSH (Radeon AI PRO R9700 32GB via rocm-smi + sysfs VRAM)
-        fake_rocm = (
-            "OS=Linux\nARCH=x86_64\n"
-            "ROCM=device,Card Series,Card Model,Card Vendor,Card SKU\n"
-            "ROCM=card0,AMD Radeon AI PRO R9700,0x7550,Advanced Micro Devices,D70201\n"
-            "VRAM_B=34342961152\n"
-            "MEMKB=67108864\n"
+    def test_ctx_tiers_and_kv_cache_helpers(self):
+        self.assertEqual(
+            speedtest.parse_ctx_list("1k,32k,64k,128k,256k"),
+            [1024, 32768, 65536, 131072, 262144],
         )
-        with mock.patch.object(speedtest, "run_cmd", return_value=fake_rocm):
-            hw_amd = speedtest.detect_hardware_via_ssh("user@192.168.1.60")
-            self.assertEqual(hw_amd["hw_id"], "r9700")
-            self.assertEqual(hw_amd["hw_raw"], "AMD Radeon AI PRO R9700")
-            self.assertEqual(hw_amd["vram_gb"], 32)
-            self.assertEqual(hw_amd["ram_gb"], 64)
-            self.assertEqual(hw_amd["gpu_count"], 1)
+        self.assertEqual(speedtest.parse_ctx_list(None), [1024, 32768, 65536, 131072, 262144])
+        self.assertEqual(speedtest.format_ctx_label(1024), "1k")
+        self.assertEqual(speedtest.format_ctx_label(65536), "64k")
+        self.assertEqual(speedtest.format_ctx_label(262144), "256k")
+        self.assertEqual(speedtest.effective_runs_for_ctx(1024, 3), 3)
+        self.assertEqual(speedtest.effective_runs_for_ctx(32768, 3), 2)
+        self.assertEqual(speedtest.effective_runs_for_ctx(65536, 3), 1)
+        self.assertEqual(speedtest.effective_runs_for_ctx(262144, 3), 1)
+        self.assertEqual(speedtest.normalize_kv_cache("FP16"), "f16")
+        self.assertEqual(speedtest.normalize_kv_cache("int8"), "int8")
+        self.assertEqual(speedtest.normalize_kv_cache("q8"), "q8_0")
+        self.assertEqual(speedtest.normalize_kv_cache("q8_0/q4_0"), "q8_0/q4_0")
 
-        # AMD Navi 48 generic lspci + 32GB VRAM -> maps to r9700 cleanly
-        fake_pci = (
-            "OS=Linux\nARCH=x86_64\n"
-            "PCI=03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT] (rev c0)\n"
-            "VRAM_B=34359738368\n"
-            "MEMKB=134217728\n"
-        )
-        with mock.patch.object(speedtest, "run_cmd", return_value=fake_pci):
-            hw_pci = speedtest.detect_hardware_via_ssh("user@192.168.1.61")
-            self.assertEqual(hw_pci["hw_id"], "r9700")
-            self.assertEqual(hw_pci["vram_gb"], 32)
-            self.assertEqual(hw_pci["ram_gb"], 128)
+    def test_parse_linux_non_nvidia_gpus(self):
+        rocm = [
+            "device,Card Series,Card Model,Card Vendor,Card SKU",
+            "card0,AMD Radeon AI PRO R9700,0x7550,Advanced Micro Devices,D70201",
+        ]
+        gpus = speedtest.parse_linux_non_nvidia_gpus(rocm, [], [], [], [34342961152])
+        self.assertEqual(len(gpus), 1)
+        self.assertEqual(gpus[0][0], "AMD Radeon AI PRO R9700")
+        self.assertEqual(gpus[0][1], 32)
+        self.assertEqual(speedtest.map_gpu_id(*gpus[0]), "r9700")
 
-    def test_endpoint_candidates_flexible_inputs(self):
-        # Bare IP -> tries reverse proxy + common ports with /v1 and without /v1
-        c1 = speedtest.endpoint_candidates("192.168.31.88")
-        self.assertIn("http://192.168.31.88/v1", c1)
-        self.assertIn("http://192.168.31.88:8080/v1", c1)
-        self.assertIn("http://192.168.31.88:11434/v1", c1)
-        self.assertIn("http://192.168.31.88:8080", c1)
+        pci = [
+            "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT] (rev c0)"
+        ]
+        gpus_pci = speedtest.parse_linux_non_nvidia_gpus([], [], [], pci, [34359738368])
+        self.assertEqual(len(gpus_pci), 1)
+        self.assertEqual(speedtest.map_gpu_id(*gpus_pci[0]), "r9700")
 
-        # IP:port without scheme or /v1
-        c2 = speedtest.endpoint_candidates("192.168.31.88:11434")
-        self.assertEqual(c2, ["http://192.168.31.88:11434/v1", "http://192.168.31.88:11434"])
+    def test_endpoint_candidates_local_inputs(self):
+        # Bare port number -> 127.0.0.1:<port>
+        self.assertEqual(speedtest.endpoint_candidates("8080"), ["http://127.0.0.1:8080/v1", "http://127.0.0.1:8080"])
+        self.assertEqual(speedtest.endpoint_candidates(":11434"), ["http://127.0.0.1:11434/v1", "http://127.0.0.1:11434"])
+
+        # localhost:port without scheme or /v1
+        c2 = speedtest.endpoint_candidates("localhost:11434")
+        self.assertEqual(c2, ["http://localhost:11434/v1", "http://localhost:11434"])
 
         # Full chat/completions URL pasted from another app
-        c3 = speedtest.endpoint_candidates("http://10.0.0.5:9000/v1/chat/completions")
-        self.assertEqual(c3, ["http://10.0.0.5:9000/v1"])
+        c3 = speedtest.endpoint_candidates("http://127.0.0.1:9000/v1/chat/completions")
+        self.assertEqual(c3, ["http://127.0.0.1:9000/v1"])
 
-        # Custom prefix (non-/v1) preserved first
-        c4 = speedtest.endpoint_candidates("https://llm.lan/api/openai/")
-        self.assertEqual(c4[0], "https://llm.lan/api/openai")
-        self.assertEqual(c4[1], "https://llm.lan/api/openai/v1")
+    def test_prompt_launch_mode(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertEqual(speedtest.prompt_launch_mode(), "cli")
+        with mock.patch("builtins.input", return_value="1"):
+            self.assertEqual(speedtest.prompt_launch_mode(), "cli")
+        with mock.patch("builtins.input", return_value="2"):
+            self.assertEqual(speedtest.prompt_launch_mode(), "ui")
+        with mock.patch("builtins.input", return_value="ui"):
+            self.assertEqual(speedtest.prompt_launch_mode(), "ui")
 
 
 class EndToEndMockTests(unittest.TestCase):
@@ -185,7 +146,9 @@ class EndToEndMockTests(unittest.TestCase):
                 pass
 
             def do_GET(self):
-                if self.path == "/v1/models":
+                if self.path == "/props":
+                    self._send_json(200, {"default_generation_settings": {"n_ctx": 270000}})
+                elif self.path == "/v1/models":
                     self._send_json(200, {"data": [
                         {"id": "Qwen3.8-27B-Q4_K_M"},
                         {"id": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"},
@@ -204,6 +167,7 @@ class EndToEndMockTests(unittest.TestCase):
                 length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 if self.path == "/v1/chat/completions":
+                    prompt_len = max(1, round(len(body["messages"][0]["content"]) / 4))
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()
@@ -214,9 +178,9 @@ class EndToEndMockTests(unittest.TestCase):
                         time.sleep(0.002)
                     final = {
                         "choices": [],
-                        "usage": {"prompt_tokens": 1024, "completion_tokens": 20},
+                        "usage": {"prompt_tokens": prompt_len, "completion_tokens": 20},
                         "timings": {
-                            "prompt_n": 1024,
+                            "prompt_n": prompt_len,
                             "predicted_n": 20,
                             "prompt_per_second": 3800.0,
                             "predicted_per_second": 170.5,
@@ -284,13 +248,14 @@ class EndToEndMockTests(unittest.TestCase):
             "--ram-type", "DDR4",
             "--ram-channels", "2",
             "--engine", "strata",
+            "--kv-cache", "int8",
             "--mtp", "true",
             "--fit", "hybrid",
             "--name", "老曹",
             "--note", "Strata 0.2.15 + fa=on",
-            "--ctx", "1024",
+            "--ctx", "1k,32k,64k,128k,256k",
             "--gen-tokens", "20",
-            "--runs", "2",
+            "--runs", "1",
             "--no-warmup",
             "--yes",
             "--submit-url", f"{base}/api/llm-speedtest/submit",
@@ -301,25 +266,33 @@ class EndToEndMockTests(unittest.TestCase):
         p = self.uploaded[0]
         self.assertEqual(p["schema_version"], 1)
         self.assertEqual(p["hardware"]["hw_id"], "rtx4090-48")
+        self.assertEqual(p["software"]["kv_cache"], "int8")
+        self.assertEqual(p["software"]["ctx_limit"], 270000)
         self.assertEqual(p["model"]["model_id"], "qwen38-flash-next")
         self.assertEqual(p["model"]["quant"], "GSQ-RCO IQ3_S")
+        self.assertEqual(len(p["results"]), 5)
+        self.assertEqual([speedtest.format_ctx_label(r["ctx_prompt"]) for r in p["results"]], ["1k", "32k", "64k", "128k", "256k"])
         self.assertEqual(p["results"][0]["tg_tps"], 170.5)
         self.assertEqual(p["results"][0]["source"], "timings")
         self.assertEqual(p["nickname"], "老曹")
         self.assertEqual(p["note"], "Strata 0.2.15 + fa=on")
         self.assertTrue(self.user_agents and self.user_agents[0].startswith("llm-speedtest/"))
 
-    def test_interactive_wizard_flow(self):
+    def test_interactive_wizard_flow_and_ceremony(self):
         base = f"http://127.0.0.1:{self.port}"
-        # Minimalist flow: pick model #2, one optional note line ("DDR4 双通道 开MTP"), confirm upload=y
-        answers = iter(["2", "DDR4 双通道 开MTP", "y"])
-        with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)):
+        # Pick model #2, one optional note line with kv int8, nickname, tuning note, confirm upload=y
+        answers = iter(["2", "DDR4 双通道 开MTP kv int8", "老曹", "Strata 0.2.15 + fa=on", "y"])
+        err_buf = io.StringIO()
+        with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)), \
+             mock.patch("sys.stderr", err_buf):
             rc = speedtest.main([
                 "--endpoint", f"{base}/v1",
                 "--hw-id", "rtx4090-48",
                 "--hw-raw", "NVIDIA GeForce RTX 4090",
                 "--vram-gb", "48",
                 "--ram-gb", "64",
+                "--ctx", "1k,64k",
+                "--ctx-limit", "70000",
                 "--gen-tokens", "20",
                 "--runs", "2",
                 "--no-warmup",
@@ -333,9 +306,17 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["model"]["model_id"], "qwen38-flash-next")
         self.assertEqual(p["model"]["quant"], "GSQ-RCO IQ3_S")
         self.assertEqual(p["software"]["engine"], "strata")
+        self.assertEqual(p["software"]["kv_cache"], "int8")
         self.assertEqual(p["software"]["mtp"], True)
         self.assertEqual(p["hardware"]["ram_type"], "DDR4")
         self.assertEqual(p["hardware"]["ram_channels"], 2)
+        self.assertEqual(p["nickname"], "老曹")
+        self.assertEqual(p["note"], "Strata 0.2.15 + fa=on")
+        self.assertEqual(len(p["results"]), 2)
+        err_text = err_buf.getvalue()
+        self.assertIn("新王登基", err_text)
+        self.assertIn("实测编号 #1", err_text)
+        self.assertIn("https://itbanana.com/llm-speed?highlight=1", err_text)
 
     def test_local_web_ui_end_to_end(self):
         import urllib.error
@@ -356,11 +337,13 @@ class EndToEndMockTests(unittest.TestCase):
         t = threading.Thread(target=ui_srv.serve_forever, daemon=True)
         t.start()
         try:
-            # 1. GET / serves HTML containing session token
+            # 1. GET / serves local-only HTML containing session token (no LAN/SSH tabs)
             with urllib.request.urlopen(f"{ui_base}/") as resp:
                 html = resp.read().decode("utf-8")
                 self.assertIn("llm-speedtest", html)
                 self.assertIn(token, html)
+                self.assertNotIn("tab-lan", html)
+                self.assertNotIn("api/ssh-detect", html)
 
             # 2. POST without token is rejected (403)
             bad_req = urllib.request.Request(
@@ -374,22 +357,29 @@ class EndToEndMockTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 403)
 
             hdrs = {"X-Speedtest-Token": token}
-            # 3. Probe mock inference server
-            probed = speedtest.http_json(f"{ui_base}/api/probe", payload={"endpoint": f"127.0.0.1:{self.port}"}, headers=hdrs)
+
+            # 3. Probing a LAN/remote IP is rejected (400)
+            with self.assertRaises(urllib.error.HTTPError) as ctx_lan:
+                speedtest.http_json(f"{ui_base}/api/probe", payload={"endpoint": "192.168.1.50:8080"}, headers=hdrs)
+            self.assertEqual(ctx_lan.exception.code, 400)
+
+            # 4. Probe local mock inference server using bare port number
+            probed = speedtest.http_json(f"{ui_base}/api/probe", payload={"endpoint": str(self.port)}, headers=hdrs)
             self.assertEqual(probed["endpoint"], f"{base}/v1")
             self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", probed["models"])
 
-            # 4. Start benchmark job in local mode -> server MUST lock hardware to local auto-detect
+            # 5. Start benchmark job -> server MUST lock hardware to local auto-detect
             speedtest.http_json(f"{ui_base}/api/start", payload={
                 "endpoint": f"{base}/v1",
                 "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
                 "quant": "GSQ-RCO IQ3_S",
                 "engine": "strata",
+                "kv_cache": "int8",
                 "mtp": True,
-                "ctx": "1024",
-                "runs": 2,
-                "remote": False,
-                "manual_hardware": {"hw_id": "rtx5090", "hw_raw": "Fake Tampered GPU"},
+                "ctx": "1k,32k,64k",
+                "runs": 1,
+                "ram_type": "DDR4",
+                "ram_channels": 2,
             }, headers=hdrs)
 
             st = {}
@@ -400,44 +390,16 @@ class EndToEndMockTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertEqual(st["state"], "done")
             self.assertEqual(st["payload"]["hardware"]["detected_by"], "local")
-            self.assertNotEqual(st["payload"]["hardware"]["hw_raw"], "Fake Tampered GPU")
+            self.assertEqual(st["payload"]["software"]["kv_cache"], "int8")
+            self.assertEqual(st["payload"]["software"]["ctx_limit"], 270000)
+            self.assertEqual(len(st["payload"]["results"]), 3)
             self.assertEqual(st["payload"]["results"][0]["tg_tps"], 170.5)
-
-            # 5. LAN mode via SSH -> server locks SSH hardware with detected_by='ssh'
-            fake_linux = "OS=Linux\nARCH=x86_64\nNV=NVIDIA GeForce RTX 4090, 49152\nMEMKB=67108864\n"
-            with mock.patch.object(speedtest, "run_cmd", return_value=fake_linux):
-                ssh_res = speedtest.http_json(f"{ui_base}/api/ssh-detect", payload={"ssh": "user@192.168.1.50"}, headers=hdrs)
-                self.assertEqual(ssh_res["hw"]["hw_id"], "rtx4090-48")
-                self.assertEqual(ssh_res["hw"]["detected_by"], "ssh")
-
-            speedtest.http_json(f"{ui_base}/api/start", payload={
-                "endpoint": f"{base}/v1",
-                "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
-                "quant": "GSQ-RCO IQ3_S",
-                "engine": "strata",
-                "mtp": True,
-                "ctx": "1024",
-                "runs": 2,
-                "remote": True,
-                "ram_type": "DDR4",
-                "ram_channels": 2,
-            }, headers=hdrs)
-            for _ in range(50):
-                st = speedtest.http_json(f"{ui_base}/api/status")
-                if st["state"] in ("done", "error"):
-                    break
-                time.sleep(0.05)
-            self.assertEqual(st["state"], "done")
-            self.assertEqual(st["payload"]["hardware"]["hw_id"], "rtx4090-48")
-            self.assertEqual(st["payload"]["hardware"]["detected_by"], "ssh")
-            self.assertEqual(st["payload"]["hardware"]["ram_type"], "DDR4")
 
             # 6. Upload through UI backend
             up = speedtest.http_json(f"{ui_base}/api/upload", payload={"payload": st["payload"]}, headers=hdrs)
             self.assertTrue(up["ok"])
             self.assertEqual(len(self.uploaded), 1)
-            self.assertEqual(self.uploaded[0]["hardware"]["hw_id"], "rtx4090-48")
-            self.assertEqual(self.uploaded[0]["hardware"]["detected_by"], "ssh")
+            self.assertEqual(self.uploaded[0]["hardware"]["detected_by"], "local")
         finally:
             ui_srv.shutdown()
             ui_srv.server_close()

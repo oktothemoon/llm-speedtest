@@ -20,21 +20,10 @@ from typing import Any, Dict, List, Optional
 
 
 PRIVACY_BANNER_CLI = (
-    "🔒 隐私承诺：本工具 100% 开源、零第三方依赖，仅采集硬件规格与推理速度，\n"
-    "   绝不收集用户名、主机名、文件路径、IP、SSH 账号、API Key 或任何个人数据。\n"
+    "🔒 隐私承诺：本工具 100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
+    "   绝不收集用户名、主机名、文件路径、原始 IP、API Key 或任何个人数据。\n"
     "   上传前会展示完整明文 JSON，欢迎直接把源码交给你的 AI 审计后再运行。"
 )
-
-
-def _catalog_items(st: Any) -> Dict[str, Any]:
-    gpus = []
-    unified = []
-    for hid, label in st.HW_ID_LABELS.items():
-        if hid in st.UNIFIED_IDS:
-            unified.append({"id": hid, "label": label})
-        else:
-            gpus.append({"id": hid, "label": label, "vram_gb": st.HW_DEFAULT_VRAM.get(hid)})
-    return {"gpus": gpus, "unified": unified}
 
 
 def _render_html(token: str, default_submit_url: str) -> str:
@@ -164,6 +153,10 @@ def _render_html(token: str, default_submit_url: str) -> str:
   .metric {{ background: #f9fafb; border: 1px solid var(--line); border-radius: 10px; padding: 12px; text-align: center; }}
   .metric .v {{ font-size: 24px; font-weight: 700; color: var(--accent); }}
   .metric .k {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
+  .tier-table {{ width: 100%; border-collapse: collapse; margin: 10px 0 4px; font-size: 13px; }}
+  .tier-table th, .tier-table td {{ padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; }}
+  .tier-table th {{ color: var(--muted); font-weight: 600; font-size: 12px; background: #f9fafb; }}
+  .tier-table td.num {{ font-variant-numeric: tabular-nums; font-weight: 600; color: var(--accent); }}
   pre {{
     background: #111827; color: #e5e7eb; padding: 12px 14px; border-radius: 10px;
     font-size: 12px; overflow-x: auto; max-height: 280px; margin: 10px 0 12px;
@@ -221,45 +214,30 @@ def _render_html(token: str, default_submit_url: str) -> str:
   <header>
     <div>
       <h1>llm-speedtest</h1>
-      <div class="sub">本地大模型标准化测速 · 实时上榜 itbanana.com/llm-speed &amp; /llm-hardware</div>
+      <div class="sub">本机大模型标准化测速 · 实时上榜 itbanana.com/llm-speed &amp; /llm-hardware</div>
     </div>
-    <div class="seg" role="tablist">
-      <button id="tab-local" class="active" type="button">测本机（推荐）</button>
-      <button id="tab-lan" type="button">测局域网另一台电脑</button>
-    </div>
+    <span class="badge">🔒 仅限本机实测认证</span>
   </header>
 
   <div class="trust">
     <strong>🔒 零个人数据承诺（欢迎交给你的 AI 检查源码）：</strong>
-    本工具 100% 开源、纯 Python 标准库零第三方依赖，仅采集硬件型号与测速数值，<strong>绝不收集</strong>用户名、主机名、本地路径、原始 IP、SSH 账号或 API Key。测速完成后可先完整审查下方明文 JSON，点击确认才会上传。
+    本工具 100% 开源、纯 Python 标准库零第三方依赖，仅采集本机硬件型号与测速数值，<strong>绝不收集</strong>用户名、主机名、本地路径、原始 IP 或 API Key。测速完成后可先完整审查下方明文 JSON，点击确认才会上传。
   </div>
 
   <!-- Step 1: Server & Model -->
   <section class="card">
     <div class="card-title">
-      <span>1. 推理服务与模型</span>
+      <span>1. 本机推理服务与模型</span>
       <span id="conn-badge" class="sub">检测中...</span>
     </div>
 
     <div id="local-bar">
       <div class="row row-1">
         <div>
-          <label for="local-endpoint">本机接口地址（已自动扫描，如有自定义端口可修改后点重新检测）</label>
+          <label for="local-endpoint">本机接口地址（已自动扫描，如有自定义端口可直接填端口号如 8080 或完整地址后点重新检测）</label>
           <div class="inline">
-            <input id="local-endpoint" placeholder="http://127.0.0.1:8080/v1" />
+            <input id="local-endpoint" placeholder="http://127.0.0.1:8080/v1 或端口号 8080" />
             <button id="btn-local-probe" class="btn btn-ghost" type="button">重新检测</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div id="lan-bar" class="hidden">
-      <div class="row row-1">
-        <div>
-          <label for="endpoint-input">局域网推理机 IP 或接口地址（直接填 IP 也行，自动探测端口与路径）</label>
-          <div class="inline">
-            <input id="endpoint-input" placeholder="例如 192.168.31.88 或 192.168.31.88:11434 或完整 URL" />
-            <button id="btn-probe" class="btn btn-primary" type="button">连接</button>
           </div>
         </div>
       </div>
@@ -282,8 +260,8 @@ def _render_html(token: str, default_submit_url: str) -> str:
   <!-- Step 2: Hardware & Software -->
   <section class="card">
     <div class="card-title">
-      <span>2. 硬件与推理配置</span>
-      <span id="hw-hint" class="sub"></span>
+      <span>2. 本机硬件与推理配置</span>
+      <span id="hw-hint" class="sub">本机硬件已锁定</span>
     </div>
 
     <!-- Local mode: strictly locked auto-detected hardware -->
@@ -298,100 +276,36 @@ def _render_html(token: str, default_submit_url: str) -> str:
       </div>
     </div>
 
-    <!-- LAN mode: guide SSH first, manual selection as secondary fallback -->
-    <div id="lan-hw-view" class="hidden">
-      <div class="ssh-box">
-        <div class="locked-head" style="margin-bottom:8px;">
-          <strong style="font-size:14px;">推荐方式：通过 SSH 自动读取推理机硬件</strong>
-          <span class="badge">自动锁定 · 直接采信</span>
-        </div>
-        <div class="sub" style="margin-bottom:8px;">
-          为防止手动填错，局域网测速<strong>优先推荐 SSH 只读采集</strong>（或直接到推理机本机运行本脚本）。SSH 地址仅在本地使用，绝不上传。
-        </div>
-        <div class="inline">
-          <input id="ssh-input" placeholder="输入推理机 SSH 地址，例如 user@192.168.31.88" />
-          <button id="btn-ssh" class="btn btn-primary" type="button">SSH 读取硬件</button>
-        </div>
-        <div id="ssh-err" class="banner banner-err hidden" style="margin-top:8px;margin-bottom:0;"></div>
+    <!-- Optional supplementary fields (engine, KV cache, RAM DDR type, MTP) -->
+    <div class="row" style="margin-top:12px;">
+      <div>
+        <label for="engine-select">推理引擎（选填）</label>
+        <select id="engine-select">
+          <option value="">不确定 / 跳过</option>
+          <option value="strata">Strata</option>
+          <option value="llamacpp">llama.cpp / Ollama / LM Studio</option>
+          <option value="vllm">vLLM</option>
+          <option value="sglang">SGLang</option>
+          <option value="mlx">MLX / oMLX / mlx-serve</option>
+          <option value="maya">Project Maya</option>
+        </select>
       </div>
-
-      <div id="ssh-locked-box" class="locked-box hidden">
-        <div class="locked-head">
-          <span class="badge">🔒 已通过 SSH 采集并锁定（不可篡改）</span>
-          <button id="btn-ssh-clear" class="btn btn-ghost" style="padding:3px 10px;font-size:12px;" type="button">重新读取</button>
-        </div>
-        <div class="locked-main" id="ssh-hw-main"></div>
-        <div class="locked-meta" id="ssh-hw-meta"></div>
+      <div>
+        <label for="kv-select">KV Cache 精度（选填，长上下文关键参数）</label>
+        <select id="kv-select">
+          <option value="">不确定 / 跳过</option>
+          <option value="f16">F16 / FP16（默认不量化）</option>
+          <option value="bf16">BF16</option>
+          <option value="fp8">FP8</option>
+          <option value="int8">INT8</option>
+          <option value="q8_0">Q8_0（llama.cpp 8-bit）</option>
+          <option value="q4_0">Q4_0（llama.cpp 4-bit）</option>
+          <option value="int4">INT4</option>
+        </select>
       </div>
-
-      <details id="manual-hw-details">
-        <summary>推理机未开启 SSH（如 Windows）？点此手动选择硬件（提交后会标记为人工自填，经复核后计入统计）</summary>
-        <div style="margin-top:12px;">
-          <div class="banner banner-warn">
-            手动选择的硬件会标记 <code>detected_by: "manual"</code>，先进入人工复核队列，不会直接混入自动采信数据。同 IP 会记住上次选择。
-          </div>
-          <label>热门配置一键点选</label>
-          <div class="chips" id="quick-hw" style="margin-bottom:12px;">
-            <button type="button" class="chip" data-hw="rtx4090-48">RTX 4090 48G</button>
-            <button type="button" class="chip" data-hw="rtx5090">RTX 5090</button>
-            <button type="button" class="chip" data-hw="rtx5080">RTX 5080</button>
-            <button type="button" class="chip" data-hw="rx7900xtx">RX 7900 XTX</button>
-            <button type="button" class="chip" data-hw="r9700">R9700 32G</button>
-            <button type="button" class="chip" data-hw="rtx3090">RTX 3090</button>
-            <button type="button" class="chip" data-hw="rtx4080s-32">RTX 4080S 32G</button>
-            <button type="button" class="chip" data-hw="m5ultra">Mac M5 Ultra</button>
-            <button type="button" class="chip" data-hw="m5max40">Mac M5 Max</button>
-          </div>
-          <div class="row row-3">
-            <div>
-              <label for="hw-select">显卡 / 芯片</label>
-              <select id="hw-select"></select>
-            </div>
-            <div id="hw-custom-wrap" class="hidden">
-              <label for="hw-raw-input">自定义型号名称</label>
-              <input id="hw-raw-input" placeholder="例如 RTX 4090D 48GB" />
-            </div>
-            <div id="gpu-count-wrap">
-              <label>显卡张数</label>
-              <div class="chips" id="gpu-count-chips">
-                <button type="button" class="chip active" data-val="1">1 张</button>
-                <button type="button" class="chip" data-val="2">2 张</button>
-                <button type="button" class="chip" data-val="4">4 张</button>
-                <button type="button" class="chip" data-val="8">8 张</button>
-              </div>
-            </div>
-            <div>
-              <label for="ram-gb">系统 / 统一内存 (GB)</label>
-              <input id="ram-gb" type="number" min="8" max="8192" placeholder="如 64 / 128" />
-              <div class="chips" id="ram-quick">
-                <button type="button" class="chip" data-ram="32">32G</button>
-                <button type="button" class="chip" data-ram="64">64G</button>
-                <button type="button" class="chip" data-ram="128">128G</button>
-                <button type="button" class="chip" data-ram="256">256G</button>
-              </div>
-            </div>
-          </div>
-          <div class="row">
-            <div>
-              <label for="vram-input">单卡显存 GB（魔改/自定义卡选填）</label>
-              <input id="vram-input" type="number" min="1" max="2048" placeholder="自动" />
-            </div>
-            <div>
-              <label for="os-select">目标机系统</label>
-              <select id="os-select">
-                <option value="">跳过</option>
-                <option value="linux">Linux</option>
-                <option value="windows">Windows</option>
-                <option value="macos">macOS</option>
-              </select>
-            </div>
-          </div>
-        </div>
-      </details>
     </div>
 
-    <!-- Optional supplementary fields (engine, RAM DDR type, MTP) -->
-    <div class="row row-3" style="margin-top:12px;">
+    <div class="row" style="margin-top:8px;">
       <div id="ram-type-wrap">
         <label for="ram-preset">内存规格（系统无法自动读取，选填）</label>
         <select id="ram-preset">
@@ -407,18 +321,6 @@ def _render_html(token: str, default_submit_url: str) -> str:
         </select>
       </div>
       <div>
-        <label for="engine-select">推理引擎（选填）</label>
-        <select id="engine-select">
-          <option value="">不确定 / 跳过</option>
-          <option value="strata">Strata</option>
-          <option value="llamacpp">llama.cpp / Ollama / LM Studio</option>
-          <option value="vllm">vLLM</option>
-          <option value="sglang">SGLang</option>
-          <option value="mlx">MLX / oMLX / mlx-serve</option>
-          <option value="maya">Project Maya</option>
-        </select>
-      </div>
-      <div>
         <label>MTP / 推测解码</label>
         <div class="chips" id="mtp-chips">
           <button type="button" class="chip active" data-val="">不确定</button>
@@ -428,15 +330,26 @@ def _render_html(token: str, default_submit_url: str) -> str:
       </div>
     </div>
 
+    <div style="margin-top:10px;">
+      <label>测试上下文档位（默认全选 1k / 32k / 64k / 128k / 256k，超出服务端上限会自动跳过）</label>
+      <div class="chips" id="ctx-chips">
+        <button type="button" class="chip active" data-ctx="1k">1k</button>
+        <button type="button" class="chip active" data-ctx="32k">32k</button>
+        <button type="button" class="chip active" data-ctx="64k">64k</button>
+        <button type="button" class="chip active" data-ctx="128k">128k</button>
+        <button type="button" class="chip active" data-ctx="256k">256k</button>
+      </div>
+    </div>
+
     <details>
-      <summary>高级设置（上下文长度、轮数、本地 API Key）</summary>
+      <summary>高级设置（自定义上下文、轮数、本地 API Key）</summary>
       <div class="row row-3" style="margin-top:10px;">
         <div>
-          <label for="ctx-input">测试上下文 (tokens)</label>
-          <input id="ctx-input" value="1024" placeholder="1024 或 1024,32768" />
+          <label for="ctx-input">测试上下文（支持 k 缩写）</label>
+          <input id="ctx-input" value="1k,32k,64k,128k,256k" placeholder="1k,32k,64k,128k,256k" />
         </div>
         <div>
-          <label for="runs-input">每档轮数（取中位数）</label>
+          <label for="runs-input">短上下文轮数（≥64k 自动 1 轮）</label>
           <input id="runs-input" type="number" min="1" max="10" value="3" />
         </div>
         <div>
@@ -454,6 +367,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
 
     <div id="result-box" class="hidden" style="margin-top:14px;">
       <div class="score-grid" id="score-grid"></div>
+      <div id="tier-table-wrap" class="hidden"></div>
       <div class="row" style="margin-top:12px;">
         <div>
           <label for="nickname-input">天梯署名（选填，≤20字，留空匿名，不可含网址）</label>
@@ -485,11 +399,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
 const TOKEN = {json.dumps(token)};
 const $ = (id) => document.getElementById(id);
 
-let mode = 'local'; // 'local' | 'lan'
 let localHw = null;
-let sshHw = null;
-let catalog = {{ gpus: [], unified: [] }};
-let gpuCount = 1;
 let mtpVal = '';
 let lastPayload = null;
 let pollTimer = null;
@@ -502,26 +412,6 @@ async function api(path, body) {{
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
-}}
-
-function fillHwDropdown() {{
-  const sel = $('hw-select');
-  sel.innerHTML = '';
-  const addOpt = (parent, val, text) => {{
-    const o = document.createElement('option'); o.value = val; o.textContent = text; parent.appendChild(o);
-  }};
-  addOpt(sel, '', '请选择显卡 / 芯片...');
-  const g1 = document.createElement('optgroup'); g1.label = '独立显卡 (GPU)';
-  for (const g of catalog.gpus) addOpt(g1, g.id, g.label);
-  sel.appendChild(g1);
-  const g2 = document.createElement('optgroup'); g2.label = '统一内存 (Mac / AI Max / DGX Spark)';
-  for (const u of catalog.unified) addOpt(g2, u.id, u.label);
-  sel.appendChild(g2);
-  addOpt(sel, '__custom__', '其他未收录型号（手动输入）');
-}}
-
-function isUnifiedId(id) {{
-  return catalog.unified.some((u) => u.id === id);
 }}
 
 function formatHwSummary(hw) {{
@@ -550,40 +440,6 @@ function renderLocalHw() {{
   }}
 }}
 
-function renderSshHw() {{
-  if (sshHw) {{
-    const s = formatHwSummary(sshHw);
-    $('ssh-hw-main').textContent = s.main;
-    $('ssh-hw-meta').textContent = s.meta;
-    $('ssh-locked-box').classList.remove('hidden');
-    $('manual-hw-details').open = false;
-    $('manual-hw-details').classList.add('hidden');
-    $('ram-type-wrap').classList.toggle('hidden', sshHw.kind === 'unified');
-    if (sshHw.kind === 'unified') $('ram-preset').value = 'Unified|';
-    $('hw-hint').textContent = '已通过 SSH 锁定远端硬件';
-  }} else {{
-    $('ssh-locked-box').classList.add('hidden');
-    $('manual-hw-details').classList.remove('hidden');
-    $('ram-type-wrap').classList.remove('hidden');
-  }}
-}}
-
-function updateManualUnifiedVisibility() {{
-  const id = $('hw-select').value;
-  const uni = isUnifiedId(id);
-  $('gpu-count-wrap').classList.toggle('hidden', uni);
-  if (uni) {{
-    $('ram-preset').value = 'Unified|';
-    if (id.startsWith('m') && !$('os-select').value) $('os-select').value = 'macos';
-  }}
-  $('hw-custom-wrap').classList.toggle('hidden', id !== '__custom__');
-}}
-
-function setGpuCount(n) {{
-  gpuCount = Number(n) || 1;
-  document.querySelectorAll('#gpu-count-chips .chip').forEach((b) => b.classList.toggle('active', Number(b.dataset.val) === gpuCount));
-}}
-
 function setMtp(v) {{
   mtpVal = v;
   document.querySelectorAll('#mtp-chips .chip').forEach((b) => b.classList.toggle('active', b.dataset.val === v));
@@ -599,86 +455,12 @@ function setModels(models, guessedEngine, guessedQuant) {{
   if (guessedQuant) $('quant-input').value = guessedQuant;
 }}
 
-function saveLanMemory(ep) {{
-  try {{
-    const rec = {{
-      hw_id: $('hw-select').value,
-      hw_raw: $('hw-raw-input').value,
-      gpu_count: gpuCount,
-      vram_gb: $('vram-input').value,
-      ram_gb: $('ram-gb').value,
-      ram_preset: $('ram-preset').value,
-      engine: $('engine-select').value,
-      mtp: mtpVal,
-      os: $('os-select').value,
-    }};
-    localStorage.setItem('llm-speedtest:lan:' + ep.trim(), JSON.stringify(rec));
-  }} catch {{}}
-}}
-
-function loadLanMemory(ep) {{
-  try {{
-    const raw = localStorage.getItem('llm-speedtest:lan:' + ep.trim());
-    if (!raw) return false;
-    const rec = JSON.parse(raw);
-    if (rec.hw_id) $('hw-select').value = rec.hw_id;
-    if (rec.hw_raw) $('hw-raw-input').value = rec.hw_raw;
-    setGpuCount(rec.gpu_count || 1);
-    $('vram-input').value = rec.vram_gb || '';
-    $('ram-gb').value = rec.ram_gb || '';
-    $('ram-preset').value = rec.ram_preset || '';
-    $('engine-select').value = rec.engine || '';
-    setMtp(rec.mtp || '');
-    $('os-select').value = rec.os || '';
-    updateManualUnifiedVisibility();
-    return Boolean(rec.hw_id);
-  }} catch {{ return false; }}
-}}
-
-function switchMode(next) {{
-  mode = next;
-  $('tab-local').classList.toggle('active', mode === 'local');
-  $('tab-lan').classList.toggle('active', mode === 'lan');
-  $('local-bar').classList.toggle('hidden', mode !== 'local');
-  $('lan-bar').classList.toggle('hidden', mode !== 'lan');
-  $('local-hw-view').classList.toggle('hidden', mode !== 'local');
-  $('lan-hw-view').classList.toggle('hidden', mode !== 'lan');
-  $('probe-err').classList.add('hidden');
-  if (mode === 'local') {{
-    renderLocalHw();
-    $('hw-hint').textContent = '本机硬件已锁定';
-  }} else {{
-    renderSshHw();
-    if (!sshHw) {{
-      $('hw-hint').textContent = '推荐通过 SSH 读取远端硬件';
-      const ep = $('endpoint-input').value.trim();
-      if (ep && loadLanMemory(ep)) {{
-        $('manual-hw-details').open = true;
-        $('hw-hint').textContent = '已载入上次该主机手动配置（仍推荐 SSH 读取）';
-      }}
-    }}
-  }}
-}}
-
 async function probe(rawEndpoint) {{
   $('probe-err').classList.add('hidden');
   $('conn-badge').textContent = '连接中...';
   try {{
     const res = await api('/api/probe', {{ endpoint: rawEndpoint, api_key: $('apikey-input').value.trim() || null }});
-    if (mode === 'lan') {{
-      $('endpoint-input').value = res.endpoint;
-      // Pre-fill SSH host hint if user hasn't typed one yet
-      try {{
-        const host = new URL(res.endpoint).hostname;
-        if (host && !$('ssh-input').value) $('ssh-input').placeholder = '例如 user@' + host;
-      }} catch {{}}
-      if (!sshHw && (loadLanMemory(res.endpoint) || loadLanMemory(rawEndpoint))) {{
-        $('manual-hw-details').open = true;
-        $('hw-hint').textContent = '已载入上次该主机手动配置（仍推荐 SSH 读取）';
-      }}
-    }} else {{
-      $('local-endpoint').value = res.endpoint;
-    }}
+    $('local-endpoint').value = res.endpoint;
     setModels(res.models, res.guessed_engine, res.guessed_quant);
     $('conn-badge').textContent = '已连接 · ' + res.models.length + ' 个模型';
   }} catch (e) {{
@@ -691,9 +473,7 @@ async function probe(rawEndpoint) {{
 async function init() {{
   try {{
     const data = await api('/api/init');
-    catalog = data.catalog;
     localHw = data.local_hw;
-    fillHwDropdown();
     renderLocalHw();
     $('hw-hint').textContent = '本机硬件已锁定';
     if (data.local_endpoint) {{
@@ -701,65 +481,28 @@ async function init() {{
       setModels(data.local_models, data.guessed_engine, data.guessed_quant);
       $('conn-badge').textContent = '已自动连上本机服务';
     }} else {{
-      $('conn-badge').textContent = '未检测到本机服务（可填端口或切到局域网）';
+      $('conn-badge').textContent = '未检测到本机服务（请先启动服务或填端口后点重新检测）';
     }}
   }} catch (e) {{
     $('conn-badge').textContent = '初始化失败：' + e.message;
   }}
 }}
 
-$('tab-local').onclick = () => switchMode('local');
-$('tab-lan').onclick = () => switchMode('lan');
-$('btn-probe').onclick = () => probe($('endpoint-input').value.trim());
 $('btn-local-probe').onclick = () => probe($('local-endpoint').value.trim());
+document.querySelectorAll('#mtp-chips .chip').forEach((b) => b.onclick = () => setMtp(b.dataset.val));
 
-$('hw-select').onchange = () => {{
-  const id = $('hw-select').value;
-  const g = catalog.gpus.find((x) => x.id === id);
-  if (g && g.vram_gb) $('vram-input').value = g.vram_gb;
-  else if (isUnifiedId(id)) $('vram-input').value = '';
-  updateManualUnifiedVisibility();
-}};
-
-document.querySelectorAll('#quick-hw .chip').forEach((btn) => {{
-  btn.onclick = () => {{
-    $('hw-select').value = btn.dataset.hw;
-    $('hw-select').onchange();
-    document.querySelectorAll('#quick-hw .chip').forEach((b) => b.classList.toggle('active', b === btn));
+function syncCtxFromChips() {{
+  const picked = Array.from(document.querySelectorAll('#ctx-chips .chip.active')).map((b) => b.dataset.ctx);
+  if (picked.length) $('ctx-input').value = picked.join(',');
+}}
+document.querySelectorAll('#ctx-chips .chip').forEach((b) => {{
+  b.onclick = () => {{
+    const active = document.querySelectorAll('#ctx-chips .chip.active');
+    if (b.classList.contains('active') && active.length <= 1) return;
+    b.classList.toggle('active');
+    syncCtxFromChips();
   }};
 }});
-document.querySelectorAll('#gpu-count-chips .chip').forEach((b) => b.onclick = () => setGpuCount(b.dataset.val));
-document.querySelectorAll('#mtp-chips .chip').forEach((b) => b.onclick = () => setMtp(b.dataset.val));
-document.querySelectorAll('#ram-quick .chip').forEach((b) => b.onclick = () => {{ $('ram-gb').value = b.dataset.ram; }});
-
-$('btn-ssh').onclick = async () => {{
-  const target = $('ssh-input').value.trim();
-  $('ssh-err').classList.add('hidden');
-  if (!target) {{
-    $('ssh-err').textContent = '请先输入 SSH 地址，例如 user@192.168.31.88';
-    $('ssh-err').classList.remove('hidden');
-    return;
-  }}
-  $('btn-ssh').disabled = true;
-  $('btn-ssh').textContent = '读取中...';
-  try {{
-    const res = await api('/api/ssh-detect', {{ ssh: target }});
-    sshHw = res.hw;
-    renderSshHw();
-  }} catch (e) {{
-    $('ssh-err').textContent = e.message;
-    $('ssh-err').classList.remove('hidden');
-  }} finally {{
-    $('btn-ssh').disabled = false;
-    $('btn-ssh').textContent = 'SSH 读取硬件';
-  }}
-}};
-
-$('btn-ssh-clear').onclick = async () => {{
-  sshHw = null;
-  try {{ await api('/api/ssh-clear', {{}}); }} catch {{}}
-  renderSshHw();
-}};
 
 $('model-select').onchange = async () => {{
   const m = $('model-select').value;
@@ -771,47 +514,26 @@ $('model-select').onchange = async () => {{
 }};
 
 $('btn-run').onclick = async () => {{
-  const ep = (mode === 'lan' ? $('endpoint-input').value : $('local-endpoint').value).trim();
+  const ep = $('local-endpoint').value.trim();
   const model = $('model-select').value;
   if (!ep || !model) {{
-    alert('请先连接推理服务并选择模型');
+    alert('请先连接本机推理服务并选择模型');
     return;
   }}
 
   const [ramType, ramCh] = ($('ram-preset').value || '|').split('|');
-  let manualHardware = null;
-  if (mode === 'lan' && !sshHw) {{
-    const hwId = $('hw-select').value;
-    const hwRaw = hwId === '__custom__' ? $('hw-raw-input').value.trim() : ($('hw-select').selectedOptions[0]?.textContent || '');
-    if (!hwId || (hwId === '__custom__' && !hwRaw)) {{
-      alert('请先通过 SSH 读取远端硬件，或展开下方手动选择推理机显卡/芯片');
-      return;
-    }}
-    saveLanMemory(ep);
-    manualHardware = {{
-      kind: isUnifiedId(hwId) ? 'unified' : 'gpu',
-      hw_id: hwId !== '__custom__' ? hwId : null,
-      hw_raw: hwRaw,
-      gpu_count: isUnifiedId(hwId) ? 1 : gpuCount,
-      vram_gb: $('vram-input').value ? Number($('vram-input').value) : null,
-      ram_gb: $('ram-gb').value ? Number($('ram-gb').value) : null,
-      os: $('os-select').value || null,
-    }};
-  }}
-
   const body = {{
     endpoint: ep,
     api_key: $('apikey-input').value.trim() || null,
     model,
     quant: $('quant-input').value.trim() || null,
     engine: $('engine-select').value || null,
+    kv_cache: $('kv-select').value || null,
     mtp: mtpVal === '' ? null : mtpVal === 'true',
-    ctx: $('ctx-input').value.trim() || '1024',
+    ctx: $('ctx-input').value.trim() || '1k,32k,64k,128k,256k',
     runs: Number($('runs-input').value) || 3,
-    remote: mode === 'lan',
     ram_type: ramType || null,
     ram_channels: ramCh ? Number(ramCh) : null,
-    manual_hardware: manualHardware,
   }};
 
   $('btn-run').disabled = true;
@@ -869,6 +591,12 @@ function syncPublicMetaToPayload() {{
 $('nickname-input').oninput = syncPublicMetaToPayload;
 $('note-input').oninput = syncPublicMetaToPayload;
 
+function fmtCtx(n) {{
+  if (n >= 1024 && n % 1024 === 0) return (n / 1024) + 'k';
+  if (n >= 1000 && Math.abs(n / 1024 - Math.round(n / 1024)) < 0.08) return Math.round(n / 1024) + 'k';
+  return String(n);
+}}
+
 function renderResult(p) {{
   const r = p.results[0];
   try {{
@@ -876,10 +604,30 @@ function renderResult(p) {{
     if (savedNick && !$('nickname-input').value) $('nickname-input').value = savedNick;
   }} catch {{}}
   $('score-grid').innerHTML = `
-    <div class="metric"><div class="v">${{r.tg_tps}}</div><div class="k">生成速度 (tok/s)</div></div>
-    <div class="metric"><div class="v">${{r.pp_tps || '-'}}</div><div class="k">读题速度 (tok/s)</div></div>
+    <div class="metric"><div class="v">${{r.tg_tps}}</div><div class="k">生成速度 (${{fmtCtx(r.ctx_prompt)}} · tok/s)</div></div>
+    <div class="metric"><div class="v">${{r.pp_tps || '-'}}</div><div class="k">读题速度 (${{fmtCtx(r.ctx_prompt)}} · tok/s)</div></div>
     <div class="metric"><div class="v">${{r.ttft_ms || '-'}} ms</div><div class="k">首字延迟 (${{r.source}})</div></div>
   `;
+  if (p.results.length > 1) {{
+    const rows = p.results.map((x) => `
+      <tr>
+        <td><strong>${{fmtCtx(x.ctx_prompt)}}</strong> (${{x.ctx_prompt}})</td>
+        <td class="num">${{x.tg_tps}} tok/s</td>
+        <td>${{x.pp_tps || '-'}} tok/s</td>
+        <td>${{x.ttft_ms || '-'}} ms</td>
+        <td>${{x.runs}} 轮 (${{x.source}})</td>
+      </tr>
+    `).join('');
+    $('tier-table-wrap').innerHTML = `
+      <table class="tier-table">
+        <thead><tr><th>上下文档位</th><th>生成速度 (TG)</th><th>读题速度 (PP)</th><th>首字延迟</th><th>采样</th></tr></thead>
+        <tbody>${{rows}}</tbody>
+      </table>
+    `;
+    $('tier-table-wrap').classList.remove('hidden');
+  }} else {{
+    $('tier-table-wrap').classList.add('hidden');
+  }}
   syncPublicMetaToPayload();
   $('result-box').classList.remove('hidden');
   $('btn-upload').disabled = false;
@@ -905,19 +653,18 @@ $('btn-upload').onclick = async () => {{
     const ranking = resp.ranking || null;
     const firstRes = (resp.results && resp.results[0]) || {{}};
     const recId = resp.record_id || firstRes.id || null;
-    const isManual = firstRes.flag_reason === 'manual_hardware';
     const hw = lastPayload.hardware || {{}};
     const mdl = lastPayload.model || {{}};
     const r0 = (lastPayload.results && lastPayload.results[0]) || {{}};
-    const verLabel = hw.detected_by === 'ssh' ? '🔒 SSH 实采' : hw.detected_by === 'local' ? '🔒 本机实采' : '人工自填（待复核）';
-    const pageUrl = ranking && ranking.ladder_url && !isManual
+    const verLabel = '🔒 本机实采';
+    const pageUrl = ranking && ranking.ladder_url
       ? ranking.ladder_url
-      : (recId && !isManual
-        ? `https://itbanana.com/llm-hardware?highlight=${{recId}}#live-speedtest`
-        : 'https://itbanana.com/llm-hardware#live-speedtest');
+      : (recId
+        ? `https://itbanana.com/llm-speed?highlight=${{recId}}`
+        : 'https://itbanana.com/llm-speed');
 
     let extraLine = '';
-    if (ranking && !isManual) {{
+    if (ranking) {{
       const gap = Number(ranking.gap_to_first || 0);
       const gapTxt = gap <= 0.05 ? '当前同卡第一！' : `距同卡第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
       extraLine = `🏆 同款硬件排第 ${{ranking.same_hw_rank}} / ${{ranking.same_hw_total}} 名（中位 ${{ranking.same_hw_median}} tok/s），全榜第 ${{ranking.overall_rank}} / ${{ranking.overall_total}} 名，${{gapTxt}}`;
@@ -928,18 +675,15 @@ $('btn-upload').onclick = async () => {{
         extraLine += ` 同配置社区区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
       }}
     }}
-    if (isManual) {{
-      extraLine = '由于硬件为手动选择，系统已自动进入复核队列，核验后将在网站公开展示。';
-    }}
 
-    const ctaText = ranking && !isManual
+    const ctaText = ranking
       ? `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`
-      : (recId && !isManual ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-hardware 查看实测榜 →');
+      : (recId ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-speed 查看实测榜 →');
 
     $('celeb-box').innerHTML = `
       <div class="celeb-top">
-        <div class="celeb-title">${{isManual ? '✅ 实测已收到，感谢贡献！' : (ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜')}}</div>
-        <div class="celeb-id">${{recId && !isManual ? '实测 #' + recId : verLabel}}</div>
+        <div class="celeb-title">${{ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜'}}</div>
+        <div class="celeb-id">${{recId ? '实测 #' + recId : verLabel}}</div>
       </div>
       <div class="celeb-sub">${{extraLine}}</div>
       <div class="celeb-card">
@@ -1037,7 +781,6 @@ def create_ui_server(
     html_bytes = _render_html(token, submit_url).encode("utf-8")
     lock = threading.Lock()
     job: Dict[str, Any] = {"state": "idle", "logs": [], "payload": None, "error": None}
-    state: Dict[str, Any] = {"verified_ssh_hw": None}
 
     def run_job(cfg: Dict[str, Any]) -> None:
         def log(msg: str) -> None:
@@ -1046,43 +789,18 @@ def create_ui_server(
 
         try:
             endpoint = cfg["endpoint"].rstrip("/")
+            if not st_module.is_local_endpoint(endpoint):
+                raise ValueError(st_module.LOCAL_ONLY_ERR)
             model = cfg["model"]
             api_key = cfg.get("api_key")
             runs = max(1, min(10, int(cfg.get("runs") or 3)))
             gen_tokens = max(16, min(4096, int(cfg.get("gen_tokens") or gen_tokens_default)))
-            ctx_list = [int(x.strip()) for x in str(cfg.get("ctx") or "1024").split(",") if x.strip()]
-            if not ctx_list:
-                ctx_list = [1024]
+            ctx_list = st_module.parse_ctx_list(cfg.get("ctx"))
+            ctx_limit = st_module.detect_server_ctx_limit(endpoint, api_key=api_key)
 
-            # Server-side hardware lock:
-            # - Local mode ALWAYS uses fresh local auto-detection (ignores client tampering)
-            # - LAN mode prefers server-verified SSH hardware if present; otherwise marks 'manual'
-            is_remote = bool(cfg.get("remote")) or not st_module.is_local_endpoint(endpoint)
-            if not is_remote:
-                hw = dict(st_module.detect_hardware())
-                hw["detected_by"] = "local"
-            else:
-                with lock:
-                    verified = state["verified_ssh_hw"]
-                if verified:
-                    hw = dict(verified)
-                    hw["detected_by"] = "ssh"
-                else:
-                    m_hw = cfg.get("manual_hardware") or {}
-                    if not m_hw.get("hw_id") and not m_hw.get("hw_raw"):
-                        raise ValueError("远程测速缺少硬件信息：请先通过 SSH 读取或手动选择硬件")
-                    hw = {
-                        "kind": m_hw.get("kind") or "gpu",
-                        "hw_id": m_hw.get("hw_id"),
-                        "hw_raw": m_hw.get("hw_raw") or "Unknown Hardware",
-                        "detected_by": "manual",
-                        "gpu_count": int(m_hw.get("gpu_count") or 1),
-                        "vram_gb": m_hw.get("vram_gb"),
-                        "ram_gb": m_hw.get("ram_gb"),
-                        "ram_type": None,
-                        "ram_channels": None,
-                        "os": m_hw.get("os"),
-                    }
+            # Server-side hardware lock: ALWAYS uses fresh local auto-detection (ignores client tampering)
+            hw = dict(st_module.detect_hardware())
+            hw["detected_by"] = "local"
 
             # Only supplementary RAM type/channels can be appended when not unified
             if hw.get("kind") != "unified":
@@ -1097,14 +815,28 @@ def create_ui_server(
 
             results: List[Dict[str, Any]] = []
             for c in ctx_list:
+                lbl = st_module.format_ctx_label(c)
+                if ctx_limit and c + gen_tokens > ctx_limit and (results or c > ctx_limit):
+                    log(f"⏭️ 跳过 [{lbl}]（当前服务上下文上限 {ctx_limit} tokens）")
+                    continue
+                tier_runs = st_module.effective_runs_for_ctx(c, runs)
+                req_timeout = st_module.timeout_for_ctx(c)
                 samples = []
-                for i in range(runs):
-                    nonce = f"{c}-{i}-{int(time.time() * 1000) % 100000}"
-                    prompt = st_module.build_prompt(c, nonce)
-                    log(f"[ctx≈{c}] 正在跑第 {i + 1}/{runs} 轮...")
-                    r = st_module.run_single_completion(endpoint, model, prompt, gen_tokens, api_key=api_key)
-                    samples.append(r)
-                    log(f"[ctx≈{c}] 第 {i + 1}/{runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（{r['source']}）")
+                try:
+                    for i in range(tier_runs):
+                        nonce = f"{c}-{i}-{int(time.time() * 1000) % 100000}"
+                        prompt = st_module.build_prompt(c, nonce)
+                        log(f"[{lbl}] 正在跑第 {i + 1}/{tier_runs} 轮（ctx≈{c}）...")
+                        r = st_module.run_single_completion(
+                            endpoint, model, prompt, gen_tokens, api_key=api_key, timeout=req_timeout
+                        )
+                        samples.append(r)
+                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（{r['source']}）")
+                except Exception as e:
+                    if results:
+                        log(f"⚠️ [{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")
+                        break
+                    raise
                 results.append({
                     "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
                     "gen_tokens": int(round(statistics.median(s["gen_tokens"] for s in samples))),
@@ -1112,9 +844,12 @@ def create_ui_server(
                     "pp_tps": round(statistics.median(s["pp_tps"] for s in samples), 2),
                     "sse_tg_tps": round(statistics.median(s["sse_tg_tps"] for s in samples), 2),
                     "ttft_ms": round(statistics.median(s["ttft_ms"] for s in samples), 1),
-                    "runs": runs,
+                    "runs": tier_runs,
                     "source": "timings" if all(s["source"] == "timings" for s in samples) else "sse",
                 })
+
+            if not results:
+                raise RuntimeError("所有上下文档位均未能完成测速，请检查服务端上下文上限设置")
 
             payload = {
                 "schema_version": st_module.SCHEMA_VERSION,
@@ -1124,8 +859,9 @@ def create_ui_server(
                     "engine": cfg.get("engine"),
                     "engine_version": None,
                     "backend": None,
+                    "kv_cache": st_module.normalize_kv_cache(cfg.get("kv_cache")),
                     "mtp": cfg.get("mtp"),
-                    "ctx_limit": None,
+                    "ctx_limit": ctx_limit,
                 },
                 "model": {
                     "model_id": st_module.map_model_id(model),
@@ -1187,7 +923,6 @@ def create_ui_server(
                     pass
                 first_m = models[0] if models else ""
                 self._send_json(200, {
-                    "catalog": _catalog_items(st_module),
                     "local_hw": local_hw,
                     "local_endpoint": ep,
                     "local_models": models,
@@ -1219,26 +954,11 @@ def create_ui_server(
                     self._send_json(200, {
                         "endpoint": ep,
                         "models": models,
-                        "remote": not st_module.is_local_endpoint(ep),
                         "guessed_engine": st_module.infer_engine_auto(ep, first_m),
                         "guessed_quant": st_module.infer_quant(first_m),
                     })
                 except Exception as e:
                     self._send_json(400, {"error": str(e)})
-            elif path == "/api/ssh-detect":
-                target = (body.get("ssh") or "").strip()
-                hw = st_module.detect_hardware_via_ssh(target) if target else None
-                if not hw:
-                    self._send_json(400, {"error": "未能免密 SSH 识别（请确认已配置免密登录），或展开下方手动选择"})
-                else:
-                    hw["detected_by"] = "ssh"
-                    with lock:
-                        state["verified_ssh_hw"] = dict(hw)
-                    self._send_json(200, {"hw": hw})
-            elif path == "/api/ssh-clear":
-                with lock:
-                    state["verified_ssh_hw"] = None
-                self._send_json(200, {"ok": True})
             elif path == "/api/infer-model":
                 m = body.get("model") or ""
                 self._send_json(200, {
@@ -1292,12 +1012,14 @@ def create_ui_server(
 
 
 def serve_ui(st_module: Any, submit_url: str, stats_url: str, port: int = 0, open_browser: bool = True) -> int:
+    if hasattr(st_module, "configure_console"):
+        st_module.configure_console()
     server, _ = create_ui_server(st_module, submit_url=submit_url, stats_url=stats_url, port=port)
     actual_port = server.server_address[1]
     url = f"http://127.0.0.1:{actual_port}"
     print(f"\n{PRIVACY_BANNER_CLI}\n", file=sys.stderr)
-    print(f"llm-speedtest 本地测速界面已启动：{url}", file=sys.stderr)
-    print("按 Ctrl+C 退出。", file=sys.stderr)
+    print(f"🌐 llm-speedtest 本地 WebUI 已启动：{url}", file=sys.stderr)
+    print("👉 浏览器将自动打开；测完后按 Ctrl+C 即可退出。", file=sys.stderr)
     if open_browser:
         threading.Timer(0.25, lambda: webbrowser.open(url)).start()
     try:
