@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from typing import Any, Dict, List
+from unittest import mock
 
 import speedtest
 
@@ -49,9 +50,10 @@ class MappingTests(unittest.TestCase):
         self.assertFalse(speedtest.is_local_endpoint("http://10.0.0.8:8000/v1"))
         self.assertFalse(speedtest.is_local_endpoint("http://gpu-box.local:8080/v1"))
 
-        # Remote endpoint without explicit hardware must be rejected (never leaks local hardware)
-        rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--dry-run"])
-        self.assertEqual(rc, 2)
+        # Remote endpoint without explicit hardware must be rejected in non-interactive mode
+        with mock.patch.object(speedtest, "fetch_models", return_value=["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"]):
+            rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--non-interactive", "--dry-run"])
+            self.assertEqual(rc, 2)
 
         # Remote endpoint WITH explicit hardware must not leak local OS / RAM
         args = speedtest.parse_args([
@@ -80,7 +82,10 @@ class EndToEndMockTests(unittest.TestCase):
 
             def do_GET(self):
                 if self.path == "/v1/models":
-                    self._send_json(200, {"data": [{"id": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"}]})
+                    self._send_json(200, {"data": [
+                        {"id": "Qwen3.8-27B-Q4_K_M"},
+                        {"id": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"},
+                    ]})
                 elif self.path.startswith("/api/llm-speedtest/stats"):
                     self._send_json(200, {
                         "ok": True,
@@ -143,6 +148,7 @@ class EndToEndMockTests(unittest.TestCase):
         base = f"http://127.0.0.1:{self.port}"
         rc = speedtest.main([
             "--endpoint", f"{base}/v1",
+            "--model", "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
             "--hw-id", "rtx4090-48",
             "--hw-raw", "NVIDIA GeForce RTX 4090",
             "--gpu-count", "1",
@@ -170,6 +176,34 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["model"]["quant"], "GSQ-RCO IQ3_S")
         self.assertEqual(p["results"][0]["tg_tps"], 170.5)
         self.assertEqual(p["results"][0]["source"], "timings")
+
+    def test_interactive_wizard_flow(self):
+        base = f"http://127.0.0.1:{self.port}"
+        # Answers: model #2, engine #1 (strata), accept default quant, mtp=y, ram #1 (DDR4 2ch), ctx default, confirm upload=y
+        answers = iter(["2", "1", "", "y", "1", "", "y"])
+        with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)):
+            rc = speedtest.main([
+                "--endpoint", f"{base}/v1",
+                "--hw-id", "rtx4090-48",
+                "--hw-raw", "NVIDIA GeForce RTX 4090",
+                "--vram-gb", "48",
+                "--ram-gb", "64",
+                "--gen-tokens", "20",
+                "--runs", "2",
+                "--no-warmup",
+                "--interactive",
+                "--submit-url", f"{base}/api/llm-speedtest/submit",
+                "--stats-url", f"{base}/api/llm-speedtest/stats",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.uploaded), 1)
+        p = self.uploaded[0]
+        self.assertEqual(p["model"]["model_id"], "qwen38-flash-next")
+        self.assertEqual(p["model"]["quant"], "GSQ-RCO IQ3_S")
+        self.assertEqual(p["software"]["engine"], "strata")
+        self.assertEqual(p["software"]["mtp"], True)
+        self.assertEqual(p["hardware"]["ram_type"], "DDR4")
+        self.assertEqual(p["hardware"]["ram_channels"], 2)
 
 
 if __name__ == "__main__":

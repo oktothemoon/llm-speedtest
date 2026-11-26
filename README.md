@@ -12,12 +12,16 @@
 把本仓库地址发给你的 AI（Claude Code / Codex / Cursor / OpenClaw 等），直接说：
 > 帮我按这个仓库的 `SKILL.md` 测一下我本地正在跑的模型速度。
 
-### 方式二：自己命令行运行
-1. 先只测不传，预览完整输出：
+### 方式二：自己直接运行（带终端交互向导）
+在终端直接运行即可进入分步引导（自动识别显卡与本机服务，多模型可选、一路回车可用默认值，测完展示成绩单和明文 JSON 后再确认上传）：
+```bash
+python3 speedtest.py
+```
+只想先本地跑一遍不上传，加 `--dry-run`：
 ```bash
 python3 speedtest.py --dry-run
 ```
-2. 确认没问题后上传（也可显式补充引擎、量化、内存类型等）：
+也可以全部用命令行参数传完直接跑（加 `--non-interactive` 或 `--yes` 跳过向导）：
 ```bash
 python3 speedtest.py \
   --endpoint http://127.0.0.1:8080/v1 \
@@ -27,7 +31,6 @@ python3 speedtest.py \
   --ram-type DDR4 \
   --ram-channels 2
 ```
-默认会在终端打印完整 JSON 并询问确认；加 `--yes` 可跳过确认提示。
 
 ### 跨局域网测另一台电脑
 如果你的推理服务跑在局域网另一台主机（如 `192.168.1.50:8080`）：

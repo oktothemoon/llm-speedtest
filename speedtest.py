@@ -671,15 +671,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--os", dest="target_os", choices=["linux", "windows", "macos"], help="Override target machine OS")
 
     # Benchmark parameters
-    p.add_argument("--ctx", default="1024", help="Comma-separated prompt token sizes to test (default: 1024)")
+    p.add_argument("--ctx", default=None, help="Comma-separated prompt token sizes to test (default: 1024)")
     p.add_argument("--gen-tokens", type=int, default=256, help="Tokens to generate per run (default: 256)")
     p.add_argument("--runs", type=int, default=3, help="Measured runs per context size (default: 3)")
     p.add_argument("--no-warmup", action="store_true", help="Skip the initial warmup request")
 
-    # Upload / privacy controls
+    # Upload / interaction / privacy controls
     p.add_argument("--detect-only", action="store_true", help="Only print detected hardware JSON and exit")
     p.add_argument("--dry-run", action="store_true", help="Run benchmark and print JSON without uploading")
-    p.add_argument("--yes", "-y", action="store_true", help="Upload without interactive confirmation prompt")
+    p.add_argument("--interactive", "-i", action="store_true", help="Force interactive step-by-step terminal wizard")
+    p.add_argument("--non-interactive", action="store_true", help="Disable interactive prompts (recommended for AI agents / scripts)")
+    p.add_argument("--yes", "-y", action="store_true", help="Upload without interactive confirmation prompt (also disables wizard)")
     p.add_argument("--submit-url", default=DEFAULT_SUBMIT_URL, help=f"Upload endpoint (default: {DEFAULT_SUBMIT_URL})")
     p.add_argument("--stats-url", default=DEFAULT_STATS_URL, help=f"Stats endpoint (default: {DEFAULT_STATS_URL})")
     return p.parse_args(argv)
@@ -710,6 +712,8 @@ def resolve_hardware(args: argparse.Namespace, remote: bool) -> Dict[str, Any]:
             hw["kind"] = "unified" if hw["hw_id"] in UNIFIED_IDS else "gpu"
         if not args.hw_raw and (remote or not hw.get("hw_raw")):
             hw["hw_raw"] = HW_ID_LABELS.get(hw["hw_id"], hw["hw_id"])
+    if hw.get("kind") == "gpu" and hw.get("ram_type") == "Unified" and not args.ram_type:
+        hw["ram_type"] = None
     if args.hw_raw:
         hw["hw_raw"] = args.hw_raw
         if not args.hw_id and remote:
@@ -745,6 +749,134 @@ def resolve_hardware(args: argparse.Namespace, remote: bool) -> Dict[str, Any]:
     return hw
 
 
+def _ask(prompt_text: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        ans = input(f"{prompt_text}{suffix}: ").strip()
+    except EOFError:
+        return default
+    return ans if ans else default
+
+
+def _ask_int(prompt_text: str, default: Optional[int] = None) -> Optional[int]:
+    ans = _ask(prompt_text, str(default) if default is not None else "")
+    if not ans:
+        return default
+    try:
+        return int(ans)
+    except ValueError:
+        return default
+
+
+def prompt_remote_hardware(args: argparse.Namespace) -> None:
+    """Interactively collect remote/LAN server specs without touching local hardware."""
+    print("\n检测到你连接的是局域网/远程推理服务，已关闭本机硬件探测，请填写【目标推理机】配置：", file=sys.stderr)
+    raw_in = _ask("  显卡/芯片型号（如 RTX 4090 / rtx4090-48 / M5 Ultra）")
+    if raw_in:
+        low = raw_in.lower().strip()
+        if low in HW_ID_LABELS or low in UNIFIED_IDS:
+            args.hw_id = low
+        else:
+            args.hw_raw = raw_in
+    if not args.hw_id or args.hw_id not in UNIFIED_IDS:
+        args.gpu_count = args.gpu_count or _ask_int("  显卡张数", 1)
+        args.vram_gb = args.vram_gb or _ask_int("  单卡显存 GB（不知道可回车跳过）")
+    args.ram_gb = args.ram_gb or _ask_int("  目标机系统/统一内存 GB（如 64 / 128，回车跳过）")
+    os_ans = _ask("  目标机系统 (linux / windows / macos，回车跳过)").lower()
+    if os_ans in ("linux", "windows", "macos"):
+        args.target_os = os_ans
+
+
+def run_interactive_wizard(args: argparse.Namespace, hw: Dict[str, Any], models: List[str]) -> Tuple[str, str]:
+    """Fill in optional benchmark metadata interactively (Enter accepts defaults)."""
+    print("\n=== llm-speedtest 交互向导（一路回车可使用默认值） ===", file=sys.stderr)
+    vram_part = f", VRAM={hw['vram_gb']}GB" if hw.get("vram_gb") else ""
+    ram_part = f", RAM={hw['ram_gb']}GB" if hw.get("ram_gb") else ""
+    print(
+        f"硬件：{hw['hw_raw']} (id={hw['hw_id'] or '未收录'}, x{hw['gpu_count']}{vram_part}{ram_part})",
+        file=sys.stderr,
+    )
+
+    # 1. Model selection if multiple models are exposed
+    if args.model:
+        model_name = args.model
+    elif len(models) > 1:
+        print("\n检测到多个已加载模型，请选择要测速的模型：", file=sys.stderr)
+        for idx, m in enumerate(models, 1):
+            print(f"  {idx}) {m}", file=sys.stderr)
+        pick = _ask_int("输入编号", 1) or 1
+        pick = min(max(1, pick), len(models))
+        model_name = models[pick - 1]
+    else:
+        model_name = models[0]
+        print(f"模型：{model_name}", file=sys.stderr)
+
+    # 2. Engine
+    if not args.engine:
+        eng_choices = ["strata", "llamacpp", "vllm", "sglang", "mlx", "maya"]
+        print("\n推理引擎（回车跳过）：", file=sys.stderr)
+        print("  1) strata   2) llamacpp (llama.cpp/Ollama/LM Studio)   3) vllm", file=sys.stderr)
+        print("  4) sglang   5) mlx   6) maya   或直接输入其他引擎名", file=sys.stderr)
+        ans = _ask("选择编号或输入名称")
+        if ans.isdigit() and 1 <= int(ans) <= len(eng_choices):
+            args.engine = eng_choices[int(ans) - 1]
+        elif ans:
+            args.engine = ans
+
+    # 3. Quant
+    if not args.quant:
+        guessed_q = infer_quant(model_name) or ""
+        q_ans = _ask("量化版本（如 GSQ-RCO IQ3_S / Q4_K_M / FP8，回车保留默认或跳过）", guessed_q)
+        if q_ans:
+            args.quant = q_ans
+
+    # 4. MTP / speculative decoding
+    if args.mtp is None:
+        mtp_ans = _ask("是否开启 MTP / 推测解码？(y=开启 / n=关闭 / 回车跳过)").lower()
+        if mtp_ans in ("y", "yes", "true", "1"):
+            args.mtp = "true"
+        elif mtp_ans in ("n", "no", "false", "0"):
+            args.mtp = "false"
+
+    # 5. RAM type & channels (for discrete GPUs when not already provided)
+    if hw.get("kind") == "gpu" and not hw.get("ram_type"):
+        print("\n系统内存规格（显存溢出时对速度影响很大，回车跳过）：", file=sys.stderr)
+        print("  1) DDR4 双通道   2) DDR5 双通道   3) X99/X299 四通道 DDR4", file=sys.stderr)
+        print("  4) X99 四通道 DDR3   5) 八通道 DDR4   6) 八通道 DDR5", file=sys.stderr)
+        ram_presets = {
+            "1": ("DDR4", 2), "2": ("DDR5", 2), "3": ("DDR4", 4),
+            "4": ("DDR3", 4), "5": ("DDR4", 8), "6": ("DDR5", 8),
+        }
+        r_ans = _ask("选择编号（或直接输入如 DDR4 / DDR5）")
+        if r_ans in ram_presets:
+            hw["ram_type"], hw["ram_channels"] = ram_presets[r_ans]
+        elif r_ans:
+            hw["ram_type"] = r_ans.upper()
+            ch = _ask_int("  内存通道数（如 2 / 4 / 8，回车跳过）")
+            if ch:
+                hw["ram_channels"] = ch
+
+    # 6. Context sizes
+    ctx_str = args.ctx if args.ctx is not None else _ask("测速上下文档位（多档用逗号分隔，如 1024,32768）", "1024")
+    return model_name, ctx_str or "1024"
+
+
+def print_summary(payload: Dict[str, Any]) -> None:
+    hw = payload["hardware"]
+    sw = payload["software"]
+    mdl = payload["model"]
+    print("\n================ 测速成绩单 ================", file=sys.stderr)
+    print(f"硬件: {hw['hw_raw']} ×{hw['gpu_count']} (RAM: {hw.get('ram_gb') or '?'}GB {hw.get('ram_type') or ''})".strip(), file=sys.stderr)
+    print(f"模型: {mdl['model_raw']} | 量化: {mdl.get('quant') or '未填'} | 引擎: {sw.get('engine') or '未填'}", file=sys.stderr)
+    for r in payload["results"]:
+        print(
+            f"  ctx≈{r['ctx_prompt']} tok -> 生成 {r['tg_tps']} tok/s | 读题 {r.get('pp_tps') or '-'} tok/s | "
+            f"首字 {r.get('ttft_ms') or '-'} ms ({r['runs']}轮中位数, {r['source']})",
+            file=sys.stderr,
+        )
+    print("============================================", file=sys.stderr)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -753,25 +885,49 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(hw, indent=2, ensure_ascii=False))
         return 0
 
-    remote = bool(args.endpoint and not is_local_endpoint(args.endpoint))
+    interactive = args.interactive or (sys.stdin.isatty() and not args.yes and not args.non_interactive)
+
+    # 1. Discover or confirm endpoint first (so we know whether it's local or LAN/remote)
+    if args.endpoint:
+        endpoint = args.endpoint.rstrip("/")
+        models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
+    else:
+        try:
+            endpoint, models = discover_endpoint(api_key=args.api_key)
+        except RuntimeError as e:
+            if not interactive:
+                print(f"Error: {e}", file=sys.stderr)
+                return 1
+            print(f"\n{e}", file=sys.stderr)
+            entered = _ask("请输入推理服务地址（如 http://127.0.0.1:8080/v1 或 http://192.168.1.50:8080/v1）")
+            if not entered:
+                return 1
+            endpoint = entered.rstrip("/")
+            if not endpoint.endswith("/v1"):
+                endpoint = endpoint + "/v1"
+            models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
+
+    remote = not is_local_endpoint(endpoint)
+    if remote and interactive and not args.hw_id and not args.hw_raw:
+        prompt_remote_hardware(args)
+
     try:
         hw = resolve_hardware(args, remote=remote)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
 
-    if args.endpoint:
-        endpoint = args.endpoint.rstrip("/")
-        models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
-    else:
-        endpoint, models = discover_endpoint(api_key=args.api_key)
-
-    model_name = args.model or (models[0] if models else None)
-    if not model_name:
+    if not models and not args.model:
         print("Error: could not determine model name. Pass --model <name>.", file=sys.stderr)
         return 1
 
-    print(f"Endpoint: {endpoint}", file=sys.stderr)
+    if interactive:
+        model_name, ctx_str = run_interactive_wizard(args, hw, models)
+    else:
+        model_name = args.model or models[0]
+        ctx_str = args.ctx or "1024"
+
+    print(f"\nEndpoint: {endpoint}", file=sys.stderr)
     print(f"Model:    {model_name}", file=sys.stderr)
     print(f"Hardware: {hw['hw_raw']} (hw_id={hw['hw_id'] or 'unmapped'}, x{hw['gpu_count']}, RAM={hw['ram_gb']}GB)", file=sys.stderr)
 
@@ -779,7 +935,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Running warmup request...", file=sys.stderr)
         run_single_completion(endpoint, model_name, "Say OK.", 24, api_key=args.api_key)
 
-    ctx_list = [int(x.strip()) for x in args.ctx.split(",") if x.strip()]
+    ctx_list = [int(x.strip()) for x in ctx_str.split(",") if x.strip()]
     results = [
         benchmark_context(endpoint, model_name, c, args.gen_tokens, args.runs, api_key=args.api_key)
         for c in ctx_list
@@ -805,6 +961,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "results": results,
     }
 
+    print_summary(payload)
     print("\n=== Benchmark Payload (no personal data included) ===")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 

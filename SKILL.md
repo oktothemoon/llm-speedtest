@@ -19,7 +19,8 @@
 - `--ram-type` / `--ram-channels`：如 `DDR4`、`DDR5` 和通道数（若已知）
 - `--fit`：`gpu`（全放显存）或 `hybrid`（显存 + 内存）
 
-## 第 2 步：先跑一次 `--dry-run`（仅本地测速，不上传）
+## 第 2 步：先跑一次 `--non-interactive --dry-run`（仅本地测速，不上传）
+AI Agent 执行时请务必带上 `--non-interactive`（避免触发终端交互问答卡住）：
 ```bash
 python3 speedtest.py \
   --endpoint http://127.0.0.1:8080/v1 \
@@ -29,6 +30,7 @@ python3 speedtest.py \
   --ram-type DDR4 \
   --ram-channels 2 \
   --fit hybrid \
+  --non-interactive \
   --dry-run
 ```
 如需加测长上下文，传 `--ctx 1024,32768`。
