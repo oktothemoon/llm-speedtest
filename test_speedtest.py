@@ -242,6 +242,20 @@ class EndToEndMockTests(unittest.TestCase):
             self.assertEqual(ep, f"{base}/v1")
             self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", models)
 
+    def test_interactive_api_key_prompt_on_401(self):
+        # Mock discover_endpoint raising AuthRequiredError, then user enters API key directly
+        with mock.patch.object(speedtest, "discover_endpoint", side_effect=speedtest.AuthRequiredError(f"http://127.0.0.1:{self.port}/v1", 401)), \
+             mock.patch("builtins.input", side_effect=["--api-key sk-test", "1", ""]):
+            rc = speedtest.main([
+                "--ctx", "1k",
+                "--gen-tokens", "20",
+                "--runs", "1",
+                "--no-warmup",
+                "--interactive",
+                "--dry-run",
+            ])
+        self.assertEqual(rc, 0)
+
     def test_end_to_end_benchmark_and_upload(self):
         base = f"http://127.0.0.1:{self.port}"
         rc = speedtest.main([

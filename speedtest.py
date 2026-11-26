@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.2"
+CLIENT_VERSION = "0.3.3"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -983,6 +983,16 @@ LOCAL_ONLY_ERR = (
 )
 
 
+class AuthRequiredError(RuntimeError):
+    """Raised when a local inference server is found but requires an API key (HTTP 401/403)."""
+    def __init__(self, endpoint: str, status_code: int = 401) -> None:
+        self.endpoint = endpoint
+        self.status_code = status_code
+        super().__init__(
+            f"已发现本机服务 {endpoint}，但该服务开启了 API Key 验证（HTTP {status_code}）。请传入 --api-key <密钥>。"
+        )
+
+
 def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Optional[str] = None) -> Tuple[str, List[str]]:
     """Normalize and probe a user-supplied local endpoint (rejects non-local hosts)."""
     cands = endpoint_candidates(raw)
@@ -992,6 +1002,7 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
         raise ValueError(LOCAL_ONLY_ERR)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_err: Optional[Exception] = None
+    auth_cand: Optional[Tuple[str, int]] = None
     for cand in cands:
         try:
             data = http_json(f"{cand}/models", headers=headers, timeout=2.5)
@@ -1000,20 +1011,27 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
                 return cand, [explicit_model] if explicit_model else models
             if explicit_model:
                 return cand, [explicit_model]
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and auth_cand is None:
+                auth_cand = (cand, e.code)
+            last_err = e
+            continue
         except Exception as e:
             last_err = e
             continue
+    if auth_cand:
+        raise AuthRequiredError(auth_cand[0], auth_cand[1])
     if explicit_model:
         return cands[0], [explicit_model]
     raise RuntimeError(
-        f"无法连接到本机接口 {raw}（已尝试 {', '.join(cands[:4])}{' 等' if len(cands) > 4 else ''}）。\n"
-        f"请确认本机推理服务已启动并加载模型。最后错误：{last_err}"
+        f"连不上本机接口 {raw}（已尝试 {', '.join(cands[:3])}{' 等' if len(cands) > 3 else ''}）。"
+        f"请确认服务已启动并加载模型（{last_err}）。"
     )
 
 
 def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    auth_hint: Optional[str] = None
+    auth_cand: Optional[Tuple[str, int]] = None
     for ep in COMMON_ENDPOINTS:
         for cand in (ep.rstrip("/"), ep.rstrip("/").removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep.rstrip("/"))):
             try:
@@ -1022,16 +1040,15 @@ def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
                 if models:
                     return cand, models
             except urllib.error.HTTPError as e:
-                if e.code in (401, 403) and not auth_hint:
-                    auth_hint = f"在 {cand} 发现推理服务但需要认证（HTTP {e.code}），请传入 --api-key <你的密钥>。"
+                if e.code in (401, 403) and auth_cand is None:
+                    auth_cand = (cand, e.code)
                 continue
             except Exception:
                 continue
-    if auth_hint:
-        raise RuntimeError(auth_hint)
+    if auth_cand:
+        raise AuthRequiredError(auth_cand[0], auth_cand[1])
     raise RuntimeError(
-        "未在本机常见端口（8080 / 11434 / 1234 / 8000 / 30000 / 8081 / 8082 / 8001 / 9000 / 5000）发现运行中的 OpenAI 兼容推理服务。\n"
-        "请确认推理服务已启动并加载模型，或直接输入你的自定义端口号（如 8088）或 --endpoint http://127.0.0.1:<端口>/v1"
+        "未在本机常见端口发现运行中的推理服务，请确认服务已启动，或在下方直接输入端口号（如 8080）。"
     )
 
 
@@ -1324,7 +1341,7 @@ def resolve_hardware(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def _ask(prompt_text: str, default: str = "") -> str:
-    suffix = f" [默认 {default}]" if default else ""
+    suffix = f"（默认 {default}）" if default else ""
     try:
         ans = input(f"{prompt_text}{suffix}：").strip()
     except (EOFError, KeyboardInterrupt):
@@ -1381,25 +1398,46 @@ def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed
 
 def print_welcome_banner() -> None:
     print(_c("╭────────────────────────────────────────────────────────────╮", "36"), file=sys.stderr)
-    print(_c(f"│  ⚡ llm-speedtest v{CLIENT_VERSION} · 本地大模型标准化测速工具       │", "1;36"), file=sys.stderr)
+    print(_c(f"│  ★ llm-speedtest v{CLIENT_VERSION} · 本地大模型标准化测速工具       │", "1;36"), file=sys.stderr)
     print(_c("╰────────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
     print(
-        "🔒 隐私承诺：100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
-        "   绝不收集用户名、主机名、文件路径、原始 IP 或 API Key。\n"
-        "   上传前会完整展示明文 JSON，欢迎随时把源码交给你的 AI 审计。",
+        "[隐私承诺] 100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
+        "           绝不收集用户名、主机名、路径、原始 IP 或 API Key；上传前明文可见。",
         file=sys.stderr,
     )
 
 
 def prompt_launch_mode() -> str:
     """Let interactive terminal users choose CLI or local WebUI."""
-    print("\n请选择操作方式：", file=sys.stderr)
-    print(f"  {_c('[1]', '1;36')} 终端命令行交互测速（推荐，本机或 SSH 终端直接跑）", file=sys.stderr)
-    print(f"  {_c('[2]', '1;36')} 打开本地 WebUI 可视化页面（自动在浏览器打开）", file=sys.stderr)
-    choice = _ask("请输入选项 [1/2]", "1").lower()
+    print("\n请选择启动方式：", file=sys.stderr)
+    print(f"  {_c('[1]', '1;36')} 终端直接测速（推荐，适合本机或 SSH 终端）", file=sys.stderr)
+    print(f"  {_c('[2]', '1;36')} 打开本地 WebUI 页面（在浏览器里操作）", file=sys.stderr)
+    choice = _ask("请输入 1 或 2，直接回车默认 1", "1").lower()
     if choice in ("2", "ui", "web", "webui", "w"):
         return "ui"
     return "cli"
+
+
+def _prompt_api_key_for_endpoint(
+    auth_ep: str, explicit_model: Optional[str] = None
+) -> Optional[Tuple[str, List[str], str]]:
+    """Interactively ask for API key when a local server returns HTTP 401/403."""
+    print(f"\n! 已找到本机服务 {_c(auth_ep, '36')}，但你的推理服务开启了 API Key 验证。", file=sys.stderr)
+    while True:
+        entered = _ask("请输入本机服务的 API Key（仅本地验证，绝不上传；输入 q 退出）")
+        if not entered or entered.lower() in ("q", "quit", "exit"):
+            print("已退出测速。", file=sys.stderr)
+            return None
+        # Be forgiving if user pasted "--api-key sk-xxx"
+        key = re.sub(r"^(?:--api-key|api-key=)\s*", "", entered, flags=re.IGNORECASE).strip()
+        try:
+            ep, models = resolve_endpoint(auth_ep, api_key=key, explicit_model=explicit_model)
+            return ep, models, key
+        except AuthRequiredError:
+            print(_c("✗ API Key 不正确，请重新输入（输入 q 退出）。", "1;31"), file=sys.stderr)
+        except RuntimeError as e:
+            print(_c(f"✗ 连接失败：{e}", "1;31"), file=sys.stderr)
+            return None
 
 
 def run_interactive_wizard(
@@ -1625,7 +1663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     vram_hint = f" ({hw['vram_gb']}GB 显存)" if hw.get("vram_gb") else ""
     ram_hint = f" · 内存 {hw['ram_gb']}GB" if hw.get("ram_gb") else ""
     print(
-        f"\n🖥️  本机硬件（自动采集）：{_c(hw['hw_raw'] + vram_hint, '1')} ×{hw['gpu_count']}{ram_hint} · 系统 {hw.get('os') or ''}",
+        f"\n◆ 本机硬件：{_c(hw['hw_raw'] + vram_hint, '1')} ×{hw['gpu_count']}{ram_hint} · 系统 {hw.get('os') or ''}",
         file=sys.stderr,
     )
 
@@ -1633,42 +1671,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.endpoint:
         try:
             endpoint, models = resolve_endpoint(args.endpoint, api_key=args.api_key, explicit_model=args.model)
+        except AuthRequiredError as e_auth:
+            if not interactive:
+                print(_c(f"\n✗ {e_auth}", "1;31"), file=sys.stderr)
+                return 1
+            res = _prompt_api_key_for_endpoint(e_auth.endpoint, explicit_model=args.model)
+            if not res:
+                return 1
+            endpoint, models, args.api_key = res
         except ValueError as e:
-            print(_c(f"\n❌ {e}", "1;31"), file=sys.stderr)
+            print(_c(f"\n✗ {e}", "1;31"), file=sys.stderr)
             return 2
         except RuntimeError as e:
-            print(_c(f"\n❌ {e}", "1;31"), file=sys.stderr)
+            print(_c(f"\n✗ {e}", "1;31"), file=sys.stderr)
             return 1
     else:
-        print("🔍 正在扫描本机常见推理端口（8080 / 11434 / 1234 / 8000 / 30000 / 8081）...", file=sys.stderr)
+        print("▸ 正在扫描本机推理服务...", file=sys.stderr)
         try:
             endpoint, models = discover_endpoint(api_key=args.api_key)
+        except AuthRequiredError as e_auth:
+            if not interactive:
+                print(_c(f"\n✗ {e_auth}", "1;31"), file=sys.stderr)
+                return 1
+            res = _prompt_api_key_for_endpoint(e_auth.endpoint, explicit_model=args.model)
+            if not res:
+                return 1
+            endpoint, models, args.api_key = res
         except RuntimeError as e:
             if not interactive:
-                print(_c(f"\n❌ {e}", "1;31"), file=sys.stderr)
+                print(_c(f"\n✗ {e}", "1;31"), file=sys.stderr)
                 return 1
-            print(f"\n⚠️  {e}", file=sys.stderr)
+            print(f"\n! {e}", file=sys.stderr)
             while True:
-                entered = _ask("请输入本机服务端口号或地址（如 8080 或 http://127.0.0.1:9000/v1；输入 q 退出）")
+                entered = _ask("请输入本机服务端口（如 8080，或完整本机地址；输入 q 退出）")
                 if not entered or entered.lower() in ("q", "quit", "exit"):
-                    print("👋 已退出测速。", file=sys.stderr)
+                    print("已退出测速。", file=sys.stderr)
                     return 1
                 try:
                     endpoint, models = resolve_endpoint(entered, api_key=args.api_key, explicit_model=args.model)
                     break
+                except AuthRequiredError as e_auth:
+                    res = _prompt_api_key_for_endpoint(e_auth.endpoint, explicit_model=args.model)
+                    if not res:
+                        return 1
+                    endpoint, models, args.api_key = res
+                    break
                 except ValueError as e_local:
-                    print(_c(f"❌ {e_local}", "1;31"), file=sys.stderr)
+                    print(_c(f"✗ {e_local}", "1;31"), file=sys.stderr)
                 except RuntimeError as e2:
-                    print(_c(f"❌ {e2}", "1;31"), file=sys.stderr)
+                    print(_c(f"✗ {e2}", "1;31"), file=sys.stderr)
 
     if not is_local_endpoint(endpoint):
-        print(_c(f"\n❌ {LOCAL_ONLY_ERR}", "1;31"), file=sys.stderr)
+        print(_c(f"\n✗ {LOCAL_ONLY_ERR}", "1;31"), file=sys.stderr)
         return 2
 
     detected_ctx_limit = detect_server_ctx_limit(endpoint, api_key=args.api_key)
     effective_ctx_limit = args.ctx_limit or detected_ctx_limit
     ctx_lim_hint = f" · 上下文上限 {effective_ctx_limit}" if effective_ctx_limit else ""
-    print(f"✅ 已连接本机推理服务：{_c(endpoint, '36')}（发现 {len(models)} 个已加载模型{ctx_lim_hint}）", file=sys.stderr)
+    print(f"✓ 已连接本机服务：{_c(endpoint, '36')}（{len(models)} 个已加载模型{ctx_lim_hint}）", file=sys.stderr)
 
     if not models and not args.model:
         print(_c("❌ 未检测到已加载模型，请先加载模型或通过 --model <模型名> 指定。", "1;31"), file=sys.stderr)
