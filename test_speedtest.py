@@ -51,7 +51,7 @@ class MappingTests(unittest.TestCase):
         self.assertFalse(speedtest.is_local_endpoint("http://gpu-box.local:8080/v1"))
 
         # Remote endpoint without explicit hardware must be rejected in non-interactive mode
-        with mock.patch.object(speedtest, "fetch_models", return_value=["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"]):
+        with mock.patch.object(speedtest, "resolve_endpoint", return_value=("http://192.168.1.50:8080/v1", ["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"])):
             rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--non-interactive", "--dry-run"])
             self.assertEqual(rc, 2)
 
@@ -104,6 +104,27 @@ class MappingTests(unittest.TestCase):
             self.assertEqual(hw["ram_gb"], 64)
             self.assertEqual(hw["os"], "linux")
             self.assertEqual(hw["gpu_count"], 1)
+
+    def test_endpoint_candidates_flexible_inputs(self):
+        # Bare IP -> tries reverse proxy + common ports with /v1 and without /v1
+        c1 = speedtest.endpoint_candidates("192.168.31.88")
+        self.assertIn("http://192.168.31.88/v1", c1)
+        self.assertIn("http://192.168.31.88:8080/v1", c1)
+        self.assertIn("http://192.168.31.88:11434/v1", c1)
+        self.assertIn("http://192.168.31.88:8080", c1)
+
+        # IP:port without scheme or /v1
+        c2 = speedtest.endpoint_candidates("192.168.31.88:11434")
+        self.assertEqual(c2, ["http://192.168.31.88:11434/v1", "http://192.168.31.88:11434"])
+
+        # Full chat/completions URL pasted from another app
+        c3 = speedtest.endpoint_candidates("http://10.0.0.5:9000/v1/chat/completions")
+        self.assertEqual(c3, ["http://10.0.0.5:9000/v1"])
+
+        # Custom prefix (non-/v1) preserved first
+        c4 = speedtest.endpoint_candidates("https://llm.lan/api/openai/")
+        self.assertEqual(c4[0], "https://llm.lan/api/openai")
+        self.assertEqual(c4[1], "https://llm.lan/api/openai/v1")
 
 
 class EndToEndMockTests(unittest.TestCase):

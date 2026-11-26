@@ -661,19 +661,112 @@ def http_json(url: str, payload: Optional[Dict[str, Any]] = None, headers: Optio
         return json.loads(resp.read().decode("utf-8"))
 
 
+COMMON_PORTS = [8080, 11434, 1234, 8000, 30000, 8081]
+
+
+def endpoint_candidates(raw: str) -> List[str]:
+    """Generate ordered candidate base URLs from flexible user input.
+
+    Accepts:
+      - '192.168.31.88'                       (auto-probes common ports + /v1 or root)
+      - '192.168.31.88:11434'                 (auto-adds http:// and tries /v1 & root)
+      - 'http://192.168.31.88:8080/v1'        (uses as-is)
+      - 'http://192.168.31.88:8080/v1/chat/completions' (strips /chat/completions)
+      - 'https://llm.lan/openai/v1/'          (keeps custom prefix)
+    """
+    s = (raw or "").strip()
+    if not s:
+        return []
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        s = "http://" + s
+    s = s.rstrip("/")
+    for suffix in ("/chat/completions", "/completions", "/models"):
+        if s.lower().endswith(suffix):
+            s = s[: -len(suffix)].rstrip("/")
+            break
+
+    parsed = urllib.parse.urlparse(s)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    if not host:
+        return [s]
+    host_fmt = f"[{host}]" if ":" in host else host
+    port = parsed.port
+    path = (parsed.path or "").rstrip("/")
+
+    cands: List[str] = []
+
+    def add(url: str) -> None:
+        u = url.rstrip("/")
+        if u not in cands:
+            cands.append(u)
+
+    if port is not None:
+        base = f"{scheme}://{host_fmt}:{port}"
+        if path:
+            add(f"{base}{path}")
+            if not path.lower().endswith("/v1"):
+                add(f"{base}{path}/v1")
+        else:
+            add(f"{base}/v1")
+            add(base)
+    else:
+        base = f"{scheme}://{host_fmt}"
+        if path:
+            add(f"{base}{path}")
+            if not path.lower().endswith("/v1"):
+                add(f"{base}{path}/v1")
+        else:
+            # First try reverse-proxy default port (80/443), then common local LLM ports
+            add(f"{base}/v1")
+            add(base)
+            for p in COMMON_PORTS:
+                add(f"{scheme}://{host_fmt}:{p}/v1")
+                add(f"{scheme}://{host_fmt}:{p}")
+    return cands
+
+
+def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Optional[str] = None) -> Tuple[str, List[str]]:
+    """Normalize and probe a user-supplied endpoint (flexible IP/port/path)."""
+    cands = endpoint_candidates(raw)
+    if not cands:
+        raise RuntimeError("Empty endpoint.")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    last_err: Optional[Exception] = None
+    for cand in cands:
+        try:
+            data = http_json(f"{cand}/models", headers=headers, timeout=2.5)
+            if isinstance(data, dict) and isinstance(data.get("data"), list):
+                models = [m["id"] for m in data["data"] if isinstance(m, dict) and m.get("id")]
+                if models:
+                    return cand, [explicit_model] if explicit_model else models
+                if explicit_model:
+                    return cand, [explicit_model]
+        except Exception as e:
+            last_err = e
+            continue
+    if explicit_model:
+        return cands[0], [explicit_model]
+    raise RuntimeError(
+        f"无法连接到 {raw}（已自动尝试 {', '.join(cands[:4])}{' 等' if len(cands) > 4 else ''}）。"
+        f"请确认推理服务已启动且监听在 0.0.0.0（局域网可访问）。最后错误：{last_err}"
+    )
+
+
 def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     for ep in COMMON_ENDPOINTS:
-        try:
-            data = http_json(f"{ep.rstrip('/')}/models", headers=headers, timeout=2.0)
-            models = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
-            if models:
-                return ep, models
-        except Exception:
-            continue
+        for cand in (ep.rstrip("/"), ep.rstrip("/").removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep.rstrip("/"))):
+            try:
+                data = http_json(f"{cand}/models", headers=headers, timeout=2.0)
+                models = [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+                if models:
+                    return cand, models
+            except Exception:
+                continue
     raise RuntimeError(
         "No local OpenAI-compatible server found on common ports (8080, 11434, 1234, 8000, 30000, 8081). "
-        "Start your local LLM server first or pass --endpoint http://127.0.0.1:PORT/v1"
+        "Start your local LLM server first or pass --endpoint <IP或完整URL>"
     )
 
 
@@ -1130,8 +1223,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 1. Discover or confirm endpoint first (so we know whether it's local or LAN/remote)
     if args.endpoint:
-        endpoint = args.endpoint.rstrip("/")
-        models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
+        try:
+            endpoint, models = resolve_endpoint(args.endpoint, api_key=args.api_key, explicit_model=args.model)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
     else:
         try:
             endpoint, models = discover_endpoint(api_key=args.api_key)
@@ -1140,13 +1236,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"Error: {e}", file=sys.stderr)
                 return 1
             print(f"\n{e}", file=sys.stderr)
-            entered = _ask("请输入推理服务地址（如 http://127.0.0.1:8080/v1 或 http://192.168.1.50:8080/v1）")
+            entered = _ask("请输入推理机 IP 或接口地址（如 192.168.31.88 或 http://IP:端口/自定义路径，不用写 /v1 也行）")
             if not entered:
                 return 1
-            endpoint = entered.rstrip("/")
-            if not endpoint.endswith("/v1"):
-                endpoint = endpoint + "/v1"
-            models = fetch_models(endpoint, api_key=args.api_key) if not args.model else [args.model]
+            try:
+                endpoint, models = resolve_endpoint(entered, api_key=args.api_key, explicit_model=args.model)
+            except RuntimeError as e2:
+                print(f"Error: {e2}", file=sys.stderr)
+                return 1
 
     remote = not is_local_endpoint(endpoint)
     ssh_hw: Optional[Dict[str, Any]] = None
