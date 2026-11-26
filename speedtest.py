@@ -30,6 +30,48 @@ SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
 DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
 
+UNIFIED_IDS = {
+    "m5ultra", "m5ultra64", "m5max40", "m5max32", "m5pro", "m6", "m5",
+    "m3ultra", "m4max", "m4pro", "m4", "m2ultra", "m2max", "aimax395", "dgxspark",
+}
+
+HW_ID_LABELS = {
+    "rtx5090": "RTX 5090", "rtx5080": "RTX 5080", "rtx5070ti": "RTX 5070 Ti", "rtx5070": "RTX 5070",
+    "rtx5060ti16": "RTX 5060 Ti 16GB", "rtx5060": "RTX 5060",
+    "rtx4090": "RTX 4090", "rtx4090-48": "RTX 4090 48GB",
+    "rtx4080s": "RTX 4080 Super", "rtx4080s-32": "RTX 4080 Super 32GB",
+    "rtx4070tis": "RTX 4070 Ti Super", "rtx4070ti": "RTX 4070 Ti", "rtx4070s": "RTX 4070 Super", "rtx4070": "RTX 4070",
+    "rtx4060ti16": "RTX 4060 Ti 16GB",
+    "rtx3090": "RTX 3090", "rtx3080-20": "RTX 3080 20GB", "rtx3080ti": "RTX 3080 Ti", "rtx3060": "RTX 3060 12GB",
+    "rtx2080ti-22": "RTX 2080 Ti 22GB",
+    "rtxpro6000": "RTX PRO 6000 Blackwell", "rtxpro5000-72": "RTX PRO 5000 Blackwell 72GB",
+    "rtxpro5000": "RTX PRO 5000 Blackwell 48GB", "rtxpro4500": "RTX PRO 4500 Blackwell", "rtxpro4000": "RTX PRO 4000 Blackwell",
+    "v100-16": "Tesla V100 16GB", "v100-32": "Tesla V100 32GB",
+    "rx7900xtx": "RX 7900 XTX", "rx7900xt": "RX 7900 XT", "r9700": "Radeon AI PRO R9700",
+    "rx9070xt": "RX 9070 XT", "rx9070": "RX 9070", "rx9060xt16": "RX 9060 XT 16GB",
+    "w7900": "Radeon PRO W7900", "w7800-48": "Radeon PRO W7800 48GB", "mi50": "Instinct MI50 16GB",
+    "arcprob70": "Arc Pro B70", "arcprob60": "Arc Pro B60", "arcb580": "Arc B580", "arca770": "Arc A770 16GB",
+    "m5ultra": "Apple M5 Ultra (80-core GPU)", "m5ultra64": "Apple M5 Ultra (64-core GPU)",
+    "m5max40": "Apple M5 Max (40-core GPU)", "m5max32": "Apple M5 Max (32-core GPU)",
+    "m5pro": "Apple M5 Pro", "m6": "Apple M6", "m5": "Apple M5",
+    "m3ultra": "Apple M3 Ultra", "m4max": "Apple M4 Max", "m4pro": "Apple M4 Pro", "m4": "Apple M4",
+    "m2ultra": "Apple M2 Ultra", "m2max": "Apple M2 Max",
+    "aimax395": "AMD Ryzen AI Max+ 395", "dgxspark": "NVIDIA DGX Spark",
+}
+
+
+def is_local_endpoint(endpoint: str) -> bool:
+    """Return True if endpoint points to the local machine (loopback)."""
+    try:
+        host = (urllib.parse.urlparse(endpoint).hostname or "").lower().strip("[]")
+    except Exception:
+        return False
+    if host in ("localhost", "localhost.localdomain", "::1", "0.0.0.0"):
+        return True
+    if host.startswith("127."):
+        return True
+    return False
+
 COMMON_ENDPOINTS = [
     "http://127.0.0.1:8080/v1",   # llama-server / Strata / mlx-serve
     "http://127.0.0.1:11434/v1",  # Ollama
@@ -617,7 +659,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ctx-limit", type=int, help="Server configured context limit (e.g. 131072)")
     p.add_argument("--fit", choices=["gpu", "hybrid"], help="Whether model fits fully in VRAM (gpu) or spills to RAM (hybrid)")
 
-    # Hardware overrides (when auto-detection cannot read DDR type/channels or modded specs)
+    # Hardware overrides (required for LAN/remote endpoints; optional overrides locally)
     p.add_argument("--hw-kind", choices=["gpu", "unified"], help="Override hardware kind (gpu or unified)")
     p.add_argument("--hw-id", help="Override canonical hardware ID (e.g. rtx4090-48)")
     p.add_argument("--hw-raw", help="Override raw hardware description")
@@ -626,6 +668,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ram-gb", type=int, help="Override system RAM in GB")
     p.add_argument("--ram-type", help="System RAM type (e.g. DDR4, DDR5, DDR3, Unified)")
     p.add_argument("--ram-channels", type=int, help="System RAM channels (e.g. 2, 4, 8)")
+    p.add_argument("--os", dest="target_os", choices=["linux", "windows", "macos"], help="Override target machine OS")
 
     # Benchmark parameters
     p.add_argument("--ctx", default="1024", help="Comma-separated prompt token sizes to test (default: 1024)")
@@ -642,26 +685,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    hw = detect_hardware()
+def resolve_hardware(args: argparse.Namespace, remote: bool) -> Dict[str, Any]:
+    """Build hardware spec. For remote/LAN endpoints, never mix in local machine hardware."""
+    if remote:
+        hw: Dict[str, Any] = {
+            "kind": None,
+            "hw_id": None,
+            "hw_raw": None,
+            "gpu_count": 1,
+            "vram_gb": None,
+            "ram_gb": None,
+            "ram_type": None,
+            "ram_channels": None,
+            "os": None,
+        }
+    else:
+        hw = detect_hardware()
+
     if args.hw_kind:
         hw["kind"] = args.hw_kind
     if args.hw_id:
-        hw["hw_id"] = args.hw_id
+        hw["hw_id"] = args.hw_id.lower()
         if not args.hw_kind:
-            unified_ids = {
-                "m5ultra", "m5ultra64", "m5max40", "m5max32", "m5pro", "m6", "m5",
-                "m3ultra", "m4max", "m4pro", "m4", "m2ultra", "m2max", "aimax395", "dgxspark",
-            }
-            hw["kind"] = "unified" if args.hw_id in unified_ids else "gpu"
+            hw["kind"] = "unified" if hw["hw_id"] in UNIFIED_IDS else "gpu"
+        if not args.hw_raw and (remote or not hw.get("hw_raw")):
+            hw["hw_raw"] = HW_ID_LABELS.get(hw["hw_id"], hw["hw_id"])
     if args.hw_raw:
         hw["hw_raw"] = args.hw_raw
+        if not args.hw_id and remote:
+            hw["hw_id"] = map_gpu_id(args.hw_raw, args.vram_gb) or map_apple_id(args.hw_raw, None)
     if args.gpu_count:
         hw["gpu_count"] = args.gpu_count
     if args.vram_gb:
         hw["vram_gb"] = args.vram_gb
-        if not args.hw_kind and not args.hw_id:
+        if not args.hw_kind and not hw.get("kind"):
             hw["kind"] = "gpu"
     if args.ram_gb:
         hw["ram_gb"] = args.ram_gb
@@ -669,10 +726,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         hw["ram_type"] = args.ram_type
     if args.ram_channels:
         hw["ram_channels"] = args.ram_channels
+    if args.target_os:
+        hw["os"] = args.target_os
+
+    if remote:
+        if not hw["hw_id"] and not hw["hw_raw"]:
+            raise ValueError(
+                "Remote/LAN endpoint detected: local hardware auto-detection is disabled so we never "
+                "misreport this client machine's specs as the server's.\n"
+                "Recommended: SSH into the inference machine and run speedtest.py there.\n"
+                "Or explicitly pass the server's hardware flags, e.g.:\n"
+                "  --hw-id rtx4090-48 --vram-gb 48 --ram-gb 64 --ram-type DDR4 --os linux"
+            )
+        if not hw["kind"]:
+            hw["kind"] = "unified" if (hw["hw_id"] in UNIFIED_IDS) else "gpu"
+        if not hw["hw_raw"]:
+            hw["hw_raw"] = HW_ID_LABELS.get(hw["hw_id"], hw["hw_id"])
+    return hw
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
 
     if args.detect_only:
+        hw = resolve_hardware(args, remote=False)
         print(json.dumps(hw, indent=2, ensure_ascii=False))
         return 0
+
+    remote = bool(args.endpoint and not is_local_endpoint(args.endpoint))
+    try:
+        hw = resolve_hardware(args, remote=remote)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
 
     if args.endpoint:
         endpoint = args.endpoint.rstrip("/")

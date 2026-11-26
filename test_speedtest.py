@@ -41,6 +41,33 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(speedtest.map_model_id("DeepSeek-V4.1-Flash-UD-IQ4_XS"), "ds-v41-flash")
         self.assertEqual(speedtest.infer_quant("DeepSeek-V4.1-Flash-UD-IQ4_XS"), "UD-IQ4_XS")
 
+    def test_remote_endpoint_guard(self):
+        self.assertTrue(speedtest.is_local_endpoint("http://127.0.0.1:8080/v1"))
+        self.assertTrue(speedtest.is_local_endpoint("http://localhost:11434/v1"))
+        self.assertTrue(speedtest.is_local_endpoint("http://[::1]:8080/v1"))
+        self.assertFalse(speedtest.is_local_endpoint("http://192.168.1.50:8080/v1"))
+        self.assertFalse(speedtest.is_local_endpoint("http://10.0.0.8:8000/v1"))
+        self.assertFalse(speedtest.is_local_endpoint("http://gpu-box.local:8080/v1"))
+
+        # Remote endpoint without explicit hardware must be rejected (never leaks local hardware)
+        rc = speedtest.main(["--endpoint", "http://192.168.1.50:8080/v1", "--dry-run"])
+        self.assertEqual(rc, 2)
+
+        # Remote endpoint WITH explicit hardware must not leak local OS / RAM
+        args = speedtest.parse_args([
+            "--endpoint", "http://192.168.1.50:8080/v1",
+            "--hw-id", "rtx4090-48",
+            "--ram-gb", "64",
+            "--ram-type", "DDR4",
+            "--os", "linux",
+        ])
+        hw = speedtest.resolve_hardware(args, remote=True)
+        self.assertEqual(hw["kind"], "gpu")
+        self.assertEqual(hw["hw_id"], "rtx4090-48")
+        self.assertEqual(hw["hw_raw"], "RTX 4090 48GB")
+        self.assertEqual(hw["ram_gb"], 64)
+        self.assertEqual(hw["os"], "linux")
+
 
 class EndToEndMockTests(unittest.TestCase):
     def setUp(self):

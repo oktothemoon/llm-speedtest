@@ -2,16 +2,22 @@
 
 如果你是用户的 AI Agent（如 Claude Code、Codex、Cursor、OpenClaw、Antigravity 等），用户把本仓库交给你跑本地大模型测速，请按以下 4 步执行：
 
-## 第 1 步：探测本机运行中的推理服务与配置
-不要替用户下载模型，直接检查本机已经跑起来的 OpenAI 兼容服务：
-1. 运行 `python3 speedtest.py --detect-only` 检查脚本自动识别的硬件规格（显卡型号、显存、内存）。
-2. 如用户没有告知端口，检查本机常见推理端口（`8080`、`11434`、`1234`、`8000`、`30000`、`8081`）或查看当前运行的推理进程名（如 `llama-server`、`strata`、`vllm`、`sglang`、`ollama`、`mlx`、`maya`）。
-3. 从进程参数或模型文件名中提取精确的元信息（**不要提取任何绝对路径、用户名或密钥**）：
-   - `--engine`：`strata` / `llamacpp` / `vllm` / `sglang` / `mlx` / `maya`
-   - `--quant`：如 `GSQ-RCO IQ3_S`、`Q4_K_M`、`UD-Q4_K_XL`、`FP8`、`NVFP4`
-   - `--mtp`：`true` 或 `false`（确认是否开启 MTP / 推测解码）
-   - `--ram-type` / `--ram-channels`：如 `DDR4`、`DDR5` 和通道数（若已知）
-   - `--fit`：`gpu`（全放显存）或 `hybrid`（显存 + 内存）
+## 第 1 步：探测运行中的推理服务与硬件配置
+不要替用户下载模型，直接检查已经跑起来的 OpenAI 兼容服务：
+
+- **情况 A：推理服务在本机（推荐）**
+  1. 运行 `python3 speedtest.py --detect-only` 检查脚本自动识别的硬件规格（显卡型号、显存、内存）。
+  2. 如用户没有告知端口，检查本机常见推理端口（`8080`、`11434`、`1234`、`8000`、`30000`、`8081`）或查看当前运行的推理进程名（如 `llama-server`、`strata`、`vllm`、`sglang`、`ollama`、`mlx`、`maya`）。
+- **情况 B：推理服务在局域网另一台机器（如 `http://192.168.x.x:8080/v1`）**
+  1. **优先尝试 SSH 到那台推理机上运行 `speedtest.py`**，这样硬件自动识别最准。
+  2. 如果无法 SSH、只能在当前机器跨局域网测：`speedtest.py` 会**自动禁用本机硬件探测**（避免把笔记本配置错报成服务器配置）。你必须先向用户确认**推理机**的真实规格，并在命令里显式传入 `--hw-id`（或 `--hw-raw`）、`--gpu-count`、`--vram-gb`、`--ram-gb`、`--ram-type`、`--ram-channels`、`--os`。
+
+从进程参数、启动命令或向用户确认中提取精确的元信息（**不要提取任何绝对路径、用户名或密钥**）：
+- `--engine`：`strata` / `llamacpp` / `vllm` / `sglang` / `mlx` / `maya`
+- `--quant`：如 `GSQ-RCO IQ3_S`、`Q4_K_M`、`UD-Q4_K_XL`、`FP8`、`NVFP4`
+- `--mtp`：`true` 或 `false`（确认是否开启 MTP / 推测解码）
+- `--ram-type` / `--ram-channels`：如 `DDR4`、`DDR5` 和通道数（若已知）
+- `--fit`：`gpu`（全放显存）或 `hybrid`（显存 + 内存）
 
 ## 第 2 步：先跑一次 `--dry-run`（仅本地测速，不上传）
 ```bash

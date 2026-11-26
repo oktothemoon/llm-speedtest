@@ -29,16 +29,28 @@ python3 speedtest.py \
 ```
 默认会在终端打印完整 JSON 并询问确认；加 `--yes` 可跳过确认提示。
 
+### 跨局域网测另一台电脑
+如果你的推理服务跑在局域网另一台主机（如 `192.168.1.50:8080`）：
+- **最推荐**：SSH 登录到那台推理机上直接跑 `python3 speedtest.py`，硬件自动识别最准。
+- **从另一台电脑远程测**：直接传 `--endpoint http://192.168.1.50:8080/v1` 也可以，脚本检测到非本机地址后会自动**关闭本机硬件探测**（防止把笔记本配置错记成推理机配置），你需要手动补上推理机的硬件参数：
+```bash
+python3 speedtest.py \
+  --endpoint http://192.168.1.50:8080/v1 \
+  --hw-id rtx4090-48 --vram-gb 48 --ram-gb 64 --ram-type DDR4 --ram-channels 2 --os linux \
+  --engine strata --quant "GSQ-RCO IQ3_S" --mtp true --fit hybrid
+```
+
 ### 常用参数
 | 参数 | 说明 |
 |---|---|
-| `--endpoint URL` | 本地 OpenAI 兼容地址（不填则自动探测 `8080`/`11434`/`1234`/`8000`/`30000`/`8081`） |
+| `--endpoint URL` | OpenAI 兼容地址（不填则自动探测本机 `8080`/`11434`/`1234`/`8000`/`30000`/`8081`） |
 | `--ctx 1024,32768` | 要测试的输入上下文长度（逗号分隔，默认 `1024`） |
 | `--gen-tokens 256` | 每轮生成 token 数（默认 `256`） |
 | `--runs 3` | 每档上下文重复测速轮数，取中位数（默认 `3`） |
 | `--engine` / `--quant` / `--mtp` | 推理引擎、量化版本、是否开启 MTP |
-| `--ram-type` / `--ram-channels` | 内存代数（`DDR4`/`DDR5` 等）与通道数 |
-| `--detect-only` | 仅打印自动识别的硬件规格并退出 |
+| `--hw-id` / `--hw-raw` / `--vram-gb` / `--os` | 硬件与系统参数（远程/局域网测速时必填） |
+| `--ram-gb` / `--ram-type` / `--ram-channels` | 内存容量、代数（`DDR4`/`DDR5` 等）与通道数 |
+| `--detect-only` | 仅打印本机自动识别的硬件规格并退出 |
 | `--dry-run` | 仅本地测速并打印 JSON，不上传 |
 
 ---
