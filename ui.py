@@ -221,7 +221,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
   <header>
     <div>
       <h1>llm-speedtest</h1>
-      <div class="sub">本地大模型标准化测速 · 数据汇总至 itbanana.com/llm-hardware</div>
+      <div class="sub">本地大模型标准化测速 · 实时上榜 itbanana.com/llm-speed &amp; /llm-hardware</div>
     </div>
     <div class="seg" role="tablist">
       <button id="tab-local" class="active" type="button">测本机（推荐）</button>
@@ -454,8 +454,18 @@ def _render_html(token: str, default_submit_url: str) -> str:
 
     <div id="result-box" class="hidden" style="margin-top:14px;">
       <div class="score-grid" id="score-grid"></div>
+      <div class="row" style="margin-top:12px;">
+        <div>
+          <label for="nickname-input">天梯署名（选填，≤20字，留空匿名，不可含网址）</label>
+          <input id="nickname-input" maxlength="20" placeholder="如：老曹 / 你的网名（留空即匿名）" />
+        </div>
+        <div>
+          <label for="note-input">一句话调优备注（选填，≤120字，方便同卡抄作业）</label>
+          <input id="note-input" maxlength="120" placeholder="如：Strata 0.2.15 + fa=on + DDR5-6400" />
+        </div>
+      </div>
       <div class="card-title" style="margin-top:10px;">
-        <span>完整明文 JSON（不含任何个人信息，可随时审查）</span>
+        <span>完整明文 JSON（含上方自愿填写的署名/备注，无任何隐私采集）</span>
         <button id="btn-copy" class="btn btn-ghost" style="padding:5px 10px;font-size:12px;" type="button">复制 JSON</button>
       </div>
       <pre id="json-preview"></pre>
@@ -841,14 +851,36 @@ async function pollStatus() {{
   }} catch {{}}
 }}
 
+function syncPublicMetaToPayload() {{
+  if (!lastPayload) return;
+  const nick = $('nickname-input').value.trim().slice(0, 20);
+  const note = $('note-input').value.trim().slice(0, 120);
+  if (nick) lastPayload.nickname = nick;
+  else delete lastPayload.nickname;
+  if (note) lastPayload.note = note;
+  else delete lastPayload.note;
+  try {{
+    if (nick) localStorage.setItem('llm-speedtest:nickname', nick);
+    else localStorage.removeItem('llm-speedtest:nickname');
+  }} catch {{}}
+  $('json-preview').textContent = JSON.stringify(lastPayload, null, 2);
+}}
+
+$('nickname-input').oninput = syncPublicMetaToPayload;
+$('note-input').oninput = syncPublicMetaToPayload;
+
 function renderResult(p) {{
   const r = p.results[0];
+  try {{
+    const savedNick = localStorage.getItem('llm-speedtest:nickname') || '';
+    if (savedNick && !$('nickname-input').value) $('nickname-input').value = savedNick;
+  }} catch {{}}
   $('score-grid').innerHTML = `
     <div class="metric"><div class="v">${{r.tg_tps}}</div><div class="k">生成速度 (tok/s)</div></div>
     <div class="metric"><div class="v">${{r.pp_tps || '-'}}</div><div class="k">读题速度 (tok/s)</div></div>
     <div class="metric"><div class="v">${{r.ttft_ms || '-'}} ms</div><div class="k">首字延迟 (${{r.source}})</div></div>
   `;
-  $('json-preview').textContent = JSON.stringify(p, null, 2);
+  syncPublicMetaToPayload();
   $('result-box').classList.remove('hidden');
   $('btn-upload').disabled = false;
   $('btn-upload').textContent = '确认上传至 itbanana.com';
@@ -870,6 +902,7 @@ $('btn-upload').onclick = async () => {{
   try {{
     const res = await api('/api/upload', {{ payload: lastPayload }});
     const resp = res.response || {{}};
+    const ranking = resp.ranking || null;
     const firstRes = (resp.results && resp.results[0]) || {{}};
     const recId = resp.record_id || firstRes.id || null;
     const isManual = firstRes.flag_reason === 'manual_hardware';
@@ -877,25 +910,35 @@ $('btn-upload').onclick = async () => {{
     const mdl = lastPayload.model || {{}};
     const r0 = (lastPayload.results && lastPayload.results[0]) || {{}};
     const verLabel = hw.detected_by === 'ssh' ? '🔒 SSH 实采' : hw.detected_by === 'local' ? '🔒 本机实采' : '人工自填（待复核）';
-    const pageUrl = recId && !isManual
-      ? `https://itbanana.com/llm-hardware?highlight=${{recId}}#live-speedtest`
-      : 'https://itbanana.com/llm-hardware#live-speedtest';
+    const pageUrl = ranking && ranking.ladder_url && !isManual
+      ? ranking.ladder_url
+      : (recId && !isManual
+        ? `https://itbanana.com/llm-hardware?highlight=${{recId}}#live-speedtest`
+        : 'https://itbanana.com/llm-hardware#live-speedtest');
 
     let extraLine = '';
-    if (resp.total_contributors) {{
+    if (ranking && !isManual) {{
+      const gap = Number(ranking.gap_to_first || 0);
+      const gapTxt = gap <= 0.05 ? '当前同卡第一！' : `距同卡第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
+      extraLine = `🏆 同款硬件排第 ${{ranking.same_hw_rank}} / ${{ranking.same_hw_total}} 名（中位 ${{ranking.same_hw_median}} tok/s），全榜第 ${{ranking.overall_rank}} / ${{ranking.overall_total}} 名，${{gapTxt}}`;
+    }} else if (resp.total_contributors) {{
       extraLine = `全站累计已收录 ${{resp.total_samples || 1}} 条实测，你是第 ${{resp.total_contributors}} 位贡献实测数据的玩家！`;
-    }}
-    if (res.stats && res.stats.group && res.stats.group.contributors) {{
-      const g = res.stats.group;
-      extraLine += ` 同配置社区区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
+      if (res.stats && res.stats.group && res.stats.group.contributors) {{
+        const g = res.stats.group;
+        extraLine += ` 同配置社区区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
+      }}
     }}
     if (isManual) {{
       extraLine = '由于硬件为手动选择，系统已自动进入复核队列，核验后将在网站公开展示。';
     }}
 
+    const ctaText = ranking && !isManual
+      ? `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`
+      : (recId && !isManual ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-hardware 查看实测榜 →');
+
     $('celeb-box').innerHTML = `
       <div class="celeb-top">
-        <div class="celeb-title">${{isManual ? '✅ 实测已收到，感谢贡献！' : '🎉 恭喜！你的实测已成功上榜'}}</div>
+        <div class="celeb-title">${{isManual ? '✅ 实测已收到，感谢贡献！' : (ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜')}}</div>
         <div class="celeb-id">${{recId && !isManual ? '实测 #' + recId : verLabel}}</div>
       </div>
       <div class="celeb-sub">${{extraLine}}</div>
@@ -910,7 +953,7 @@ $('btn-upload').onclick = async () => {{
         </div>
       </div>
       <a class="celeb-cta" href="${{pageUrl}}" target="_blank" rel="noopener noreferrer">
-        ${{recId && !isManual ? '去 itbanana.com 查看我的 #' + recId + ' 实测记录 →' : '前往 itbanana.com/llm-hardware 查看实测榜 →'}}
+        ${{ctaText}}
       </a>
     `;
     $('celeb-box').classList.remove('hidden');
@@ -1092,6 +1135,12 @@ def create_ui_server(
                 },
                 "results": results,
             }
+            nick = st_module.clean_public_text(cfg.get("nickname"), 20)
+            note = st_module.clean_public_text(cfg.get("note"), 120)
+            if nick:
+                payload["nickname"] = nick
+            if note:
+                payload["note"] = note
             log("测速完成！")
             with lock:
                 job["state"] = "done"

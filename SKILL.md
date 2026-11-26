@@ -18,6 +18,7 @@
 - `--mtp`：`true` 或 `false`（确认是否开启 MTP / 推测解码）
 - `--ram-type` / `--ram-channels`：如 `DDR4`、`DDR5` 和通道数（若已知）
 - `--fit`：`gpu`（全放显存）或 `hybrid`（显存 + 内存）
+- `--name` / `--note`（完全可选）：若用户想在 [速度天梯图（itbanana.com/llm-speed）](https://itbanana.com/llm-speed) 上署名或留下调优参数备注，可传入自定义昵称（≤20 字）与调优说明（≤120 字，勿包含网址或个人信息）；用户未提供则留空保持匿名。
 
 ## 第 2 步：先跑一次 `--non-interactive --dry-run`（仅本地测速，不上传）
 AI Agent 执行时请务必带上 `--non-interactive`（避免触发终端交互问答卡住）：

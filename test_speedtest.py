@@ -196,14 +196,28 @@ class EndToEndMockTests(unittest.TestCase):
                     self.wfile.flush()
                 elif self.path == "/api/llm-speedtest/submit":
                     uploaded_ref.append(body)
+                    rec_id = len(uploaded_ref)
                     self._send_json(200, {
                         "ok": True,
                         "batch_id": "test-batch",
-                        "record_id": len(uploaded_ref),
+                        "record_id": rec_id,
                         "accepted": len(body["results"]),
-                        "total_samples": len(uploaded_ref),
-                        "total_contributors": len(uploaded_ref),
-                        "results": [{"id": len(uploaded_ref), "status": "approved"}],
+                        "total_samples": rec_id,
+                        "total_contributors": rec_id,
+                        "results": [{"id": rec_id, "status": "approved"}],
+                        "ranking": {
+                            "model_id": body["model"].get("model_id"),
+                            "record_id": rec_id,
+                            "same_hw_rank": 1,
+                            "same_hw_total": 1,
+                            "overall_rank": 1,
+                            "overall_total": 1,
+                            "same_hw_median": 170.5,
+                            "same_hw_best": 170.5,
+                            "gap_to_first": 0,
+                            "vs_median_pct": 0,
+                            "ladder_url": f"https://itbanana.com/llm-speed?highlight={rec_id}",
+                        },
                     })
                 else:
                     self._send_json(404, {"error": "not found"})
@@ -240,6 +254,8 @@ class EndToEndMockTests(unittest.TestCase):
             "--engine", "strata",
             "--mtp", "true",
             "--fit", "hybrid",
+            "--name", "老曹",
+            "--note", "Strata 0.2.15 + fa=on",
             "--ctx", "1024",
             "--gen-tokens", "20",
             "--runs", "2",
@@ -257,6 +273,8 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["model"]["quant"], "GSQ-RCO IQ3_S")
         self.assertEqual(p["results"][0]["tg_tps"], 170.5)
         self.assertEqual(p["results"][0]["source"], "timings")
+        self.assertEqual(p["nickname"], "老曹")
+        self.assertEqual(p["note"], "Strata 0.2.15 + fa=on")
 
     def test_interactive_wizard_flow(self):
         base = f"http://127.0.0.1:{self.port}"

@@ -2,7 +2,7 @@
 
 轻量、开源、零第三方依赖的**本地大模型推理速度测试工具**（Python 3.9+ 标准库实现）。
 
-它直接对你本机已经运行起来的 OpenAI 兼容接口（llama.cpp、Strata、vLLM、SGLang、Ollama、LM Studio、MLX、Project Maya 等）执行标准化测速，并将**仅包含脱敏硬件规格与速度指标**的结果汇总到 [本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware)，帮助大家看到更真实的硬件实测速度。
+它直接对你本机已经运行起来的 OpenAI 兼容接口（llama.cpp、Strata、vLLM、SGLang、Ollama、LM Studio、MLX、Project Maya 等）执行标准化测速，并将**仅包含脱敏硬件规格与速度指标**的结果汇总到 [本地大模型速度天梯图（itbanana.com/llm-speed）](https://itbanana.com/llm-speed) 与 [本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware)，方便对比同款硬件的真实水平与调优上限。
 
 ---
 
@@ -36,6 +36,7 @@ python3 speedtest.py
 | `--gen-tokens 256` | 每轮生成 token 数（默认 `256`） |
 | `--runs 3` | 每档上下文重复测速轮数，取中位数（默认 `3`） |
 | `--engine` / `--quant` / `--mtp` | 推理引擎、量化版本、是否开启 MTP |
+| `--name` / `--note` | 选填：天梯图公开署名（≤20 字）与一句话调优备注（≤120 字），不填默认匿名 |
 | `--hw-id` / `--hw-raw` / `--vram-gb` / `--os` | 手动指定目标机硬件与系统 |
 | `--ram-gb` / `--ram-type` / `--ram-channels` | 内存容量、代数（`DDR4`/`DDR5` 等）与通道数 |
 | `--detect-only` | 仅打印本机自动识别的硬件规格并退出 |

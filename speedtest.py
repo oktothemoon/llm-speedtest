@@ -25,10 +25,20 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.1.0"
+CLIENT_VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
 DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
+
+
+def clean_public_text(val: Optional[str], max_chars: int) -> Optional[str]:
+    if not val:
+        return None
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(val))
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+    return s[:max_chars]
 
 UNIFIED_IDS = {
     "m5ultra", "m5ultra64", "m5max40", "m5max32", "m5pro", "m6", "m5",
@@ -1066,6 +1076,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--runs", type=int, default=3, help="Measured runs per context size (default: 3)")
     p.add_argument("--no-warmup", action="store_true", help="Skip the initial warmup request")
 
+    # Optional leaderboard identity & tuning note (voluntary public fields; anonymous if omitted)
+    p.add_argument("--name", "--nickname", dest="nickname", help="Optional public nickname on the speed leaderboard (<=20 chars, no URLs)")
+    p.add_argument("--note", help="Optional one-line tuning note on the leaderboard (<=120 chars, e.g. 'Strata 0.2.15 + fa=on')")
+
     # Upload / interaction / privacy controls
     p.add_argument("--ui", action="store_true", help="Open the local browser web UI (default when run with no flags in a terminal)")
     p.add_argument("--cli", action="store_true", help="Force terminal CLI mode instead of opening the local web UI")
@@ -1278,6 +1292,13 @@ def print_summary(payload: Dict[str, Any]) -> None:
     print("\n================ 测速成绩单 ================", file=sys.stderr)
     print(f"硬件: {hw['hw_raw']} ×{hw['gpu_count']} (RAM: {hw.get('ram_gb') or '?'}GB {hw.get('ram_type') or ''})".strip(), file=sys.stderr)
     print(f"模型: {mdl['model_raw']} | 量化: {mdl.get('quant') or '未填'} | 引擎: {sw.get('engine') or '未填'}", file=sys.stderr)
+    if payload.get("nickname") or payload.get("note"):
+        meta_parts = []
+        if payload.get("nickname"):
+            meta_parts.append(f"署名: {payload['nickname']}")
+        if payload.get("note"):
+            meta_parts.append(f"备注: {payload['note']}")
+        print(" | ".join(meta_parts), file=sys.stderr)
     for r in payload["results"]:
         print(
             f"  ctx≈{r['ctx_prompt']} tok -> 生成 {r['tg_tps']} tok/s | 读题 {r.get('pp_tps') or '-'} tok/s | "
@@ -1412,7 +1433,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for c in ctx_list
     ]
 
-    payload = {
+    payload: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "client_version": CLIENT_VERSION,
         "hardware": hw,
@@ -1431,6 +1452,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         },
         "results": results,
     }
+    nickname = clean_public_text(args.nickname, 20)
+    note = clean_public_text(args.note, 120)
+    if nickname:
+        payload["nickname"] = nickname
+    if note:
+        payload["note"] = note
 
     print_summary(payload)
     print("\n=== Benchmark Payload (no personal data included) ===")
@@ -1452,8 +1479,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         resp = http_json(args.submit_url, payload=payload, timeout=15.0)
         rec_id = resp.get("record_id")
+        ranking = resp.get("ranking") if isinstance(resp.get("ranking"), dict) else None
         print(f"\n🎉 上传成功：{json.dumps(resp, ensure_ascii=False)}", file=sys.stderr)
-        if rec_id:
+        if ranking:
+            gap = ranking.get("gap_to_first") or 0
+            gap_txt = "当前同卡第一！" if gap <= 0.05 else f"距同卡第一仅差 {gap} tok/s"
+            vs_med = ranking.get("vs_median_pct")
+            med_txt = f"（较中位 {ranking.get('same_hw_median')} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）" if vs_med is not None else ""
+            print(
+                f"🏆 天梯排名：同款硬件第 {ranking.get('same_hw_rank')} / {ranking.get('same_hw_total')} 名{med_txt}，"
+                f"全榜第 {ranking.get('overall_rank')} / {ranking.get('overall_total')} 名，{gap_txt}",
+                file=sys.stderr,
+            )
+            if ranking.get("ladder_url"):
+                print(f"直达天梯图高亮我的成绩：{ranking['ladder_url']}", file=sys.stderr)
+        elif rec_id:
             print(f"查看你的实测记录：https://itbanana.com/llm-hardware?highlight={rec_id}#live-speedtest", file=sys.stderr)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
