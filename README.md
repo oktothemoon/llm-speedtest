@@ -2,43 +2,46 @@
 
 轻量、开源、零第三方依赖的**本机大模型推理速度测试工具**（Python 3.9+ 标准库实现，支持 **Windows / macOS / Linux**）。
 
-它直接对你**当前电脑**上已经运行起来的 OpenAI 兼容接口（llama.cpp、Strata、vLLM、SGLang、Ollama、LM Studio、MLX、Project Maya 等）执行标准化测速，自动识别并锁定本机硬件规格，并将**仅包含脱敏硬件规格与速度指标**的结果汇总到 [本地大模型速度天梯图（itbanana.com/llm-speed）](https://itbanana.com/llm-speed) 与 [本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware)，方便对比同款硬件的真实水平与调优上限。
+> 🏆 **测完即可实时上榜！**
+> 想知道你的显卡 / Mac 在同款硬件里排第几、离同卡第一还差多少 `tok/s`、别人是怎么调出极限速度的？
+> 跑一遍本工具，自动完成 `1k / 32k / 64k / 128k / 256k` 多档上下文标准化测速，确认上传后即可**实时登上 [本地大模型速度天梯图（itbanana.com/llm-speed）](https://itbanana.com/llm-speed)** 与 **[本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware)**：
+> - 🏅 **立刻看到你的同卡排名 & 全榜排名**（登顶还有专属榜首战绩卡片与直达高亮链接）
+> - 🏷️ **支持自由署名 & 留下一句话调优配方**（如引擎版本、KV Cache 精度、MTP 开关等），晒出你的神级调优，也让同卡玩家直接抄作业
+> - 🔒 **100% 本机实测锁定硬件**，真实可信、零水分、零个人隐私采集
 
-> 为保证实测数据与硬件规格 100% 真实可信，本工具**仅支持在运行大模型的本机进行测速**（仅允许 `127.0.0.1` / `localhost`）。如果你的模型跑在另一台电脑或 Linux 服务器上，请直接到那台机器上（或通过 SSH 登录后）运行本脚本。
+支持所有本机运行中的 OpenAI 兼容接口（`llama.cpp`、`Strata`、`vLLM`、`SGLang`、`Ollama`、`LM Studio`、`MLX`、`Project Maya` 等）。
+
+> **仅限本机实测**：为保证硬件规格 100% 真实可信，本工具仅允许在运行大模型的本机测速（`127.0.0.1` / `localhost` / 本机网卡 IP）。如果模型跑在远端 Linux 服务器上，请先 SSH 登录后直接在该服务器上运行。
 
 ---
 
-## 快速开始
+## 快速开始（一条命令，测完直接冲榜）
 
 ### 方式一：自己直接运行（支持终端交互或打开本地 WebUI）
 
 **macOS / Linux：**
 ```bash
-git clone https://github.com/oktothemoon/llm-speedtest.git
-cd llm-speedtest
-python3 speedtest.py
+if [ -d llm-speedtest ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
 ```
 
-**Windows（PowerShell / CMD）：**
+**Windows（PowerShell）：**
 ```powershell
-git clone https://github.com/oktothemoon/llm-speedtest.git
-cd llm-speedtest
-python speedtest.py
+if (Test-Path llm-speedtest) { git -C llm-speedtest pull --ff-only } else { git clone https://github.com/oktothemoon/llm-speedtest.git }; cd llm-speedtest; python speedtest.py
 ```
 
-直接运行后会出现友好的中文引导菜单，你可以自由选择：
-- **`[1]` 终端命令行交互测速（默认）**：适合本机或 SSH 远程终端直接操作，自动识别本机硬件、扫描本机端口与模型 → 测速 → 查看成绩单与明文 JSON → 确认上传后展示专属上榜战绩卡片与天梯直达链接。
-- **`[2]` 打开本地 WebUI 可视化页面**：仅监听 `127.0.0.1`、自动在浏览器打开，点点鼠标即可完成测速与带礼花动效的上榜提交。
+运行后会出现中文引导菜单，你可以自由选择：
+- **`[1]` 终端直接测速（默认）**：适合本机或 SSH 终端，自动识别本机硬件、扫描端口与模型（如服务设置了 API Key 会直接引导输入）→ 自动跑 `1k / 32k / 64k / 128k / 256k` 测速 → 查看成绩单与明文 JSON → 选填署名/调优备注 → 确认上传并生成专属上榜战绩卡片与天梯直达链接。
+- **`[2]` 打开本地 WebUI 页面**：仅监听 `127.0.0.1`、自动在浏览器打开，点点鼠标即可完成多档测速与带礼花动效的上榜提交。
 
 也可以通过参数直接进入对应模式：
-- `python3 speedtest.py --cli`（或 Windows 下 `python speedtest.py --cli`）：直接进入终端交互模式
+- `python3 speedtest.py --cli`（Windows 下 `python speedtest.py --cli`）：直接进入终端模式
 - `python3 speedtest.py --ui`：直接启动本地 WebUI 页面
 
 ### 方式二：直接丢给你的 AI Agent 跑（最省事）
 直接把下面这段话复制发给你的 AI（Claude Code / Codex / Cursor / OpenClaw / Antigravity 等）：
 
 ```text
-请先拉取或查看 https://github.com/oktothemoon/llm-speedtest 里的 SKILL.md，按里面的步骤帮我测一下我本机正在运行的本地大模型速度。先用 --non-interactive --dry-run 跑完，把成绩单和完整 JSON 发我确认后再决定是否上传。
+请先拉取或查看 https://github.com/oktothemoon/llm-speedtest 里的 SKILL.md，按里面的步骤帮我测一下我本机正在运行的本地大模型速度。先用 --non-interactive --dry-run 跑完，把成绩单和完整 JSON 发我确认后再决定是否上传上榜。
 ```
 
 ---
@@ -48,7 +51,8 @@ python speedtest.py
 |---|---|
 | `--cli` / `--ui` | 直接进入终端命令行模式 / 直接打开本地 WebUI 页面 |
 | `--endpoint URL` | 本机 OpenAI 兼容地址或端口号（如 `8080` 或 `http://127.0.0.1:8080/v1`，不填则自动扫描） |
-| `--ctx 1k,32k,64k,128k,256k` | 要测试的输入上下文档位，逗号分隔、支持 `k` 缩写（默认 `1k,32k,64k,128k,256k`，超限档位自动跳过） |
+| `--api-key KEY` | 本机推理服务 API Key（选填，绝不上传；交互模式下遇到 401 也会自动提示输入） |
+| `--ctx 1k,32k,64k,128k,256k` | 要测试的输入上下文档位，逗号分隔、支持 `k` 缩写（默认全测，超限档位自动跳过） |
 | `--gen-tokens 256` | 每轮生成 token 数（默认 `256`） |
 | `--runs 3` | 短上下文每档测速轮数，取中位数（默认 `3`；≥64k 自动 1 轮） |
 | `--engine` / `--quant` / `--kv-cache` / `--mtp` | 推理引擎、量化版本、KV Cache 精度（`f16`/`bf16`/`fp8`/`int8`/`q8_0`/`q4_0`）、是否开启 MTP |
