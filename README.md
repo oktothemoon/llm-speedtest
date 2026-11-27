@@ -31,17 +31,36 @@
 
 ---
 
-## 快速开始（一条命令，测完直接冲榜）
+## 快速开始（一条命令，免 Git，测完直接冲榜）
+
+无需预先安装 Git；如果本机尚未安装 Python 3.9+，脚本会自动检测并给出中文安装指引（Windows 支持 `winget` 一键安装，macOS 支持 Homebrew，Linux 支持系统包管理器）。
 
 **macOS / Linux：**
 ```bash
-cd ~ && if [ -d llm-speedtest/.git ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
+curl -fsSL https://raw.githubusercontent.com/oktothemoon/llm-speedtest/main/run.sh | bash
 ```
 
 **Windows（PowerShell）：**
 ```powershell
+irm https://raw.githubusercontent.com/oktothemoon/llm-speedtest/main/run.ps1 | iex
+```
+
+<details>
+<summary>不想管道运行？查看手动下载 / Git 克隆运行方式（方便先审计源码）</summary>
+
+**macOS / Linux（Git）：**
+```bash
+cd ~ && if [ -d llm-speedtest/.git ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
+```
+
+**Windows PowerShell（Git）：**
+```powershell
 cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-only } else { git clone https://github.com/oktothemoon/llm-speedtest.git }; if (Test-Path llm-speedtest\speedtest.py) { cd llm-speedtest; python speedtest.py }
 ```
+
+或者直接点击页面上方 **Code → Download ZIP** 下载源码，解压后在目录中运行 `python3 speedtest.py`（Windows 下为 `python speedtest.py`）。
+
+</details>
 
 运行后会出现中文引导菜单（支持 `↑`/`↓` 方向键切换或直按 `1`/`2`）：
 - **`[1]` 终端直接测速（默认）**：适合本机或 SSH 终端，自动识别本机硬件、扫描端口与模型（如服务设置了 API Key 会直接引导输入）→ 自动跑 `1k / 32k / 64k / 128k / 256k` 测速 → 查看成绩单与明文 JSON → 选填署名/调优备注 → 确认上传并生成专属上榜战绩卡片与天梯直达链接。
