@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.21"
+CLIENT_VERSION = "0.3.22"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -1835,6 +1835,13 @@ def fetch_models(endpoint: str, api_key: Optional[str] = None) -> List[str]:
     return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
+def _model_path_candidates(value: str) -> List[str]:
+    """File name first, then up to 3 parent folder names (e.g. 'Qwen3.8-Flash-Next-GGUF/iq3_s.gguf').
+    Used in memory ONLY for model matching; the path is never stored or uploaded."""
+    parts = [p for p in (value or "").replace("\\", "/").split("/") if p and not p.endswith(":")]
+    return list(reversed(parts[-4:]))
+
+
 def detect_server_model_id(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
     """Best-effort leaderboard model_id detection: checks model_name first, then local /props or /models metadata in memory ONLY."""
     mid = map_model_id(model_name)
@@ -1850,10 +1857,10 @@ def detect_server_model_id(endpoint: str, model_name: str, api_key: Optional[str
                 for key in ("model_path", "model_alias", "model"):
                     v = props.get(key)
                     if isinstance(v, str) and v:
-                        base = os.path.basename(v.replace("\\", "/"))
-                        mid = map_model_id(base)
-                        if mid:
-                            return mid
+                        for cand in _model_path_candidates(v):
+                            mid = map_model_id(cand)
+                            if mid:
+                                return mid
         except Exception:
             pass
         try:
@@ -1866,10 +1873,10 @@ def detect_server_model_id(endpoint: str, model_name: str, api_key: Optional[str
                     for key in ("name", "root", "owned_by", "model"):
                         v = item.get(key)
                         if isinstance(v, str) and v:
-                            base = os.path.basename(v.replace("\\", "/"))
-                            mid = map_model_id(base)
-                            if mid:
-                                return mid
+                            for cand in _model_path_candidates(v):
+                                mid = map_model_id(cand)
+                                if mid:
+                                    return mid
         except Exception:
             pass
     return None

@@ -263,6 +263,13 @@ def _render_html(token: str, default_submit_url: str) -> str:
         <input id="quant-input" placeholder="例如 GSQ-RCO IQ3_S / Q4_K_M / FP8" />
       </div>
     </div>
+    <div class="row" style="margin-top:10px;">
+      <div>
+        <label for="lb-model-select">天梯模型（自动识别，可按需修改）</label>
+        <select id="lb-model-select"></select>
+        <div id="lb-model-hint" class="sub hidden" style="margin-top:6px;color:#b45309;"></div>
+      </div>
+    </div>
   </section>
 
   <!-- Step 2: Hardware & Software -->
@@ -502,7 +509,32 @@ function setMtp(v) {{
   document.querySelectorAll('#mtp-chips .chip').forEach((b) => b.classList.toggle('active', b.dataset.val === v));
 }}
 
-function setModels(models, guessedEngine, guessedQuant) {{
+let lbModels = [];
+function setLbModels(list) {{
+  if (!Array.isArray(list) || !list.length) return;
+  lbModels = list;
+  const sel = $('lb-model-select');
+  sel.innerHTML = '';
+  for (const [id, label] of list) {{
+    const o = document.createElement('option'); o.value = id; o.textContent = label; sel.appendChild(o);
+  }}
+}}
+
+function applyDetectedModelId(modelId, rawName) {{
+  const sel = $('lb-model-select');
+  const hint = $('lb-model-hint');
+  if (!lbModels.length) return;
+  if (modelId && lbModels.some(([id]) => id === modelId)) {{
+    sel.value = modelId;
+    hint.classList.add('hidden');
+  }} else {{
+    sel.value = lbModels[0][0];
+    hint.textContent = '接口返回的模型名为「' + (rawName || '?') + '」，无法自动识别，已默认选「' + lbModels[0][1] + '」，如不是请手动改。';
+    hint.classList.remove('hidden');
+  }}
+}}
+
+function setModels(models, guessedEngine, guessedQuant, detectedModelId) {{
   const sel = $('model-select');
   sel.innerHTML = '';
   for (const m of models) {{
@@ -510,6 +542,7 @@ function setModels(models, guessedEngine, guessedQuant) {{
   }}
   if (guessedEngine && !$('engine-select').value) $('engine-select').value = guessedEngine;
   if (guessedQuant) $('quant-input').value = guessedQuant;
+  applyDetectedModelId(detectedModelId, models && models[0]);
 }}
 
 async function probe(rawEndpoint) {{
@@ -520,7 +553,8 @@ async function probe(rawEndpoint) {{
   try {{
     const res = await api('/api/probe', {{ endpoint: rawEndpoint, api_key: $('apikey-input').value.trim() || null }});
     $('local-endpoint').value = res.endpoint;
-    setModels(res.models, res.guessed_engine, res.guessed_quant);
+    setLbModels(res.leaderboard_models);
+    setModels(res.models, res.guessed_engine, res.guessed_quant, res.detected_model_id);
     $('conn-badge').textContent = '已连接 · ' + res.models.length + ' 个模型';
   }} catch (e) {{
     $('conn-badge').textContent = '未连接';
@@ -535,12 +569,13 @@ async function init() {{
   setDetecting(true, '正在识别本机硬件与推理服务...');
   try {{
     const data = await api('/api/init');
+    setLbModels(data.leaderboard_models);
     localHw = data.local_hw;
     renderLocalHw();
     $('hw-hint').textContent = '本机硬件已锁定';
     if (data.local_endpoint) {{
       $('local-endpoint').value = data.local_endpoint;
-      setModels(data.local_models, data.guessed_engine, data.guessed_quant);
+      setModels(data.local_models, data.guessed_engine, data.guessed_quant, data.detected_model_id);
       $('conn-badge').textContent = '已自动连上本机服务';
     }} else {{
       $('conn-badge').textContent = '未检测到本机服务（请先启动服务或填端口后点重新检测）';
@@ -572,7 +607,8 @@ document.querySelectorAll('#ctx-chips .chip').forEach((b) => {{
 $('model-select').onchange = async () => {{
   const m = $('model-select').value;
   try {{
-    const res = await api('/api/infer-model', {{ model: m }});
+    const res = await api('/api/infer-model', {{ model: m, endpoint: $('local-endpoint').value.trim() || null, api_key: $('apikey-input').value.trim() || null }});
+    applyDetectedModelId(res.model_id, m);
     if (res.quant) $('quant-input').value = res.quant;
     if (res.engine && !$('engine-select').value) $('engine-select').value = res.engine;
   }} catch {{}}
@@ -597,6 +633,7 @@ $('btn-run').onclick = async () => {{
     endpoint: ep,
     api_key: $('apikey-input').value.trim() || null,
     model,
+    model_id: $('lb-model-select').value || null,
     quant: $('quant-input').value.trim() || null,
     engine: $('engine-select').value || null,
     kv_cache: $('kv-select').value || null,
@@ -1003,7 +1040,9 @@ def create_ui_server(
             client_id = None if cfg.get("anonymous") else (
                 st_module.clean_client_id(cfg.get("client_id")) or st_module.get_or_create_client_id()
             )
-            detected_mid = st_module.detect_server_model_id(endpoint, model, api_key=api_key)
+            known_ids = {mid for mid, _ in st_module.KNOWN_LEADERBOARD_MODELS}
+            picked_mid = (cfg.get("model_id") or "").strip()
+            detected_mid = picked_mid if picked_mid in known_ids else st_module.detect_server_model_id(endpoint, model, api_key=api_key)
             resolved_model_raw = st_module.resolve_model_raw(endpoint, model, model_id=detected_mid, api_key=api_key)
             detected_engine = cfg.get("engine") or st_module.infer_engine_auto(endpoint, model, api_key=api_key)
             detected_quant = cfg.get("quant") or st_module.detect_server_quant(endpoint, model, api_key=api_key)
@@ -1096,6 +1135,8 @@ def create_ui_server(
                     "local_models": models,
                     "guessed_engine": st_module.infer_engine_auto(ep or "", first_m) if ep else None,
                     "guessed_quant": st_module.detect_server_quant(ep or "", first_m) if (ep and first_m) else (st_module.infer_quant(first_m) if first_m else None),
+                    "detected_model_id": st_module.detect_server_model_id(ep or "", first_m) if first_m else None,
+                    "leaderboard_models": [list(x) for x in st_module.KNOWN_LEADERBOARD_MODELS],
                 })
             elif path == "/api/status":
                 with lock:
@@ -1126,13 +1167,17 @@ def create_ui_server(
                         "models": models,
                         "guessed_engine": st_module.infer_engine_auto(ep, first_m, api_key=body.get("api_key")),
                         "guessed_quant": st_module.detect_server_quant(ep, first_m, api_key=body.get("api_key")),
+                        "detected_model_id": st_module.detect_server_model_id(ep, first_m, api_key=body.get("api_key")) if first_m else None,
+                        "leaderboard_models": [list(x) for x in st_module.KNOWN_LEADERBOARD_MODELS],
                     })
                 except Exception as e:
                     self._send_json(400, {"error": str(e)})
             elif path == "/api/infer-model":
                 m = body.get("model") or ""
+                ep_raw = (body.get("endpoint") or "").strip()
+                ep_ok = ep_raw if (ep_raw and st_module.is_local_endpoint(ep_raw)) else ""
                 self._send_json(200, {
-                    "model_id": st_module.map_model_id(m),
+                    "model_id": st_module.detect_server_model_id(ep_ok, m, api_key=body.get("api_key")) if ep_ok else st_module.map_model_id(m),
                     "quant": st_module.infer_quant(m),
                     "engine": st_module.infer_engine_auto("", m),
                 })

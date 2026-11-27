@@ -780,6 +780,8 @@ class EndToEndMockTests(unittest.TestCase):
             probed = speedtest.http_json(f"{ui_base}/api/probe", payload={"endpoint": str(self.port)}, headers=hdrs)
             self.assertEqual(probed["endpoint"], f"{base}/v1")
             self.assertIn("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S", probed["models"])
+            self.assertEqual(probed["leaderboard_models"][0], ["qwen38-flash-next", "Qwen3.8-Flash-Next"])
+            self.assertIn("detected_model_id", probed)
 
             # 5. Start benchmark job -> server MUST lock hardware to local auto-detect
             speedtest.http_json(f"{ui_base}/api/start", payload={
@@ -831,6 +833,24 @@ class EndToEndMockTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertEqual(st2["state"], "done")
             self.assertNotIn("client_id", st2["payload"])
+
+            # 8. WebUI 手动选择的天梯模型优先；不在已知列表里的值被忽略
+            for picked, expected in (("qwen38-flash-next", "qwen38-flash-next"), ("evil-model", "qwen38-27b")):
+                speedtest.http_json(f"{ui_base}/api/start", payload={
+                    "endpoint": f"{base}/v1",
+                    "model": "Qwen3.8-27B-Q4_K_M",
+                    "model_id": picked,
+                    "ctx": "1k",
+                    "runs": 1,
+                }, headers=hdrs)
+                st3 = {}
+                for _ in range(50):
+                    st3 = speedtest.http_json(f"{ui_base}/api/status")
+                    if st3["state"] in ("done", "error"):
+                        break
+                    time.sleep(0.05)
+                self.assertEqual(st3["state"], "done")
+                self.assertEqual(st3["payload"]["model"]["model_id"], expected)
         finally:
             ui_srv.shutdown()
             ui_srv.server_close()
@@ -977,6 +997,29 @@ class TestLocalListeningDiscovery(unittest.TestCase):
         with mock.patch.object(speedtest, "http_json", side_effect=OSError("no props")):
             resolved = speedtest.resolve_model_raw("http://127.0.0.1:47831/v1", "iq3_s", model_id="qwen38-flash-next")
             self.assertEqual(resolved, "Qwen3.8-Flash-Next (iq3_s)")
+
+    def test_detect_model_id_from_parent_folder(self):
+        # Short alias + quant-only file name: the model name lives in the parent folder
+        with mock.patch.object(
+            speedtest,
+            "http_json",
+            return_value={"model_path": r"D:\\models\\Qwen3.8-Flash-Next-GGUF\\iq3_s.gguf"},
+        ):
+            self.assertEqual(
+                speedtest.detect_server_model_id("http://127.0.0.1:8080/v1", "iq3_s"),
+                "qwen38-flash-next",
+            )
+            resolved = speedtest.resolve_model_raw("http://127.0.0.1:8080/v1", "iq3_s", model_id="qwen38-flash-next")
+            self.assertEqual(resolved, "Qwen3.8-Flash-Next (iq3_s)")
+            self.assertNotIn("models", resolved)
+        # File name still wins over folder names
+        self.assertEqual(
+            speedtest._model_path_candidates("/a/Qwen3.8-27B/Qwen3.8-Flash-Next-IQ3_S.gguf")[0],
+            "Qwen3.8-Flash-Next-IQ3_S.gguf",
+        )
+        # Non-local endpoints never get probed
+        with mock.patch.object(speedtest, "http_json", side_effect=AssertionError("must not call")):
+            self.assertIsNone(speedtest.detect_server_model_id("http://192.168.1.5:8080/v1", "iq3_s"))
 
     def test_build_warmup_prompt(self):
         p = speedtest.build_warmup_prompt(131072)
