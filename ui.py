@@ -694,34 +694,71 @@ $('btn-upload').onclick = async () => {{
         : 'https://itbanana.com/llm-speed');
 
     let extraLine = '';
+    let celebTitle = ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜';
     if (ranking) {{
+      const sameHwRank = ranking.same_hw_rank;
+      const sameHwTotal = ranking.same_hw_total;
       const sameModelRank = ranking.same_model_rank ?? ranking.overall_rank;
       const sameModelTotal = ranking.same_model_total ?? ranking.overall_total;
       const gap = Number(ranking.gap_to_first || 0);
-      const gapTxt = gap <= 0.05 ? '当前同配置榜首！' : `距同配置第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
-      extraLine = `🏆 同配置同模型速度排名第 ${{ranking.same_hw_rank}} / ${{ranking.same_hw_total}} 名（中位 ${{ranking.same_hw_median}} tok/s），同模型速度排名第 ${{sameModelRank}} / ${{sameModelTotal}} 名，${{gapTxt}}`;
+      const isSoleHw = sameHwTotal != null && sameHwTotal <= 1;
+      if (sameHwRank === 1 && !isSoleHw && gap <= 0.05) {{
+        celebTitle = '👑 新王登基！你的实测已登顶同配置同模型榜首';
+      }} else if (sameHwRank === 1 && isSoleHw && gap <= 0.05) {{
+        celebTitle = '🚩 首位开荒！你为该配置+模型立下了首条实测基准';
+      }}
+      const medTxt = (!isSoleHw && ranking.same_hw_median != null)
+        ? `（中位 ${{ranking.same_hw_median}} tok/s）`
+        : '';
+      let hwTail = '';
+      if (sameHwRank === 1) {{
+        if (gap > 0.05) {{
+          hwTail = `，本次较个人历史最佳低 ${{gap}} tok/s，未刷新纪录`;
+        }} else if (isSoleHw) {{
+          hwTail = '，同配置首个基准！';
+        }} else {{
+          hwTail = '，当前同配置榜首！';
+        }}
+      }} else if (gap > 0.05) {{
+        hwTail = `，距同配置第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
+      }}
+      const parts = [];
+      if (sameHwRank != null && sameHwTotal != null) {{
+        parts.push(`🏆 同配置同模型速度排名第 ${{sameHwRank}} / ${{sameHwTotal}} 名${{medTxt}}${{hwTail}}`);
+      }}
+      if (sameModelRank != null && sameModelTotal != null) {{
+        parts.push(`同模型速度排名第 ${{sameModelRank}} / ${{sameModelTotal}} 名`);
+      }}
+      extraLine = parts.join('；');
     }} else if (resp.total_contributors) {{
       extraLine = `全站累计已收录 ${{resp.total_samples || 1}} 条实测，你是第 ${{resp.total_contributors}} 位贡献实测数据的玩家！`;
     }}
     if (res.stats && res.stats.group && res.stats.group.contributors) {{
       const g = res.stats.group;
-      extraLine += `${{extraLine ? ' ' : ''}}同配置同模型参考区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}} tok/s，共 ${{g.contributors}} 位实测用户）。`;
+      const refTxt = (g.contributors === 1 && g.tg_min === g.tg_max)
+        ? `同配置同模型参考基准 ${{g.tg_median}} tok/s（共 1 位实测用户）。`
+        : `同配置同模型参考区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}} tok/s，共 ${{g.contributors}} 位实测用户）。`;
+      extraLine += `${{extraLine ? ' ' : ''}}${{refTxt}}`;
     }}
 
     const ctaText = ranking
       ? `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`
       : (recId ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-speed 查看实测榜 →');
+    const mdlRaw = String(mdl.model_raw || '-');
+    const quantSuffix = (mdl.quant && String(mdl.quant).toLowerCase() !== mdlRaw.trim().toLowerCase())
+      ? ' · ' + mdl.quant
+      : '';
 
     $('celeb-box').innerHTML = `
       <div class="celeb-top">
-        <div class="celeb-title">${{ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜'}}</div>
+        <div class="celeb-title">${{celebTitle}}</div>
         <div class="celeb-id">${{recId ? '实测 #' + recId : verLabel}}</div>
       </div>
       <div class="celeb-sub">${{extraLine}}</div>
       <div class="celeb-card">
         <div>
           <div class="celeb-hw">${{hw.hw_raw}}${{hw.gpu_count > 1 ? ' ×' + hw.gpu_count : ''}}${{hw.ram_gb ? ' · ' + hw.ram_gb + 'GB' : ''}}</div>
-          <div class="celeb-mdl">${{mdl.model_raw}}${{mdl.quant ? ' · ' + mdl.quant : ''}} · ${{verLabel}}</div>
+          <div class="celeb-mdl">${{mdlRaw}}${{quantSuffix}} · ${{verLabel}}</div>
         </div>
         <div class="celeb-spd">
           <div class="big">${{r0.tg_tps}} tok/s</div>
@@ -843,7 +880,7 @@ def create_ui_server(
 
             if not no_warmup:
                 log("正在发送预热请求...")
-                st_module.run_single_completion(endpoint, model, "Say OK.", 24, api_key=api_key)
+                st_module.run_single_completion(endpoint, model, st_module.build_warmup_prompt(ctx_limit), 24, api_key=api_key)
 
             results: List[Dict[str, Any]] = []
             cpt = 5.6
@@ -893,13 +930,17 @@ def create_ui_server(
             client_id = None if cfg.get("anonymous") else (
                 st_module.clean_client_id(cfg.get("client_id")) or st_module.get_or_create_client_id()
             )
+            detected_mid = st_module.detect_server_model_id(endpoint, model, api_key=api_key)
+            resolved_model_raw = st_module.resolve_model_raw(endpoint, model, model_id=detected_mid, api_key=api_key)
+            detected_engine = cfg.get("engine") or st_module.infer_engine_auto(endpoint, model, api_key=api_key)
+            detected_quant = cfg.get("quant") or st_module.detect_server_quant(endpoint, model, api_key=api_key)
             payload = {
                 "schema_version": st_module.SCHEMA_VERSION,
                 "client_version": st_module.CLIENT_VERSION,
                 **({"client_id": client_id} if client_id else {}),
                 "hardware": hw,
                 "software": {
-                    "engine": cfg.get("engine"),
+                    "engine": detected_engine,
                     "engine_version": None,
                     "backend": None,
                     "kv_cache": st_module.normalize_kv_cache(cfg.get("kv_cache")),
@@ -907,9 +948,9 @@ def create_ui_server(
                     "ctx_limit": ctx_limit,
                 },
                 "model": {
-                    "model_id": st_module.map_model_id(model),
-                    "model_raw": model,
-                    "quant": cfg.get("quant") or st_module.infer_quant(model),
+                    "model_id": detected_mid,
+                    "model_raw": resolved_model_raw,
+                    "quant": detected_quant,
                     "fit": None,
                 },
                 "results": results,

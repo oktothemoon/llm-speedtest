@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.7"
+CLIENT_VERSION = "0.3.8"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -304,7 +304,7 @@ def infer_engine_from_text(text: str) -> Optional[str]:
     low = (text or "").lower()
     if re.search(r"\bstrata\b", low):
         return "strata"
-    if re.search(r"\b(?:llama\.?cpp|llamacpp|llama-server|ollama|lm\s*studio)\b", low):
+    if re.search(r"\b(?:llama\.?cpp|llamacpp|llama[-_]?server|ik[-_]?llama|ollama|lm\s*studio|koboldcpp)\b", low):
         return "llamacpp"
     if re.search(r"\bvllm\b", low):
         return "vllm"
@@ -378,6 +378,12 @@ def _detect_http_engine(endpoint: str, api_key: Optional[str] = None) -> Optiona
                                 eng = infer_engine_from_text(v)
                                 if eng:
                                     return eng
+                        for k in ("model_path", "model_alias", "model"):
+                            v = obj.get(k)
+                            if isinstance(v, str) and re.search(r"gsq[\s_-]*rco|ista[\s_-]*daslab", v, re.IGNORECASE):
+                                return "strata"
+                        if any(k in obj for k in ("default_generation_settings", "total_slots")):
+                            return "llamacpp"
         except Exception:
             continue
     return None
@@ -1703,6 +1709,64 @@ def detect_server_model_id(endpoint: str, model_name: str, api_key: Optional[str
     return None
 
 
+def _strip_model_file_ext(name: str) -> str:
+    return re.sub(r"\.(?:gguf|bin|safetensors|mlx)$", "", name.strip(), flags=re.IGNORECASE)
+
+
+def resolve_model_raw(
+    endpoint: str,
+    model_name: str,
+    model_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """Resolve a human-readable model_raw without ever exposing local directory paths.
+
+    If API already returned a recognizable model name, keep it as-is.
+    When API only returned a short alias (e.g. 'iq3_s'), prefer the pure filename stem
+    from local /props or /models metadata; otherwise fall back to '<Label> (<alias>)'.
+    """
+    raw = (model_name or "").strip()
+    if not raw or map_model_id(raw):
+        return raw
+
+    if endpoint and is_local_endpoint(endpoint):
+        ep = endpoint.rstrip("/")
+        root = re.sub(r"/v1$", "", ep, flags=re.IGNORECASE)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            props = http_json(f"{root}/props", headers=headers, timeout=1.5)
+            if isinstance(props, dict):
+                for key in ("model_path", "model_alias", "model"):
+                    v = props.get(key)
+                    if isinstance(v, str) and v:
+                        stem = _strip_model_file_ext(os.path.basename(v.replace("\\", "/")))
+                        if stem and map_model_id(stem):
+                            return stem
+        except Exception:
+            pass
+        try:
+            data = http_json(f"{ep}/models", headers=headers, timeout=1.5)
+            items = data.get("data") if isinstance(data, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("name", "root", "model"):
+                        v = item.get(key)
+                        if isinstance(v, str) and v:
+                            stem = _strip_model_file_ext(os.path.basename(v.replace("\\", "/")))
+                            if stem and map_model_id(stem):
+                                return stem
+        except Exception:
+            pass
+
+    if model_id:
+        label = dict(KNOWN_LEADERBOARD_MODELS).get(model_id, model_id)
+        if label and label.lower() != raw.lower():
+            return f"{label} ({raw})"
+    return raw
+
+
 def detect_server_quant(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
     """Best-effort quant detection: checks model_name first, then enriches from local /props filename in memory ONLY (path is never stored or uploaded)."""
     q_from_name = infer_quant(model_name)
@@ -1778,6 +1842,14 @@ def effective_ctx_target(tier_ctx: int, gen_tokens: int, ctx_limit: Optional[int
         # e.g. server n_ctx=262144 and tier=256k -> trim slightly to fit gen_tokens + chat template
         return ctx_limit - margin
     return None
+
+
+def build_warmup_prompt(ctx_limit: Optional[int] = None) -> str:
+    """Build a short (~256-token) warmup prompt so prefill kernels and KV buffers warm up before 1k."""
+    target = 256
+    if ctx_limit and ctx_limit > 0:
+        target = min(target, max(32, ctx_limit - 128))
+    return build_prompt(target, "warmup")
 
 
 def build_prompt(target_tokens: int, nonce: str, chars_per_token: float = 5.6) -> str:
@@ -2454,12 +2526,22 @@ def print_upload_ceremony(
     first_res = (resp.get("results") or [{}])[0] if isinstance(resp.get("results"), list) else {}
     rec_id = resp.get("record_id") or (first_res.get("id") if isinstance(first_res, dict) else None)
 
-    is_king = bool(ranking and ranking.get("same_hw_rank") == 1)
-    title = (
-        "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
-        if is_king
-        else ("★ 恭喜上榜！实测成绩已载入速度天梯图 ★" if ranking else "★ 恭喜！你的本机实测已成功上榜 ★")
-    )
+    same_hw_rank = ranking.get("same_hw_rank") if ranking else None
+    same_hw_total = ranking.get("same_hw_total") if ranking else None
+    gap = float(ranking.get("gap_to_first") or 0) if ranking else 0.0
+    is_sole_hw = bool(ranking and same_hw_total is not None and same_hw_total <= 1)
+    is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and gap <= 0.05)
+    is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and gap <= 0.05)
+
+    if is_king:
+        title = "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
+    elif is_pioneer:
+        title = "★ 首位开荒！你为该配置+模型立下了首条实测基准！ ★"
+    elif ranking:
+        title = "★ 恭喜上榜！实测成绩已载入速度天梯图 ★"
+    else:
+        title = "★ 恭喜！你的本机实测已成功上榜 ★"
+
     badge = f"实测编号 #{rec_id} · [本机实采认证]" if rec_id else "[本机实采认证]"
     cnt = f" ×{hw['gpu_count']}" if (hw.get("gpu_count") or 1) > 1 else ""
     cpu_part = (
@@ -2469,14 +2551,16 @@ def print_upload_ceremony(
     )
     ram_t = f" {hw['ram_type']}" if hw.get("ram_type") and hw.get("ram_type") != "Unified" else ""
     ram = f" · {hw['ram_gb']}GB{ram_t}" if hw.get("ram_gb") else (f" ·{ram_t}" if ram_t else "")
-    quant = f" · {mdl['quant']}" if mdl.get("quant") else ""
+    model_raw = str(mdl.get("model_raw") or "-")
+    quant_raw = str(mdl.get("quant") or "")
+    quant = f" · {quant_raw}" if quant_raw and quant_raw.lower() != model_raw.strip().lower() else ""
     kv = f" · KV {sw['kv_cache']}" if sw.get("kv_cache") else ""
     author = payload.get("nickname") or "匿名贡献者"
 
     info_lines: List[str] = [
         f"  ★ {_c(badge, '1;36')}",
         f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{cpu_part}{ram}",
-        f"  ◆ 模型：{mdl.get('model_raw', '-')}{quant}{kv}",
+        f"  ◆ 模型：{model_raw}{quant}{kv}",
     ]
     if len(results) == 1:
         info_lines.append(
@@ -2496,22 +2580,35 @@ def print_upload_ceremony(
 
     ranking_lines: List[str] = []
     if ranking:
-        gap = float(ranking.get("gap_to_first") or 0)
-        gap_txt = "★ 当前同配置榜首！" if gap <= 0.05 else f"距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！"
         vs_med = ranking.get("vs_median_pct")
+        med_val = ranking.get("same_hw_median")
         med_txt = (
-            f"（较同配置中位 {ranking.get('same_hw_median')} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
-            if vs_med is not None
+            f"（较同配置中位 {med_val} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
+            if (not is_sole_hw and vs_med is not None and med_val is not None)
             else ""
         )
+        if same_hw_rank == 1:
+            if gap > 0.05:
+                hw_tail = f" · 本次较个人历史最佳低 {gap:g} tok/s，未刷新纪录"
+            elif is_sole_hw:
+                hw_tail = " · ★ 同配置首个基准！"
+            else:
+                hw_tail = " · ★ 当前同配置榜首！"
+        elif gap > 0.05:
+            hw_tail = f" · 距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！"
+        else:
+            hw_tail = ""
+
+        if same_hw_rank is not None and same_hw_total is not None:
+            ranking_lines.append(
+                f"  ★ 同配置同模型速度排名：第 {_c(str(same_hw_rank), '1;33')} / {same_hw_total} 名{med_txt}{hw_tail}"
+            )
         same_model_rank = ranking.get("same_model_rank") or ranking.get("overall_rank")
         same_model_total = ranking.get("same_model_total") or ranking.get("overall_total")
-        ranking_lines.append(
-            f"  ★ 同配置同模型速度排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}"
-        )
-        ranking_lines.append(
-            f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名 · {gap_txt}"
-        )
+        if same_model_rank is not None and same_model_total is not None:
+            ranking_lines.append(
+                f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名"
+            )
 
     community_lines: List[str] = []
     if resp.get("total_contributors"):
@@ -2520,9 +2617,14 @@ def print_upload_ceremony(
         )
     if stats and isinstance(stats.get("group"), dict) and stats["group"].get("contributors"):
         g = stats["group"]
-        community_lines.append(
-            f"  ◆ 同配置同模型参考区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位实测用户）"
-        )
+        if g.get("contributors") == 1 and g.get("tg_min") == g.get("tg_max"):
+            community_lines.append(
+                f"  ◆ 同配置同模型参考基准：{g['tg_median']} tok/s（共 1 位实测用户）"
+            )
+        else:
+            community_lines.append(
+                f"  ◆ 同配置同模型参考区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位实测用户）"
+            )
 
     ladder_url = (ranking or {}).get("ladder_url") or (
         f"https://itbanana.com/llm-speed?highlight={rec_id}" if rec_id else "https://itbanana.com/llm-speed"
@@ -2696,7 +2798,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.no_warmup:
         print("\n▸ 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
-        run_single_completion(endpoint, model_name, "Say OK.", 24, api_key=args.api_key)
+        run_single_completion(endpoint, model_name, build_warmup_prompt(effective_ctx_limit), 24, api_key=args.api_key)
 
     ctx_list = parse_ctx_list(ctx_str)
     results: List[Dict[str, Any]] = []
@@ -2734,6 +2836,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(_c("✗ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)
         return 1
 
+    resolved_model_id = args.model_id or map_model_id(model_name)
+    resolved_model_raw = resolve_model_raw(endpoint, model_name, model_id=resolved_model_id, api_key=args.api_key)
     client_id = None if args.anonymous else (clean_client_id(args.client_id) or get_or_create_client_id())
     payload: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -2749,8 +2853,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "ctx_limit": effective_ctx_limit,
         },
         "model": {
-            "model_id": args.model_id or map_model_id(model_name),
-            "model_raw": model_name,
+            "model_id": resolved_model_id,
+            "model_raw": resolved_model_raw,
             "quant": args.quant or infer_quant(model_name),
             "fit": args.fit,
         },

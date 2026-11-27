@@ -237,6 +237,87 @@ class MappingTests(unittest.TestCase):
         for ln in sum_lines[1:-1]:
             self.assertLess(speedtest._display_width(ln), top_w)
 
+    def test_ceremony_ranking_edge_cases(self):
+        base_payload = {
+            "hardware": {"hw_raw": "NVIDIA GeForce RTX 5070 Ti", "gpu_count": 1, "ram_gb": 64, "ram_type": "DDR4"},
+            "software": {"kv_cache": None},
+            "model": {"model_raw": "iq3_s", "quant": "IQ3_S"},
+            "results": [{"ctx_prompt": 1024, "tg_tps": 65.6, "pp_tps": 658.0, "ttft_ms": 1584.9, "runs": 3}],
+        }
+
+        def _render(ranking, stats=None):
+            buf = io.StringIO()
+            resp = {"record_id": 56, "total_samples": 59, "total_contributors": 5, "ranking": ranking}
+            with mock.patch("sys.stderr", buf):
+                speedtest.print_upload_ceremony(base_payload, resp, stats)
+            return buf.getvalue()
+
+        # 1. Rank 1/1 with gap > 0 (own historical record is faster): must NOT claim king or "距同配置第一"
+        out_not_pb = _render(
+            {
+                "same_hw_rank": 1,
+                "same_hw_total": 1,
+                "same_hw_median": 71.6,
+                "vs_median_pct": -8,
+                "same_model_rank": 5,
+                "same_model_total": 5,
+                "gap_to_first": 6.0,
+            },
+            stats={"group": {"tg_min": 71.6, "tg_max": 71.6, "tg_median": 71.6, "contributors": 1}},
+        )
+        self.assertNotIn("新王登基", out_not_pb)
+        self.assertNotIn("距同配置第一", out_not_pb)
+        self.assertNotIn("较同配置中位", out_not_pb)
+        self.assertIn("本次较个人历史最佳低 6 tok/s", out_not_pb)
+        self.assertIn("参考基准：71.6 tok/s（共 1 位实测用户）", out_not_pb)
+        self.assertNotIn("71.6–71.6", out_not_pb)
+        # Duplicate model_raw / quant should not render as "iq3_s · IQ3_S"
+        self.assertNotIn("iq3_s · IQ3_S", out_not_pb)
+
+        # 2. Sole pioneer (1/1, gap == 0): pioneer banner, not king
+        out_pioneer = _render({
+            "same_hw_rank": 1,
+            "same_hw_total": 1,
+            "same_hw_median": 65.6,
+            "vs_median_pct": 0,
+            "same_model_rank": 3,
+            "same_model_total": 5,
+            "gap_to_first": 0.0,
+        })
+        self.assertIn("首位开荒", out_pioneer)
+        self.assertNotIn("新王登基", out_pioneer)
+        self.assertIn("同配置首个基准", out_pioneer)
+
+        # 3. True king (1/3, gap == 0)
+        out_king = _render({
+            "same_hw_rank": 1,
+            "same_hw_total": 3,
+            "same_hw_median": 60.0,
+            "vs_median_pct": 9,
+            "same_model_rank": 2,
+            "same_model_total": 5,
+            "gap_to_first": 0.0,
+        })
+        self.assertIn("新王登基", out_king)
+        self.assertIn("较同配置中位 60.0 tok/s +9%", out_king)
+        self.assertIn("当前同配置榜首", out_king)
+
+        # 4. Non-first rank (2/4, gap > 0): gap must appear on same-hw line, NOT same-model line
+        out_runner = _render({
+            "same_hw_rank": 2,
+            "same_hw_total": 4,
+            "same_hw_median": 68.0,
+            "vs_median_pct": -4,
+            "same_model_rank": 4,
+            "same_model_total": 10,
+            "gap_to_first": 4.5,
+        })
+        self.assertNotIn("新王登基", out_runner)
+        same_hw_line = next(ln for ln in out_runner.splitlines() if "★ 同配置同模型速度排名" in ln)
+        same_model_line = next(ln for ln in out_runner.splitlines() if "★ 同模型速度排名" in ln)
+        self.assertIn("距同配置第一仅差 4.5 tok/s", same_hw_line)
+        self.assertNotIn("距同配置第一", same_model_line)
+
     def test_cpu_name_cleanup_and_ram_type_detection(self):
         self.assertEqual(
             speedtest.clean_cpu_name("AMD Ryzen 9 9950X 16-Core Processor"),
@@ -501,7 +582,7 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertIsNotNone(speedtest.clean_client_id(p.get("client_id")))
         self.assertEqual(len(p["results"]), 2)
         err_text = err_buf.getvalue()
-        self.assertIn("新王登基", err_text)
+        self.assertIn("首位开荒", err_text)
         self.assertIn("同配置同模型速度排名", err_text)
         self.assertIn("同模型速度排名", err_text)
         self.assertIn("位实测用户", err_text)
@@ -737,6 +818,73 @@ class TestLocalListeningDiscovery(unittest.TestCase):
         ):
             mid = speedtest.detect_server_model_id("http://127.0.0.1:47831/v1", "iq3_s")
             self.assertEqual(mid, "qwen38-flash-next")
+
+    def test_infer_engine_extended_and_props_fallback(self):
+        self.assertEqual(speedtest.infer_engine_from_text("ik_llama-server"), "llamacpp")
+        self.assertEqual(speedtest.infer_engine_from_text("llama_server.exe"), "llamacpp")
+        self.assertEqual(speedtest.infer_engine_from_text("koboldcpp"), "llamacpp")
+
+        class _FakeResp:
+            def __init__(self, payload: dict):
+                self._raw = json.dumps(payload).encode("utf-8")
+                self.headers = {}
+
+            def read(self):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        # llama.cpp /props with opaque build_info + default_generation_settings -> llamacpp
+        with mock.patch.object(
+            speedtest,
+            "_urlopen",
+            return_value=_FakeResp({"build_info": "b4521-deadbeef", "default_generation_settings": {"n_ctx": 131072}}),
+        ):
+            self.assertEqual(speedtest._detect_http_engine("http://127.0.0.1:47831/v1"), "llamacpp")
+
+        # /props with GSQ-RCO model_path -> strata
+        with mock.patch.object(
+            speedtest,
+            "_urlopen",
+            return_value=_FakeResp({
+                "build_info": "b4521-deadbeef",
+                "model_path": r"C:\Users\alice\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S.gguf",
+                "default_generation_settings": {"n_ctx": 131072},
+            }),
+        ):
+            self.assertEqual(speedtest._detect_http_engine("http://127.0.0.1:47831/v1"), "strata")
+
+    def test_resolve_model_raw_privacy_and_fallback(self):
+        # Recognizable API name stays untouched
+        self.assertEqual(
+            speedtest.resolve_model_raw("http://127.0.0.1:8080/v1", "Qwen3.8-Flash-Next-IQ3_S"),
+            "Qwen3.8-Flash-Next-IQ3_S",
+        )
+        # Short alias -> pure filename stem from /props (never leaks directory path)
+        with mock.patch.object(
+            speedtest,
+            "http_json",
+            return_value={"model_path": r"C:\Users\secret\models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S.gguf"},
+        ):
+            resolved = speedtest.resolve_model_raw("http://127.0.0.1:47831/v1", "iq3_s", model_id="qwen38-flash-next")
+            self.assertEqual(resolved, "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S")
+            self.assertNotIn("secret", resolved)
+            self.assertNotIn("\\", resolved)
+        # /props unavailable -> fall back to '<Label> (<alias>)'
+        with mock.patch.object(speedtest, "http_json", side_effect=OSError("no props")):
+            resolved = speedtest.resolve_model_raw("http://127.0.0.1:47831/v1", "iq3_s", model_id="qwen38-flash-next")
+            self.assertEqual(resolved, "Qwen3.8-Flash-Next (iq3_s)")
+
+    def test_build_warmup_prompt(self):
+        p = speedtest.build_warmup_prompt(131072)
+        self.assertGreater(len(p), 800)
+        self.assertIn("[Bench run warmup]", p)
+        p_small = speedtest.build_warmup_prompt(200)
+        self.assertLess(len(p_small), len(p))
 
 
 if __name__ == "__main__":
