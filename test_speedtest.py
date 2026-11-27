@@ -407,6 +407,15 @@ class MappingTests(unittest.TestCase):
         self.assertIn("personal_best_record_id", html)
         self.assertIn("与个人最佳 #", html)
 
+    def test_ui_run_button_locked_while_detecting(self):
+        import ui
+        html = ui._render_html("tok", "https://example.com/submit")
+        # 首屏即为加载态，/api/init 返回前不可点击
+        self.assertRegex(html, r'<button id="btn-run"[^>]*\bdisabled\b[^>]*aria-busy="true"')
+        self.assertIn("正在识别本机硬件与推理服务", html)
+        self.assertIn("function setDetecting(", html)
+        self.assertIn("if (detecting || running) return;", html)
+
     def test_cpu_name_cleanup_and_ram_type_detection(self):
         self.assertEqual(
             speedtest.clean_cpu_name("AMD Ryzen 9 9950X 16-Core Processor"),

@@ -137,6 +137,16 @@ def _render_html(token: str, default_submit_url: str) -> str:
   .btn-primary {{ background: var(--accent); color: #fff; }}
   .btn-primary:hover {{ background: var(--accent-hover); }}
   .btn-primary:disabled {{ opacity: 0.55; cursor: not-allowed; }}
+  .btn:disabled {{ opacity: 0.55; cursor: not-allowed; }}
+  .btn-primary.is-busy:disabled {{ opacity: 0.8; cursor: progress; }}
+  .spinner {{
+    display: inline-block; width: 14px; height: 14px; flex-shrink: 0; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.45); border-top-color: #fff;
+    animation: spin 0.8s linear infinite; vertical-align: -2px;
+  }}
+  .spinner-dark {{ border-color: rgba(15,118,110,0.25); border-top-color: var(--accent); }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  @media (prefers-reduced-motion: reduce) {{ .spinner {{ animation-duration: 2.4s; }} }}
   .btn-ghost {{ background: #eef1f4; color: var(--text); }}
   .btn-ghost:hover {{ background: #e2e6eb; }}
   .btn-lg {{ width: 100%; padding: 12px 18px; font-size: 15px; }}
@@ -235,7 +245,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
           <label for="local-endpoint">本机接口地址（已自动扫描，如有自定义端口可直接填端口号如 8080 或完整地址后点重新检测）</label>
           <div class="inline">
             <input id="local-endpoint" placeholder="http://127.0.0.1:8080/v1 或端口号 8080" />
-            <button id="btn-local-probe" class="btn btn-ghost" type="button">重新检测</button>
+            <button id="btn-local-probe" class="btn btn-ghost" type="button" disabled>重新检测</button>
           </div>
         </div>
       </div>
@@ -269,7 +279,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
           <span class="badge">🔒 本机自动采集并锁定（不可篡改）</span>
           <span class="sub" id="local-hw-os"></span>
         </div>
-        <div class="locked-main" id="local-hw-main">正在识别本机硬件...</div>
+        <div class="locked-main" id="local-hw-main"><span class="spinner spinner-dark" aria-hidden="true"></span> 正在识别本机硬件...</div>
         <div class="locked-meta" id="local-hw-meta"></div>
       </div>
     </div>
@@ -367,7 +377,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
 
   <!-- Step 3: Run & Upload -->
   <section class="card">
-    <button id="btn-run" class="btn btn-primary btn-lg" type="button">开始测速</button>
+    <button id="btn-run" class="btn btn-primary btn-lg is-busy" type="button" disabled aria-busy="true"><span class="spinner" aria-hidden="true"></span>正在识别本机硬件与推理服务...</button>
     <div id="run-log" class="log hidden"></div>
 
     <div id="result-box" class="hidden" style="margin-top:14px;">
@@ -408,6 +418,32 @@ let localHw = null;
 let mtpVal = '';
 let lastPayload = null;
 let pollTimer = null;
+let detecting = true;   // /api/init 或 /api/probe 进行中
+let running = false;    // 测速进行中
+
+// 识别硬件 / 探测服务期间锁住「开始测速」和「重新检测」，并在按钮上显示当前在做什么
+function setDetecting(on, label) {{
+  detecting = on;
+  const btn = $('btn-run');
+  $('btn-local-probe').disabled = on || running;
+  if (running) return;
+  if (on) {{
+    btn.disabled = true;
+    btn.classList.add('is-busy');
+    btn.setAttribute('aria-busy', 'true');
+    btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>' + (label || '正在检测...');
+  }} else {{
+    btn.disabled = false;
+    btn.classList.remove('is-busy');
+    btn.removeAttribute('aria-busy');
+    btn.textContent = lastPayload ? '重新测速' : '开始测速';
+  }}
+}}
+
+function setRunning(on) {{
+  running = on;
+  $('btn-local-probe').disabled = on || detecting;
+}}
 
 async function api(path, body) {{
   const opts = body === undefined
@@ -477,8 +513,10 @@ function setModels(models, guessedEngine, guessedQuant) {{
 }}
 
 async function probe(rawEndpoint) {{
+  if (detecting || running) return;
   $('probe-err').classList.add('hidden');
   $('conn-badge').textContent = '连接中...';
+  setDetecting(true, '正在连接推理服务并识别模型...');
   try {{
     const res = await api('/api/probe', {{ endpoint: rawEndpoint, api_key: $('apikey-input').value.trim() || null }});
     $('local-endpoint').value = res.endpoint;
@@ -488,10 +526,13 @@ async function probe(rawEndpoint) {{
     $('conn-badge').textContent = '未连接';
     $('probe-err').textContent = e.message;
     $('probe-err').classList.remove('hidden');
+  }} finally {{
+    setDetecting(false);
   }}
 }}
 
 async function init() {{
+  setDetecting(true, '正在识别本机硬件与推理服务...');
   try {{
     const data = await api('/api/init');
     localHw = data.local_hw;
@@ -506,6 +547,9 @@ async function init() {{
     }}
   }} catch (e) {{
     $('conn-badge').textContent = '初始化失败：' + e.message;
+    if (!localHw) $('local-hw-main').textContent = '硬件识别失败，请刷新页面重试';
+  }} finally {{
+    setDetecting(false);
   }}
 }}
 
@@ -535,6 +579,7 @@ $('model-select').onchange = async () => {{
 }};
 
 $('btn-run').onclick = async () => {{
+  if (detecting || running) return;
   const ep = $('local-endpoint').value.trim();
   const model = $('model-select').value;
   if (!ep || !model) {{
@@ -563,6 +608,7 @@ $('btn-run').onclick = async () => {{
     anonymous: Boolean($('anonymous-toggle').checked),
   }};
 
+  setRunning(true);
   $('btn-run').disabled = true;
   $('btn-run').textContent = '测速中...';
   $('result-box').classList.add('hidden');
@@ -576,6 +622,7 @@ $('btn-run').onclick = async () => {{
     pollTimer = setInterval(pollStatus, 700);
   }} catch (e) {{
     $('run-log').textContent = '启动失败：' + e.message;
+    setRunning(false);
     $('btn-run').disabled = false;
     $('btn-run').textContent = '开始测速';
   }}
@@ -587,12 +634,14 @@ async function pollStatus() {{
     if (st.logs && st.logs.length) $('run-log').textContent = st.logs.join('\\n');
     if (st.state === 'done') {{
       clearInterval(pollTimer);
+      setRunning(false);
       $('btn-run').disabled = false;
       $('btn-run').textContent = '重新测速';
       lastPayload = st.payload;
       renderResult(st.payload);
     }} else if (st.state === 'error') {{
       clearInterval(pollTimer);
+      setRunning(false);
       $('btn-run').disabled = false;
       $('btn-run').textContent = '重新测速';
       $('run-log').textContent = (st.logs || []).join('\\n') + '\\n错误：' + st.error;
