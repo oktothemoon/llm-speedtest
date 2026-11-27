@@ -318,6 +318,89 @@ class MappingTests(unittest.TestCase):
         self.assertIn("距同配置第一仅差 4.5 tok/s", same_hw_line)
         self.assertNotIn("距同配置第一", same_model_line)
 
+    def test_ceremony_personal_best_api(self):
+        """New backend: ranks by personal best and sends is_personal_best / vs_personal_best."""
+        base_payload = {
+            "hardware": {"hw_raw": "NVIDIA GeForce RTX 5070 Ti", "gpu_count": 1, "ram_gb": 64, "ram_type": "DDR4"},
+            "software": {"kv_cache": None},
+            "model": {"model_raw": "iq3_s", "quant": "IQ3_S"},
+            "results": [{"ctx_prompt": 1024, "tg_tps": 65.6, "pp_tps": 658.0, "ttft_ms": 1584.9, "runs": 3}],
+        }
+
+        def _render(ranking, record_id=56):
+            buf = io.StringIO()
+            resp = {"record_id": record_id, "total_samples": 59, "total_contributors": 5, "ranking": ranking}
+            with mock.patch("sys.stderr", buf):
+                speedtest.print_upload_ceremony(base_payload, resp, None)
+            return buf.getvalue()
+
+        common = {"same_model_rank": 1, "same_model_total": 3, "gap_to_first": 0}
+
+        # 1. Sole config, slower than own best (the reported 71.6 → 65.6 case): no pioneer banner
+        out = _render({**common, "same_hw_rank": 1, "same_hw_total": 1, "same_hw_best": 71.6,
+                       "same_hw_median": 71.6, "vs_median_pct": 0, "submitted_tg": 65.6,
+                       "personal_best": 71.6, "personal_best_tg": 71.6, "is_personal_best": False,
+                       "vs_personal_best": -6, "personal_best_record_id": 40,
+                       "ladder_url": "https://itbanana.com/llm-speed?highlight=40"})
+        self.assertNotIn("首位开荒", out)
+        self.assertNotIn("同配置首个基准", out)
+        self.assertNotIn("新王登基", out)
+        self.assertIn("本次较个人历史最佳低 6 tok/s（最佳 71.6 tok/s），未刷新纪录", out)
+        self.assertIn("高亮我的最佳成绩 #40", out)
+
+        # 2. Already #1 of several, slower run: no king banner, median phrased as personal best
+        out = _render({**common, "same_hw_rank": 1, "same_hw_total": 2, "same_hw_best": 80,
+                       "same_hw_median": 77.5, "vs_median_pct": 3, "submitted_tg": 78,
+                       "personal_best": 80, "is_personal_best": False, "vs_personal_best": -2,
+                       "personal_best_record_id": 3})
+        self.assertNotIn("新王登基", out)
+        self.assertNotIn("当前同配置榜首", out)
+        self.assertIn("个人最佳较同配置中位 77.5 tok/s +3%", out)
+        self.assertIn("本次较个人历史最佳低 2 tok/s", out)
+
+        # 3. Runner-up, slower than own best: shows both the gap to first and the personal-best gap
+        out = _render({**common, "same_hw_rank": 2, "same_hw_total": 2, "same_hw_best": 80,
+                       "same_hw_median": 77.5, "vs_median_pct": -3, "gap_to_first": 5,
+                       "submitted_tg": 70, "personal_best": 75, "is_personal_best": False,
+                       "vs_personal_best": -5, "personal_best_record_id": 4})
+        line = next(ln for ln in out.splitlines() if "★ 同配置同模型速度排名" in ln)
+        self.assertIn("距同配置第一仅差 5 tok/s", line)
+        self.assertIn("本次较个人历史最佳低 5 tok/s（最佳 75 tok/s）", line)
+
+        # 4. New personal best that is #1 among several: king banner, no "未刷新"
+        out = _render({**common, "same_hw_rank": 1, "same_hw_total": 2, "same_hw_best": 80,
+                       "same_hw_median": 75.8, "vs_median_pct": 6, "submitted_tg": 80,
+                       "personal_best": 80, "is_personal_best": True, "vs_personal_best": 0,
+                       "personal_best_record_id": 56})
+        self.assertIn("新王登基", out)
+        self.assertIn("较同配置中位 75.8 tok/s +6%", out)
+        self.assertNotIn("个人最佳较", out)
+        self.assertNotIn("未刷新纪录", out)
+        self.assertIn("高亮我的成绩：", out)
+
+        # 5. First-ever upload on a config: pioneer banner
+        out = _render({**common, "same_hw_rank": 1, "same_hw_total": 1, "same_hw_best": 65.6,
+                       "same_hw_median": 65.6, "vs_median_pct": 0, "submitted_tg": 65.6,
+                       "personal_best": 65.6, "is_personal_best": True, "vs_personal_best": 0,
+                       "personal_best_record_id": 56})
+        self.assertIn("首位开荒", out)
+        self.assertIn("同配置首个基准", out)
+
+        # 6. Box borders stay aligned with the longer not-PB line
+        widths = {speedtest._display_width(ln) for ln in _render({**common, "same_hw_rank": 2, "same_hw_total": 9,
+                  "same_hw_median": 77.5, "vs_median_pct": -3, "gap_to_first": 5, "submitted_tg": 70,
+                  "personal_best": 75, "is_personal_best": False, "vs_personal_best": -5,
+                  "personal_best_record_id": 4}).splitlines() if ln.startswith(("╔", "║", "╠", "╟", "╚"))}
+        self.assertEqual(len(widths), 1)
+
+    def test_ui_celebration_handles_personal_best_fields(self):
+        import ui
+        html = ui._render_html("tok", "https://example.com/submit")
+        self.assertIn("is_personal_best", html)
+        self.assertIn("vs_personal_best", html)
+        self.assertIn("personal_best_record_id", html)
+        self.assertIn("我的最佳成绩 #", html)
+
     def test_cpu_name_cleanup_and_ram_type_detection(self):
         self.assertEqual(
             speedtest.clean_cpu_name("AMD Ryzen 9 9950X 16-Core Processor"),

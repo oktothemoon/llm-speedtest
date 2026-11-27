@@ -694,6 +694,7 @@ $('btn-upload').onclick = async () => {{
         : 'https://itbanana.com/llm-speed');
 
     let extraLine = '';
+    let bestRecId = null;
     let celebTitle = ranking ? '🏆 恭喜！你已登上速度天梯图' : '🎉 恭喜！你的实测已成功上榜';
     if (ranking) {{
       const sameHwRank = ranking.same_hw_rank;
@@ -702,25 +703,48 @@ $('btn-upload').onclick = async () => {{
       const sameModelTotal = ranking.same_model_total ?? ranking.overall_total;
       const gap = Number(ranking.gap_to_first || 0);
       const isSoleHw = sameHwTotal != null && sameHwTotal <= 1;
-      if (sameHwRank === 1 && !isSoleHw && gap <= 0.05) {{
+      // 新版后端按「个人最佳」排名并返回 is_personal_best；旧版仅靠第 1 名时的 gap 判断
+      const newApi = Object.prototype.hasOwnProperty.call(ranking, 'is_personal_best');
+      let isPb = true;
+      let belowPb = 0;
+      let bestTg = null;
+      if (newApi) {{
+        isPb = !!ranking.is_personal_best;
+        bestTg = ranking.personal_best_tg ?? ranking.personal_best ?? null;
+        let vsPb = ranking.vs_personal_best;
+        if (vsPb == null && bestTg != null && ranking.submitted_tg != null) vsPb = Number(ranking.submitted_tg) - Number(bestTg);
+        belowPb = isPb ? 0 : Math.round(Math.max(0, -Number(vsPb || 0)) * 10) / 10;
+        if (!isPb && ranking.personal_best_record_id) bestRecId = ranking.personal_best_record_id;
+      }} else if (sameHwRank === 1 && gap > 0.05) {{
+        isPb = false;
+        belowPb = gap;
+      }}
+      if (sameHwRank === 1 && !isSoleHw && isPb) {{
         celebTitle = '👑 新王登基！你的实测已登顶同配置同模型榜首';
-      }} else if (sameHwRank === 1 && isSoleHw && gap <= 0.05) {{
+      }} else if (sameHwRank === 1 && isSoleHw && isPb) {{
         celebTitle = '🚩 首位开荒！你为该配置+模型立下了首条实测基准';
       }}
       const medTxt = (!isSoleHw && ranking.same_hw_median != null)
         ? `（中位 ${{ranking.same_hw_median}} tok/s）`
         : '';
+      const pbTail = (!isPb && belowPb > 0.05)
+        ? `，本次较个人历史最佳低 ${{belowPb}} tok/s${{bestTg != null ? `（最佳 ${{bestTg}} tok/s）` : ''}}，未刷新纪录`
+        : '';
       let hwTail = '';
       if (sameHwRank === 1) {{
-        if (gap > 0.05) {{
-          hwTail = `，本次较个人历史最佳低 ${{gap}} tok/s，未刷新纪录`;
+        if (!isPb) {{
+          hwTail = pbTail;
         }} else if (isSoleHw) {{
           hwTail = '，同配置首个基准！';
         }} else {{
           hwTail = '，当前同配置榜首！';
         }}
-      }} else if (gap > 0.05) {{
-        hwTail = `，距同配置第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
+      }} else {{
+        if (gap > 0.05) {{
+          hwTail = pbTail ? `，距同配置第一差 ${{gap}} tok/s${{pbTail}}` : `，距同配置第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
+        }} else {{
+          hwTail = pbTail;
+        }}
       }}
       const parts = [];
       if (sameHwRank != null && sameHwTotal != null) {{
@@ -742,7 +766,9 @@ $('btn-upload').onclick = async () => {{
     }}
 
     const ctaText = ranking
-      ? `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`
+      ? (bestRecId && bestRecId !== recId
+        ? `🏆 去速度天梯图查看我的最佳成绩 #${{bestRecId}} 排名与同卡配方 →`
+        : `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`)
       : (recId ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-speed 查看实测榜 →');
     const mdlRaw = String(mdl.model_raw || '-');
     const quantSuffix = (mdl.quant && String(mdl.quant).toLowerCase() !== mdlRaw.trim().toLowerCase())

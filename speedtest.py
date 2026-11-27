@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.8"
+CLIENT_VERSION = "0.3.9"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2511,6 +2511,40 @@ def print_summary(payload: Dict[str, Any]) -> None:
     print(_c(f"╰{'─' * inner_width}╯", "36"), file=sys.stderr)
 
 
+def personal_best_info(ranking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalise "is this upload a personal best?" across backend versions.
+
+    New backend (>= 2026-11-27) ranks by each contributor's personal best and sends
+    is_personal_best / vs_personal_best / personal_best(_tg) / personal_best_record_id.
+    Older backends only sent gap_to_first, which at rank 1 meant "this run vs my best".
+    """
+    out: Dict[str, Any] = {"new_api": False, "is_pb": True, "below": 0.0, "best": None, "best_id": None}
+    if not ranking:
+        return out
+
+    def _num(v: Any) -> Optional[float]:
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    if "is_personal_best" in ranking:
+        out["new_api"] = True
+        out["is_pb"] = bool(ranking.get("is_personal_best"))
+        out["best"] = _num(ranking.get("personal_best_tg", ranking.get("personal_best")))
+        vs_pb = _num(ranking.get("vs_personal_best"))
+        if vs_pb is None and out["best"] is not None and _num(ranking.get("submitted_tg")) is not None:
+            vs_pb = _num(ranking.get("submitted_tg")) - out["best"]
+        out["below"] = round(max(0.0, -(vs_pb or 0.0)), 1) if not out["is_pb"] else 0.0
+        out["best_id"] = ranking.get("personal_best_record_id")
+    else:
+        gap = _num(ranking.get("gap_to_first")) or 0.0
+        if ranking.get("same_hw_rank") == 1 and gap > 0.05:
+            out["is_pb"] = False
+            out["below"] = gap
+    return out
+
+
 def print_upload_ceremony(
     payload: Dict[str, Any],
     resp: Dict[str, Any],
@@ -2530,8 +2564,9 @@ def print_upload_ceremony(
     same_hw_total = ranking.get("same_hw_total") if ranking else None
     gap = float(ranking.get("gap_to_first") or 0) if ranking else 0.0
     is_sole_hw = bool(ranking and same_hw_total is not None and same_hw_total <= 1)
-    is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and gap <= 0.05)
-    is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and gap <= 0.05)
+    pb = personal_best_info(ranking)
+    is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and pb["is_pb"])
+    is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and pb["is_pb"])
 
     if is_king:
         title = "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
@@ -2582,22 +2617,28 @@ def print_upload_ceremony(
     if ranking:
         vs_med = ranking.get("vs_median_pct")
         med_val = ranking.get("same_hw_median")
+        # 新版后端的排名/中位对比按「个人最佳」计；未刷新纪录时需明确说明，避免误读为本次成绩
+        med_subject = "个人最佳较" if (pb["new_api"] and not pb["is_pb"]) else "较"
         med_txt = (
-            f"（较同配置中位 {med_val} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
+            f"（{med_subject}同配置中位 {med_val} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
             if (not is_sole_hw and vs_med is not None and med_val is not None)
             else ""
         )
+        pb_tail = ""
+        if not pb["is_pb"] and pb["below"] > 0.05:
+            best_txt = f"（最佳 {pb['best']:g} tok/s）" if pb["best"] is not None else ""
+            pb_tail = f" · 本次较个人历史最佳低 {pb['below']:g} tok/s{best_txt}，未刷新纪录"
         if same_hw_rank == 1:
-            if gap > 0.05:
-                hw_tail = f" · 本次较个人历史最佳低 {gap:g} tok/s，未刷新纪录"
+            if not pb["is_pb"]:
+                hw_tail = pb_tail
             elif is_sole_hw:
                 hw_tail = " · ★ 同配置首个基准！"
             else:
                 hw_tail = " · ★ 当前同配置榜首！"
-        elif gap > 0.05:
-            hw_tail = f" · 距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！"
         else:
-            hw_tail = ""
+            # 旧后端：非第 1 名时 gap 即本次与第一名之差；新后端：个人最佳与第一名之差
+            hw_tail = f" · 距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！" if gap > 0.05 else ""
+            hw_tail += pb_tail
 
         if same_hw_rank is not None and same_hw_total is not None:
             ranking_lines.append(
@@ -2629,7 +2670,12 @@ def print_upload_ceremony(
     ladder_url = (ranking or {}).get("ladder_url") or (
         f"https://itbanana.com/llm-speed?highlight={rec_id}" if rec_id else "https://itbanana.com/llm-speed"
     )
-    footer_line = f"  → 直达天梯图高亮我的成绩：{_c(ladder_url, '1;4;36')}"
+    footer_label = (
+        f"直达天梯图高亮我的最佳成绩 #{pb['best_id']}"
+        if (not pb["is_pb"] and pb["best_id"] and pb["best_id"] != rec_id)
+        else "直达天梯图高亮我的成绩"
+    )
+    footer_line = f"  → {footer_label}：{_c(ladder_url, '1;4;36')}"
 
     all_body_lines = info_lines + ranking_lines + community_lines + [footer_line]
     title_w = _display_width(title)
