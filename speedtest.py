@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.20"
+CLIENT_VERSION = "0.3.21"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2980,10 +2980,11 @@ def run_interactive_wizard(
             ),
             file=sys.stderr,
         )
-        print("  请选择实际测试的模型编号（或直接输入模型名，直接回车跳过）：", file=sys.stderr)
+        default_label = KNOWN_LEADERBOARD_MODELS[0][1]
+        print(f"  请选择实际测试的模型编号（或直接输入模型名，直接回车默认 1) {default_label}）：", file=sys.stderr)
         for idx, (_mid, label) in enumerate(KNOWN_LEADERBOARD_MODELS, 1):
             print(f"   {idx:>2}) {label}", file=sys.stderr)
-        pick_raw = _ask("模型编号或名称（如 1 表示 Qwen3.8-Flash-Next）")
+        pick_raw = _ask(f"模型编号或名称（直接回车 = 1 {default_label}）") or "1"
         if pick_raw:
             if pick_raw.isdigit():
                 idx = int(pick_raw)

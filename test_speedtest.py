@@ -986,6 +986,30 @@ class TestLocalListeningDiscovery(unittest.TestCase):
         self.assertLess(len(p_small), len(p))
 
 
+class WizardModelPickTests(unittest.TestCase):
+    def _run(self, answers):
+        import argparse
+        args = argparse.Namespace(model=None, engine="llamacpp", quant="IQ3_S", model_id=None, api_key=None,
+                                  ctx=None, kv_cache="q8_0", mtp="false")
+        hw = {"kind": "gpu", "hw_raw": "NVIDIA GeForce RTX 5070 Ti", "vram_gb": 16, "ram_gb": 64,
+              "ram_type": "DDR4", "gpu_count": 1}
+        it = iter(answers)
+        with mock.patch.object(speedtest, "detect_server_model_id", return_value=None), \
+             mock.patch("builtins.input", lambda *_a, **_k: next(it, "")), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                speedtest.run_interactive_wizard(args, hw, ["iq3_s"], "http://127.0.0.1:8080")
+            except Exception:
+                pass
+        return args.model_id
+
+    def test_enter_defaults_to_first_leaderboard_model(self):
+        self.assertEqual(self._run([""]), speedtest.KNOWN_LEADERBOARD_MODELS[0][0])
+
+    def test_explicit_number_still_works(self):
+        self.assertEqual(self._run(["2"]), speedtest.KNOWN_LEADERBOARD_MODELS[1][0])
+
+
 if __name__ == "__main__":
     unittest.main()
 
