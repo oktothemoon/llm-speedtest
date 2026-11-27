@@ -346,7 +346,7 @@ class MappingTests(unittest.TestCase):
         self.assertNotIn("同配置首个基准", out)
         self.assertNotIn("新王登基", out)
         self.assertIn("本次较个人历史最佳低 6 tok/s（最佳 71.6 tok/s），未刷新纪录", out)
-        self.assertIn("高亮我的最佳成绩 #40", out)
+        self.assertIn("查看本次成绩 #56（天梯展示你的个人最佳 #40）", out)
 
         # 2. Already #1 of several, slower run: no king banner, median phrased as personal best
         out = _render({**common, "same_hw_rank": 1, "same_hw_total": 2, "same_hw_best": 80,
@@ -363,9 +363,15 @@ class MappingTests(unittest.TestCase):
                        "same_hw_median": 77.5, "vs_median_pct": -3, "gap_to_first": 5,
                        "submitted_tg": 70, "personal_best": 75, "is_personal_best": False,
                        "vs_personal_best": -5, "personal_best_record_id": 4})
-        line = next(ln for ln in out.splitlines() if "★ 同配置同模型速度排名" in ln)
-        self.assertIn("距同配置第一仅差 5 tok/s", line)
-        self.assertIn("本次较个人历史最佳低 5 tok/s（最佳 75 tok/s）", line)
+        lines = out.splitlines()
+        i = next(k for k, ln in enumerate(lines) if "★ 同配置同模型速度排名" in ln)
+        block = lines[i]
+        for ln in lines[i + 1:]:  # 过长时在卡片内折行，续行以 5 个空格缩进
+            if not ln.startswith("     "):
+                break
+            block += ln.strip()
+        self.assertIn("距同配置第一仅差 5 tok/s", block)
+        self.assertIn("本次较个人历史最佳低 5 tok/s（最佳 75 tok/s）", block)
 
         # 4. New personal best that is #1 among several: king banner, no "未刷新"
         out = _render({**common, "same_hw_rank": 1, "same_hw_total": 2, "same_hw_best": 80,
@@ -399,7 +405,7 @@ class MappingTests(unittest.TestCase):
         self.assertIn("is_personal_best", html)
         self.assertIn("vs_personal_best", html)
         self.assertIn("personal_best_record_id", html)
-        self.assertIn("我的最佳成绩 #", html)
+        self.assertIn("与个人最佳 #", html)
 
     def test_cpu_name_cleanup_and_ram_type_detection(self):
         self.assertEqual(
@@ -1465,3 +1471,46 @@ class PrefillEstimateTests(unittest.TestCase):
         ep2 = self._serve(with_timings=True)
         speedtest.run_benchmark_tiers(ep2, "m", [1024], 16, 1, warmup=True, log=lambda m, c=None: lines2.append(m))
         self.assertFalse(any("固定开销约" in ln for ln in lines2))
+
+
+class CeremonyLayoutTests(unittest.TestCase):
+    """The card must never be wider than the terminal (borders would wrap and the box falls apart)."""
+
+    def _render(self, cols):
+        payload = {
+            "hardware": {"hw_raw": "AMD Radeon AI PRO R9700", "cpu_raw": "AMD Ryzen 7 5700X", "kind": "gpu", "ram_gb": 64, "ram_type": "DDR4"},
+            "software": {}, "model": {"model_raw": "qwen3.8-flash-next-iq3_s", "quant": "GSQ-RCO IQ3_S"},
+            "results": [{"ctx_prompt": c, "tg_tps": 100.0, "pp_tps": 3000.0, "ttft_ms": 9000.0} for c in (1024, 32768, 65536, 131072, 262144)],
+        }
+        resp = {"record_id": 65, "total_samples": 60, "total_contributors": 5, "ranking": {
+            "same_hw_rank": 1, "same_hw_total": 4, "same_hw_median": 116.9, "vs_median_pct": 4,
+            "same_model_rank": 1, "same_model_total": 5, "gap_to_first": 0, "submitted_tg": 120.3,
+            "personal_best": 121, "is_personal_best": False, "vs_personal_best": -0.7, "personal_best_record_id": 51,
+            "ladder_url": "https://itbanana.com/llm-speed?highlight=65"}}
+        stats = {"group": {"tg_min": 114.6, "tg_max": 121, "tg_median": 116.9, "contributors": 4}}
+        buf = io.StringIO()
+        with mock.patch.object(speedtest, "_terminal_columns", return_value=cols), mock.patch("sys.stderr", buf):
+            speedtest.print_upload_ceremony(payload, resp, stats)
+        return [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+
+    def test_card_fits_narrow_terminal_and_keeps_url_whole(self):
+        for cols in (80, 100, 120):
+            lines = self._render(cols)
+            widths = {speedtest._display_width(ln) for ln in lines if ln.startswith(("╔", "╠", "╟", "╚"))}
+            self.assertEqual(len(widths), 1, cols)
+            self.assertLessEqual(max(widths), cols, cols)
+            for ln in lines:
+                self.assertLessEqual(speedtest._display_width(ln), cols, (cols, ln))
+            self.assertTrue(any(ln.strip() == "https://itbanana.com/llm-speed?highlight=65" or ln.strip().endswith("https://itbanana.com/llm-speed?highlight=65") for ln in lines))
+            joined = "".join(ln.strip() for ln in lines)
+            self.assertIn("未刷新纪录", joined)
+            self.assertIn("查看本次成绩 #65", joined)
+
+    def test_wrap_display_handles_cjk_and_ansi(self):
+        line = "  ★ " + speedtest._c("同配置同模型速度排名", "1;33") + "：第 1 / 4 名（个人最佳较同配置中位 116.9 tok/s +4%） · 本次较个人历史最佳低 0.7 tok/s（最佳 121 tok/s），未刷新纪录"
+        parts = speedtest._wrap_display(line, 60)
+        self.assertGreater(len(parts), 1)
+        for p in parts:
+            self.assertLessEqual(speedtest._display_width(p), 60)
+        self.assertEqual(speedtest.strip_ansi("".join(p.strip() for p in parts)).replace(" ", ""),
+                         speedtest.strip_ansi(line).replace(" ", ""))

@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.14"
+CLIENT_VERSION = "0.3.15"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -244,6 +244,65 @@ def _c(text: str, code: str) -> str:
     if not _supports_color():
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+def _terminal_columns(default: int = 120) -> int:
+    """Width of the terminal the card is printed to (stderr first, since stdout may be redirected)."""
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            return max(40, os.get_terminal_size(stream.fileno()).columns)
+        except (OSError, ValueError, AttributeError):
+            continue
+    try:
+        return max(40, int(os.environ.get("COLUMNS", default)))
+    except ValueError:
+        return default
+
+
+_BREAK_AFTER = set(" ·，、|；：）)")
+
+
+def _wrap_display(line: str, width: int, indent: str = "     ") -> List[str]:
+    """Wrap a line (may contain ANSI colors, CJK) so each piece fits in `width` display columns.
+
+    Prefers breaking after a space / "·" / "，" in the second half of the line; continuation
+    lines are prefixed with `indent`.
+    """
+    if width <= 10 or _display_width(line) <= width:
+        return [line]
+    tokens = re.findall(r"\x1b\[[0-9;?]*[A-Za-z~]|.", line, flags=re.S)
+    out: List[str] = []
+    cur: List[str] = []
+    cur_w = 0
+    last_break = -1  # index in cur after which we may break
+    prefix = ""
+    prefix_w = 0
+    for tok in tokens:
+        if tok.startswith("\x1b"):
+            cur.append(tok)
+            continue
+        w = 0 if unicodedata.combining(tok) else (2 if unicodedata.east_asian_width(tok) in ("W", "F") else 1)
+        if cur_w + w > width - prefix_w and cur:
+            if last_break >= 0 and _display_width("".join(cur[: last_break + 1])) >= (width - prefix_w) // 2:
+                head, rest = cur[: last_break + 1], cur[last_break + 1 :]
+            else:
+                head, rest = cur, []
+            out.append(prefix + "".join(head).rstrip())
+            prefix, prefix_w = indent, _display_width(indent)
+            # 续行开头不留空格
+            while rest and rest[0] == " ":
+                rest.pop(0)
+            cur, cur_w, last_break = rest, _display_width("".join(rest)), -1
+            for i, t in enumerate(cur):
+                if t in _BREAK_AFTER:
+                    last_break = i
+        cur.append(tok)
+        cur_w += w
+        if tok in _BREAK_AFTER:
+            last_break = len(cur) - 1
+    if cur:
+        out.append(prefix + "".join(cur).rstrip())
+    return out
 
 
 def _display_width(text: str) -> int:
@@ -3022,16 +3081,33 @@ def print_upload_ceremony(
         f"https://itbanana.com/llm-speed?highlight={rec_id}" if rec_id else "https://itbanana.com/llm-speed"
     )
     footer_label = (
-        f"直达天梯图高亮我的最佳成绩 #{pb['best_id']}"
-        if (not pb["is_pb"] and pb["best_id"] and pb["best_id"] != rec_id)
+        f"直达天梯图查看本次成绩 #{rec_id}（天梯展示你的个人最佳 #{pb['best_id']}）"
+        if (not pb["is_pb"] and pb["best_id"] and rec_id and pb["best_id"] != rec_id)
         else "直达天梯图高亮我的成绩"
     )
-    footer_line = f"  → {footer_label}：{_c(ladder_url, '1;4;36')}"
 
-    all_body_lines = info_lines + ranking_lines + community_lines + [footer_line]
     title_w = _display_width(title)
+    # 卡片宽度不超过终端宽度：过宽时终端会把每条边框折行，整张卡片就散了
+    max_inner = max(title_w + 4, _terminal_columns() - 2)
+    footer_line = f"  → {footer_label}：{_c(ladder_url, '1;4;36')}"
+    footer_lines = [footer_line]
+    if _display_width(footer_line) > max_inner:
+        # 链接单独成行且不拆开，保证终端里可以直接点击
+        footer_lines = _wrap_display(f"  → {footer_label}：", max_inner) + [f"     {_c(ladder_url, '1;4;36')}"]
+
+    def _fit(lines: List[str]) -> List[str]:
+        out: List[str] = []
+        for ln in lines:
+            out.extend(_wrap_display(ln, max_inner))
+        return out
+
+    info_lines = _fit(info_lines)
+    ranking_lines = _fit(ranking_lines)
+    community_lines = _fit(community_lines)
+
+    all_body_lines = info_lines + ranking_lines + community_lines + footer_lines
     max_body_w = max((_display_width(line) for line in all_body_lines), default=0)
-    inner_width = max(62, max_body_w + 1, title_w + 4)
+    inner_width = min(max(62, max_body_w + 1, title_w + 4), max(max_inner, title_w + 4))
     pad_total = inner_width - title_w
     pad_left = pad_total // 2
     pad_right = pad_total - pad_left
@@ -3049,7 +3125,8 @@ def print_upload_ceremony(
     for line in community_lines:
         print(line, file=sys.stderr)
     print(_c(f"╟{'─' * inner_width}╢", "33"), file=sys.stderr)
-    print(footer_line, file=sys.stderr)
+    for line in footer_lines:
+        print(line, file=sys.stderr)
     print(_c(f"╚{'═' * inner_width}╝", "1;33"), file=sys.stderr)
 
 

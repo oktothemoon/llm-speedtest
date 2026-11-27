@@ -772,7 +772,7 @@ $('btn-upload').onclick = async () => {{
     }}
     const ctaText = ranking
       ? (bestRecId && bestRecId !== recId
-        ? `🏆 去速度天梯图查看我的最佳成绩 #${{bestRecId}} 排名与同卡配方 →`
+        ? `🏆 去速度天梯图查看本次 #${{recId}} 与个人最佳 #${{bestRecId}} →`
         : `🏆 去速度天梯图查看我的 #${{recId}} 排名与同卡配方 →`)
       : (recId ? `去 itbanana.com 查看我的 #${{recId}} 实测记录 →` : '前往 itbanana.com/llm-speed 查看实测榜 →');
     const mdlRaw = String(mdl.model_raw || '-');
