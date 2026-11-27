@@ -607,6 +607,15 @@ class TestLocalListeningDiscovery(unittest.TestCase):
                 speedtest.discover_endpoint()
             self.assertIn("未加载任何模型", str(ctx.exception))
 
+    def test_detect_server_model_id_from_props(self):
+        with mock.patch.object(
+            speedtest,
+            "http_json",
+            return_value={"model_path": r"C:\models\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S.gguf"},
+        ):
+            mid = speedtest.detect_server_model_id("http://127.0.0.1:47831/v1", "iq3_s")
+            self.assertEqual(mid, "qwen38-flash-next")
+
 
 if __name__ == "__main__":
     unittest.main()

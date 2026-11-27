@@ -749,6 +749,24 @@ def map_apple_id(chip: str, gpu_cores: Optional[int]) -> Optional[str]:
     return None
 
 
+KNOWN_LEADERBOARD_MODELS: List[Tuple[str, str]] = [
+    ("qwen38-flash-next", "Qwen3.8-Flash-Next"),
+    ("qwen38-27b", "Qwen3.8-27B"),
+    ("qwen36-35b-a3b", "Qwen3.6-35B-A3B"),
+    ("qwen36-27b", "Qwen3.6-27B"),
+    ("qwen35-9b", "Qwen3.5-9B"),
+    ("qwen35-4b", "Qwen3.5-4B"),
+    ("ds-v41-flash", "DeepSeek-V4.1-Flash"),
+    ("glm-53-flash", "GLM-5.3-Flash"),
+    ("kimi-k3", "Kimi-K3"),
+    ("gpt-oss-120b", "gpt-oss-120b"),
+    ("gpt-oss-20b", "gpt-oss-20b"),
+    ("gemma4-31b", "Gemma-4-31B"),
+    ("gemma4-26b-a4b", "Gemma-4-26B-A4B"),
+    ("gemma4-12b", "Gemma-4-12B"),
+]
+
+
 def map_model_id(raw: str) -> Optional[str]:
     s = (raw or "").lower()
     if "kimi" in s and "k3" in s:
@@ -1464,6 +1482,46 @@ def fetch_models(endpoint: str, api_key: Optional[str] = None) -> List[str]:
     return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
+def detect_server_model_id(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Best-effort leaderboard model_id detection: checks model_name first, then local /props or /models metadata in memory ONLY."""
+    mid = map_model_id(model_name)
+    if mid:
+        return mid
+    if endpoint and is_local_endpoint(endpoint):
+        ep = endpoint.rstrip("/")
+        root = re.sub(r"/v1$", "", ep, flags=re.IGNORECASE)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            props = http_json(f"{root}/props", headers=headers, timeout=1.5)
+            if isinstance(props, dict):
+                for key in ("model_path", "model_alias", "model"):
+                    v = props.get(key)
+                    if isinstance(v, str) and v:
+                        base = os.path.basename(v.replace("\\", "/"))
+                        mid = map_model_id(base)
+                        if mid:
+                            return mid
+        except Exception:
+            pass
+        try:
+            data = http_json(f"{ep}/models", headers=headers, timeout=1.5)
+            items = data.get("data") if isinstance(data, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("name", "root", "owned_by", "model"):
+                        v = item.get(key)
+                        if isinstance(v, str) and v:
+                            base = os.path.basename(v.replace("\\", "/"))
+                            mid = map_model_id(base)
+                            if mid:
+                                return mid
+        except Exception:
+            pass
+    return None
+
+
 def detect_server_quant(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
     """Best-effort quant detection: checks model_name first, then enriches from local /props filename in memory ONLY (path is never stored or uploaded)."""
     q_from_name = infer_quant(model_name)
@@ -1923,6 +1981,27 @@ def run_interactive_wizard(
         args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
     if not args.quant:
         args.quant = detect_server_quant(endpoint, model_name, api_key=args.api_key)
+    if not args.model_id:
+        args.model_id = detect_server_model_id(endpoint, model_name, api_key=args.api_key)
+    if not args.model_id:
+        print(
+            _c(
+                f"\n! 接口返回的模型 ID 为「{model_name}」，无法自动匹配天梯图榜单模型（未匹配将无法显示在对应模型榜单中）。",
+                "33",
+            ),
+            file=sys.stderr,
+        )
+        print("  请选择实际测试的模型编号（或直接输入模型名，直接回车跳过）：", file=sys.stderr)
+        for idx, (_mid, label) in enumerate(KNOWN_LEADERBOARD_MODELS, 1):
+            print(f"   {idx:>2}) {label}", file=sys.stderr)
+        pick_raw = _ask("模型编号或名称（如 1 表示 Qwen3.8-Flash-Next）")
+        if pick_raw:
+            if pick_raw.isdigit():
+                idx = int(pick_raw)
+                if 1 <= idx <= len(KNOWN_LEADERBOARD_MODELS):
+                    args.model_id = KNOWN_LEADERBOARD_MODELS[idx - 1][0]
+            else:
+                args.model_id = map_model_id(pick_raw) or pick_raw.strip().lower()
     guessed_q = args.quant
     ctx_str = args.ctx or DEFAULT_CTX_STR
 
@@ -2207,6 +2286,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
         if not args.quant:
             args.quant = detect_server_quant(endpoint, model_name, api_key=args.api_key)
+        if not args.model_id:
+            args.model_id = detect_server_model_id(endpoint, model_name, api_key=args.api_key)
 
     if not args.no_warmup:
         print("\n▸ 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
