@@ -1514,3 +1514,61 @@ class CeremonyLayoutTests(unittest.TestCase):
             self.assertLessEqual(speedtest._display_width(p), 60)
         self.assertEqual(speedtest.strip_ansi("".join(p.strip() for p in parts)).replace(" ", ""),
                          speedtest.strip_ansi(line).replace(" ", ""))
+
+
+class TitleSemanticsTests(unittest.TestCase):
+    """首位开荒 / 刷新个人纪录 / 卫冕 / 新王登基 must reflect what actually happened."""
+
+    payload = {"hardware": {"hw_raw": "GPU"}, "software": {}, "model": {"model_raw": "m"},
+               "results": [{"ctx_prompt": 1024, "tg_tps": 1}]}
+
+    def _out(self, ranking, **resp_extra):
+        base = {"same_model_rank": 1, "same_model_total": 5, "gap_to_first": 0, "is_personal_best": True,
+                "vs_personal_best": 0, "personal_best_record_id": 9}
+        resp = {"record_id": 9, "total_samples": 69, "total_contributors": 2, "ranking": {**base, **ranking}, **resp_extra}
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf), mock.patch.object(speedtest, "_terminal_columns", return_value=200):
+            speedtest.print_upload_ceremony(self.payload, resp, None)
+        return buf.getvalue()
+
+    def test_5070ti_case_sole_returning_user_is_new_pb_not_pioneer(self):
+        out = self._out({"same_hw_rank": 1, "same_hw_total": 1, "submitted_tg": 71.8, "personal_best": 71.8,
+                         "prev_personal_best": 71.6, "vs_prev_best": 0.2, "was_top": True})
+        self.assertNotIn("首位开荒", out)
+        self.assertNotIn("首个基准", out)
+        self.assertIn("刷新个人纪录", out)
+        self.assertIn("+0.2 tok/s", out)
+        self.assertIn("该配置目前仅你一人实测", out)
+
+    def test_r9700_case_already_top_is_defend_not_new_king(self):
+        out = self._out({"same_hw_rank": 1, "same_hw_total": 2, "same_hw_median": 121.2, "vs_median_pct": 2,
+                         "submitted_tg": 123.6, "personal_best": 123.6,
+                         "prev_personal_best": 121.0, "vs_prev_best": 2.6, "was_top": True})
+        self.assertNotIn("新王登基", out)
+        self.assertIn("卫冕榜首", out)
+        self.assertIn("+2.6 tok/s", out)
+
+    def test_overtaking_someone_else_is_new_king(self):
+        out = self._out({"same_hw_rank": 1, "same_hw_total": 3, "submitted_tg": 125, "personal_best": 125,
+                         "prev_personal_best": 115, "vs_prev_best": 10, "was_top": False})
+        self.assertIn("新王登基", out)
+
+    def test_first_ever_on_config_is_pioneer(self):
+        out = self._out({"same_hw_rank": 1, "same_hw_total": 1, "submitted_tg": 60, "personal_best": 60,
+                         "prev_personal_best": None, "vs_prev_best": None, "was_top": False})
+        self.assertIn("首位开荒", out)
+        self.assertIn("同配置首个基准", out)
+
+    def test_runner_up_improving_own_record(self):
+        out = self._out({"same_hw_rank": 2, "same_hw_total": 3, "gap_to_first": 4, "submitted_tg": 110,
+                         "personal_best": 110, "prev_personal_best": 105, "vs_prev_best": 5, "was_top": False})
+        self.assertIn("刷新个人纪录", out)
+        self.assertIn("距同配置第一仅差 4 tok/s", out)
+
+    def test_contributor_line_says_which_contributor_you_are(self):
+        out = self._out({"same_hw_rank": 1, "same_hw_total": 1, "prev_personal_best": None},
+                        total_runs=23, contributor_no=1)
+        self.assertIn("全站已汇聚 23 次真实测速（2 位贡献者），你是第 1 位加入的贡献者", out)
+        self.assertNotIn("感谢第 2 位贡献者", out)
+        old = self._out({"same_hw_rank": 1, "same_hw_total": 1})
+        self.assertIn("条测速记录，来自 2 位贡献者", old)

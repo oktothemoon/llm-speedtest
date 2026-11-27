@@ -717,10 +717,19 @@ $('btn-upload').onclick = async () => {{
         isPb = false;
         belowPb = gap;
       }}
-      if (sameHwRank === 1 && !isSoleHw && isPb) {{
+      // 提交前的个人最佳 / 是否原本就是同卡第一（新版后端提供）：区分首位开荒、刷新个人纪录、卫冕、新王登基
+      const returning = newApi && ranking.prev_personal_best != null;
+      const wasTop = !!ranking.was_top;
+      const gain = Number(ranking.vs_prev_best || 0);
+      const gainTxt = gain > 0.05 ? `+${{Math.round(gain * 10) / 10}} tok/s` : '';
+      if (sameHwRank === 1 && !isSoleHw && isPb && !(returning && wasTop)) {{
         celebTitle = '👑 新王登基！你的实测已登顶同配置同模型榜首';
-      }} else if (sameHwRank === 1 && isSoleHw && isPb) {{
+      }} else if (sameHwRank === 1 && isSoleHw && isPb && !returning) {{
         celebTitle = '🚩 首位开荒！你为该配置+模型立下了首条实测基准';
+      }} else if (sameHwRank === 1 && !isSoleHw && isPb && returning && wasTop) {{
+        celebTitle = gainTxt ? `🛡️ 卫冕榜首！你再次刷新了同配置最高纪录（${{gainTxt}}）` : '🛡️ 卫冕榜首！你仍是同配置第一';
+      }} else if (isPb && returning && gainTxt) {{
+        celebTitle = `📈 刷新个人纪录！${{gainTxt}}`;
       }}
       const medTxt = (!isSoleHw && ranking.same_hw_median != null)
         ? `（中位 ${{ranking.same_hw_median}} tok/s）`
@@ -733,7 +742,9 @@ $('btn-upload').onclick = async () => {{
         if (!isPb) {{
           hwTail = pbTail;
         }} else if (isSoleHw) {{
-          hwTail = '，同配置首个基准！';
+          hwTail = returning ? `，刷新个人纪录 ${{gainTxt}}（该配置目前仅你一人实测）` : '，同配置首个基准！';
+        }} else if (returning && wasTop) {{
+          hwTail = gainTxt ? `，卫冕同配置榜首，刷新个人纪录 ${{gainTxt}}` : '，卫冕同配置榜首';
         }} else {{
           hwTail = '，当前同配置榜首！';
         }}
@@ -752,8 +763,15 @@ $('btn-upload').onclick = async () => {{
         parts.push(`同模型速度排名第 ${{sameModelRank}} / ${{sameModelTotal}} 名`);
       }}
       extraLine = parts.join('；');
-    }} else if (resp.total_contributors) {{
-      extraLine = `全站累计已收录 ${{resp.total_samples || 1}} 条实测，你是第 ${{resp.total_contributors}} 位贡献实测数据的玩家！`;
+    }}
+    if (resp.total_contributors) {{
+      const tc = resp.total_contributors;
+      const commTxt = (resp.total_runs && resp.contributor_no)
+        ? `全站已汇聚 ${{resp.total_runs}} 次真实测速（${{tc}} 位贡献者），你是第 ${{resp.contributor_no}} 位加入的贡献者，感谢！`
+        : (resp.total_runs
+          ? `全站已汇聚 ${{resp.total_runs}} 次真实测速，来自 ${{tc}} 位贡献者，感谢参与！`
+          : `全站已汇聚 ${{resp.total_samples || 1}} 条测速记录，来自 ${{tc}} 位贡献者，感谢参与！`);
+      extraLine += `${{extraLine ? '。' : ''}}${{commTxt}}`;
     }}
     if (res.stats && res.stats.group && res.stats.group.contributors) {{
       const g = res.stats.group;

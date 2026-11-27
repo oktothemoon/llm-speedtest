@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.15"
+CLIENT_VERSION = "0.3.16"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2915,6 +2915,18 @@ def server_busy(endpoint: str, api_key: Optional[str] = None) -> Optional[bool]:
     return busy
 
 
+def community_text(resp: Dict[str, Any]) -> str:
+    """'全站已汇聚 N 次真实测速（M 位贡献者），你是第 K 位加入的贡献者，感谢！' (falls back for older backends)."""
+    total_c = resp.get("total_contributors")
+    runs = resp.get("total_runs")
+    no = resp.get("contributor_no")
+    if runs and no:
+        return f"全站已汇聚 {runs} 次真实测速（{total_c} 位贡献者），你是第 {no} 位加入的贡献者，感谢！"
+    if runs:
+        return f"全站已汇聚 {runs} 次真实测速，来自 {total_c} 位贡献者，感谢参与！"
+    return f"全站已汇聚 {resp.get('total_samples') or 1} 条测速记录，来自 {total_c} 位贡献者，感谢参与！"
+
+
 def personal_best_info(ranking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Normalise "is this upload a personal best?" across backend versions.
 
@@ -2922,7 +2934,10 @@ def personal_best_info(ranking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     is_personal_best / vs_personal_best / personal_best(_tg) / personal_best_record_id.
     Older backends only sent gap_to_first, which at rank 1 meant "this run vs my best".
     """
-    out: Dict[str, Any] = {"new_api": False, "is_pb": True, "below": 0.0, "best": None, "best_id": None}
+    out: Dict[str, Any] = {
+        "new_api": False, "is_pb": True, "below": 0.0, "best": None, "best_id": None,
+        "has_prev_api": False, "prev": None, "gain": None, "was_top": False,
+    }
     if not ranking:
         return out
 
@@ -2941,6 +2956,12 @@ def personal_best_info(ranking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             vs_pb = _num(ranking.get("submitted_tg")) - out["best"]
         out["below"] = round(max(0.0, -(vs_pb or 0.0)), 1) if not out["is_pb"] else 0.0
         out["best_id"] = ranking.get("personal_best_record_id")
+        if "prev_personal_best" in ranking:
+            # 提交前的个人最佳 / 是否原本就是同卡第一：区分首位开荒、刷新个人纪录、卫冕、新王登基
+            out["has_prev_api"] = True
+            out["prev"] = _num(ranking.get("prev_personal_best"))
+            out["gain"] = _num(ranking.get("vs_prev_best"))
+            out["was_top"] = bool(ranking.get("was_top"))
     else:
         gap = _num(ranking.get("gap_to_first")) or 0.0
         if ranking.get("same_hw_rank") == 1 and gap > 0.05:
@@ -2969,8 +2990,12 @@ def print_upload_ceremony(
     gap = float(ranking.get("gap_to_first") or 0) if ranking else 0.0
     is_sole_hw = bool(ranking and same_hw_total is not None and same_hw_total <= 1)
     pb = personal_best_info(ranking)
-    is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and pb["is_pb"])
-    is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and pb["is_pb"])
+    returning = pb["has_prev_api"] and pb["prev"] is not None  # 此前在该配置上已有成绩
+    is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and pb["is_pb"] and not (returning and pb["was_top"]))
+    is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and pb["is_pb"] and not returning)
+    is_defend = bool(ranking and same_hw_rank == 1 and not is_sole_hw and pb["is_pb"] and returning and pb["was_top"])
+    is_new_pb = bool(ranking and pb["is_pb"] and returning and (pb["gain"] or 0) > 0.05)
+    gain_txt = f"+{pb['gain']:g} tok/s" if (pb["gain"] or 0) > 0.05 else ""
 
     review = review_notice(resp)
     has_flagged = any(
@@ -2982,6 +3007,10 @@ def print_upload_ceremony(
         title = "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
     elif is_pioneer:
         title = "★ 首位开荒！你为该配置+模型立下了首条实测基准！ ★"
+    elif is_defend:
+        title = f"★ 卫冕榜首！你再次刷新了同配置同模型最高纪录（{gain_txt}） ★" if gain_txt else "★ 卫冕榜首！你仍是同配置同模型第一 ★"
+    elif is_new_pb:
+        title = f"★ 刷新个人纪录！{gain_txt}，成绩已载入速度天梯图 ★"
     elif ranking:
         title = "★ 恭喜上榜！实测成绩已载入速度天梯图 ★"
     else:
@@ -3038,17 +3067,20 @@ def print_upload_ceremony(
         if not pb["is_pb"] and pb["below"] > 0.05:
             best_txt = f"（最佳 {pb['best']:g} tok/s）" if pb["best"] is not None else ""
             pb_tail = f" · 本次较个人历史最佳低 {pb['below']:g} tok/s{best_txt}，未刷新纪录"
+        new_pb_tail = f" · ★ 刷新个人纪录 {gain_txt}" if (pb["is_pb"] and returning and gain_txt) else ""
         if same_hw_rank == 1:
             if not pb["is_pb"]:
                 hw_tail = pb_tail
             elif is_sole_hw:
-                hw_tail = " · ★ 同配置首个基准！"
+                hw_tail = (new_pb_tail + "（该配置目前仅你一人实测）") if returning else " · ★ 同配置首个基准！"
+            elif returning and pb["was_top"]:
+                hw_tail = " · ★ 卫冕同配置榜首" + (f"，刷新个人纪录 {gain_txt}" if gain_txt else "")
             else:
                 hw_tail = " · ★ 当前同配置榜首！"
         else:
             # 旧后端：非第 1 名时 gap 即本次与第一名之差；新后端：个人最佳与第一名之差
             hw_tail = f" · 距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！" if gap > 0.05 else ""
-            hw_tail += pb_tail
+            hw_tail += pb_tail + new_pb_tail
 
         if same_hw_rank is not None and same_hw_total is not None:
             ranking_lines.append(
@@ -3063,9 +3095,7 @@ def print_upload_ceremony(
 
     community_lines: List[str] = [f"  ! {line}" for line in review]
     if resp.get("total_contributors"):
-        community_lines.append(
-            f"  ◆ 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！"
-        )
+        community_lines.append(f"  ◆ {community_text(resp)}")
     if stats and isinstance(stats.get("group"), dict) and stats["group"].get("contributors"):
         g = stats["group"]
         if g.get("contributors") == 1 and g.get("tg_min") == g.get("tg_max"):
