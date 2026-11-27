@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.12"
+CLIENT_VERSION = "0.3.13"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2717,6 +2717,7 @@ def print_summary(payload: Dict[str, Any]) -> None:
 
 REVIEW_REASON_TEXT = {
     "outlier_vs_median": "明显高于同配置其他用户的成绩",
+    "too_many_client_ids": "同一网络短时间内出现了多个匿名 ID",
     "outlier_vs_best": "明显高于同配置目前的最高成绩",
     "unknown_hw_id": "你的硬件型号还没有收录进硬件库",
     "over_bandwidth_cap": "超过了该硬件的理论显存带宽上限",
@@ -2741,6 +2742,9 @@ def review_notice(resp: Dict[str, Any]) -> List[str]:
         lines.append(
             f"成绩已收到，但 [{tiers}] 档因{'；'.join(reasons)}，需要人工审核通过后才会出现在速度天梯上（通常 1–2 天）。"
         )
+    for n in resp.get("notices") if isinstance(resp.get("notices"), list) else []:
+        if isinstance(n, str) and n.strip():
+            lines.append(n.strip())
     dropped = resp.get("dropped") if isinstance(resp.get("dropped"), list) else []
     if dropped:
         lines.append(f"有 {len(dropped)} 档数据未通过服务端格式校验，未被收录：" + "；".join(str(d.get("error")) for d in dropped if isinstance(d, dict)))
@@ -2862,7 +2866,10 @@ def print_upload_ceremony(
     is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and pb["is_pb"])
 
     review = review_notice(resp)
-    if review and not ranking:
+    has_flagged = any(
+        isinstance(r, dict) and r.get("status") == "flagged" for r in (resp.get("results") or [])
+    ) if isinstance(resp.get("results"), list) else False
+    if has_flagged and not ranking:
         title = "★ 成绩已提交，等待人工审核后上榜 ★"
     elif is_king:
         title = "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"

@@ -765,7 +765,8 @@ $('btn-upload').onclick = async () => {{
 
     const reviewNotes = Array.isArray(res.review_notes) ? res.review_notes : [];
     if (reviewNotes.length) {{
-      if (!ranking) celebTitle = '⏳ 成绩已提交，等待人工审核后上榜';
+      const hasFlagged = (resp.results || []).some((r) => r && r.status === 'flagged');
+      if (!ranking && hasFlagged) celebTitle = '⏳ 成绩已提交，等待人工审核后上榜';
       const escTxt = (t) => String(t).replace(/[&<>"]/g, (c) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }}[c]));
       extraLine = reviewNotes.map((n) => '⚠ ' + escTxt(n)).join(' ') + (extraLine ? ' ' + extraLine : '');
     }}

@@ -1372,3 +1372,25 @@ class EdgeCaseTests(unittest.TestCase):
         self.assertIn("测试模型：", out)
         self.assertIn("model-a", out)
         self.assertIn("--model", out)
+
+
+class ServerNoticeTests(unittest.TestCase):
+    def test_nickname_notice_and_sybil_reason_are_shown(self):
+        notes = speedtest.review_notice({
+            "results": [{"ctx_tier": "1k", "status": "flagged", "flag_reason": "too_many_client_ids:4"}],
+            "notices": ["署名「ITBANANA官方」包含保留字（如官方、管理员、ITBANANA），已改为匿名展示"],
+        })
+        self.assertTrue(any("多个匿名 ID" in n for n in notes))
+        self.assertTrue(any("已改为匿名展示" in n for n in notes))
+
+    def test_notice_only_keeps_congrats_title(self):
+        payload = {"hardware": {"hw_raw": "RTX 4090"}, "software": {}, "model": {"model_raw": "m"},
+                   "results": [{"ctx_prompt": 1024, "tg_tps": 170}]}
+        resp = {"record_id": 3, "results": [{"ctx_tier": "1k", "status": "approved"}],
+                "notices": ["署名「官方」包含保留字（如官方、管理员、ITBANANA），已改为匿名展示"]}
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            speedtest.print_upload_ceremony(payload, resp, None)
+        out = buf.getvalue()
+        self.assertNotIn("等待人工审核", out)
+        self.assertIn("已改为匿名展示", out)
