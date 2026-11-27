@@ -33,8 +33,6 @@
 
 ## 快速开始（一条命令，测完直接冲榜）
 
-### 方式一：自己直接运行（支持终端交互或打开本地 WebUI）
-
 **macOS / Linux：**
 ```bash
 cd ~ && if [ -d llm-speedtest/.git ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
@@ -45,20 +43,13 @@ cd ~ && if [ -d llm-speedtest/.git ]; then git -C llm-speedtest pull --ff-only |
 cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-only } else { git clone https://github.com/oktothemoon/llm-speedtest.git }; if (Test-Path llm-speedtest\speedtest.py) { cd llm-speedtest; python speedtest.py }
 ```
 
-运行后会出现中文引导菜单，你可以自由选择：
+运行后会出现中文引导菜单（支持 `↑`/`↓` 方向键切换或直按 `1`/`2`）：
 - **`[1]` 终端直接测速（默认）**：适合本机或 SSH 终端，自动识别本机硬件、扫描端口与模型（如服务设置了 API Key 会直接引导输入）→ 自动跑 `1k / 32k / 64k / 128k / 256k` 测速 → 查看成绩单与明文 JSON → 选填署名/调优备注 → 确认上传并生成专属上榜战绩卡片与天梯直达链接。
 - **`[2]` 打开本地 WebUI 页面**：仅监听 `127.0.0.1`、自动在浏览器打开，点点鼠标即可完成多档测速与带礼花动效的上榜提交。
 
 也可以通过参数直接进入对应模式：
 - `python3 speedtest.py --cli`（Windows 下 `python speedtest.py --cli`）：直接进入终端模式
 - `python3 speedtest.py --ui`：直接启动本地 WebUI 页面
-
-### 方式二：直接丢给你的 AI Agent 跑（最省事）
-直接把下面这段话复制发给你的 AI（Claude Code / Codex / Cursor / OpenClaw / Antigravity 等）：
-
-```text
-请先拉取或查看 https://github.com/oktothemoon/llm-speedtest 里的 SKILL.md，按里面的步骤帮我测一下我本机正在运行的本地大模型速度。先用 --non-interactive --dry-run 跑完，把成绩单和完整 JSON 发我确认后再决定是否上传上榜。
-```
 
 ---
 
