@@ -535,6 +535,31 @@ class EndToEndMockTests(unittest.TestCase):
 
 
 class TestLocalListeningDiscovery(unittest.TestCase):
+    def test_parse_windows_netstat_and_tasklist(self):
+        tl_out = "\n".join([
+            '"System Idle Process","0","Services","0","8 K"',
+            '"svchost.exe","1148","Services","0","24,000 K"',
+            '"custom-backend.exe","19284","Console","1","450,000 K"',
+            '"strata-server.exe","20001","Console","1","120,000 K"',
+            '"chrome.exe","30001","Console","1","200,000 K"',
+        ])
+        ns_out = "\n".join([
+            "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1148",
+            "  TCP    0.0.0.0:49664          0.0.0.0:0              LISTENING       1148",
+            "  TCP    127.0.0.1:47831        0.0.0.0:0              LISTENING       19284",
+            "  TCP    127.0.0.1:17880        0.0.0.0:0              LISTENING       20001",
+            "  TCP    127.0.0.1:9222         0.0.0.0:0              LISTENING       30001",
+            "  TCP    127.0.0.1:51234        0.0.0.0:0              LISTENING       99999",
+        ])
+        pm = speedtest._parse_windows_tasklist(tl_out)
+        entries = speedtest._parse_windows_netstat(ns_out, pm)
+        self.assertIn((1, "127.0.0.1", 17880), entries)
+        # Arbitrary process name or unknown PID on 127.0.0.1 is still discovered (Tier 3)
+        self.assertIn((3, "127.0.0.1", 47831), entries)
+        self.assertIn((3, "127.0.0.1", 51234), entries)
+        # svchost and chrome must be skipped
+        self.assertFalse(any(p in (135, 49664, 9222) for _, _, p in entries))
+
     def test_parse_windows_listening(self):
         ps_out = "\n".join([
             "127.0.0.1|17880|strata-server",

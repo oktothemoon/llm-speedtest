@@ -12,6 +12,8 @@ payload, and optionally uploads it to https://itbanana.com/api/llm-speedtest/sub
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import csv
 import json
 import os
 import platform
@@ -1191,18 +1193,36 @@ _LLM_PROC_TIER2 = (
     "python", "python3", "pythonw", "uvicorn", "gunicorn",
     "node", "bun", "deno", "electron",
 )
+_SKIP_LISTEN_PROCS = (
+    "svchost", "system", "lsass", "services", "wininit", "spoolsv",
+    "searchhost", "msmpeng", "dashost", "winlogon", "csrss", "smss",
+    "chrome", "msedge", "firefox", "safari", "brave", "opera",
+    "clash", "v2ray", "mihomo", "sing-box", "shadowsocks", "xray",
+    "wechat", "qq", "discord", "slack", "spotify", "steam", "epicgameslauncher",
+    "mysqld", "postgres", "redis-server", "mongod", "nginx", "httpd", "sshd",
+    "cupsd", "controlcenter", "rapportd", "airplayxpchelper", "mDNSResponder".lower(),
+)
 
 
-def _rank_listening_process(proc_name: str) -> int:
-    """Return 1 for known LLM server/client process names, 2 for generic runtimes, 0 to skip."""
+def _rank_listening_process(proc_name: str, is_loopback_only: bool = False) -> int:
+    """Return priority rank (1=known LLM, 2=runtime, 3=other loopback, 4=other local, 0=skip)."""
     low = (proc_name or "").strip().lower()
-    if not low:
-        return 0
-    if any(k in low for k in _LLM_PROC_TIER1):
-        return 1
-    if any(low == k or low.startswith(k) for k in _LLM_PROC_TIER2):
-        return 2
-    return 0
+    if low.endswith(".exe"):
+        low = low[:-4]
+    if low:
+        if any(k in low for k in _LLM_PROC_TIER1):
+            return 1
+        if any(low == k or low.startswith(k) for k in _LLM_PROC_TIER2):
+            return 2
+        if any(low == k or low.startswith(k) for k in _SKIP_LISTEN_PROCS):
+            return 0
+        return 3 if is_loopback_only else 4
+    return 3 if is_loopback_only else 0
+
+
+def _is_loopback_bind(addr: str) -> bool:
+    a = (addr or "").strip().strip("[]").split("%")[0].lower()
+    return a == "::1" or a.startswith("127.")
 
 
 def _normalize_listen_hosts(addr: str) -> List[str]:
@@ -1221,6 +1241,44 @@ def _normalize_listen_hosts(addr: str) -> List[str]:
     return []
 
 
+def _parse_windows_tasklist(csv_output: str) -> Dict[str, str]:
+    """Parse 'tasklist /FO CSV /NH' into {pid_str: process_name}."""
+    pid_map: Dict[str, str] = {}
+    for row in csv.reader((csv_output or "").splitlines()):
+        if len(row) >= 2:
+            name = row[0].strip()
+            pid = row[1].strip()
+            if pid.isdigit() and name:
+                pid_map[pid] = name
+    return pid_map
+
+
+def _parse_windows_netstat(netstat_output: str, pid_map: Optional[Dict[str, str]] = None) -> List[Tuple[int, str, int]]:
+    """Parse 'netstat -ano' TCP LISTENING rows into (rank, host, port)."""
+    pm = pid_map or {}
+    found: List[Tuple[int, str, int]] = []
+    for line in (netstat_output or "").splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if parts[3].upper() != "LISTENING":
+            continue
+        m = re.match(r"^(.+):(\d+)$", parts[1])
+        if not m:
+            continue
+        addr, port = m.group(1), int(m.group(2))
+        if port < 1024 or port > 65535:
+            continue
+        pid = parts[4].strip()
+        proc = pm.get(pid, "")
+        rank = _rank_listening_process(proc, is_loopback_only=_is_loopback_bind(addr))
+        if not rank:
+            continue
+        for h in _normalize_listen_hosts(addr):
+            found.append((rank, h, port))
+    return found
+
+
 def _parse_windows_listening(ps_output: str) -> List[Tuple[int, str, int]]:
     """Parse 'LocalAddress|LocalPort|ProcessName' lines from PowerShell."""
     found: List[Tuple[int, str, int]] = []
@@ -1229,11 +1287,13 @@ def _parse_windows_listening(ps_output: str) -> List[Tuple[int, str, int]]:
         if len(parts) < 3:
             continue
         addr, port_s, proc = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        rank = _rank_listening_process(proc)
-        if not rank or not port_s.isdigit():
+        if not port_s.isdigit():
             continue
         port = int(port_s)
         if port < 1024 or port > 65535:
+            continue
+        rank = _rank_listening_process(proc, is_loopback_only=_is_loopback_bind(addr))
+        if not rank:
             continue
         for h in _normalize_listen_hosts(addr):
             found.append((rank, h, port))
@@ -1248,15 +1308,15 @@ def _parse_macos_listening(lsof_output: str) -> List[Tuple[int, str, int]]:
         if len(parts) < 2:
             continue
         proc = parts[0]
-        rank = _rank_listening_process(proc)
-        if not rank:
-            continue
         addr_port = parts[-2] if parts[-1] == "(LISTEN)" else parts[-1]
         m = re.match(r"^(.+):(\d+)$", addr_port)
         if not m:
             continue
         addr, port = m.group(1), int(m.group(2))
         if port < 1024 or port > 65535:
+            continue
+        rank = _rank_listening_process(proc, is_loopback_only=_is_loopback_bind(addr))
+        if not rank:
             continue
         for h in _normalize_listen_hosts(addr):
             found.append((rank, h, port))
@@ -1270,37 +1330,37 @@ def _parse_linux_listening(ss_output: str) -> List[Tuple[int, str, int]]:
         parts = line.split()
         if len(parts) < 4:
             continue
-        names = re.findall(r'\(\("([^"]+)"', line)
-        best_rank = 0
-        for nm in names:
-            r = _rank_listening_process(nm)
-            if r and (best_rank == 0 or r < best_rank):
-                best_rank = r
-        if not best_rank:
-            continue
         m = re.match(r"^(.+):(\d+)$", parts[3])
         if not m:
             continue
         addr, port = m.group(1), int(m.group(2))
         if port < 1024 or port > 65535:
             continue
+        is_lb = _is_loopback_bind(addr)
+        names = re.findall(r'\(\("([^"]+)"', line)
+        best_rank = 0
+        if names:
+            for nm in names:
+                r = _rank_listening_process(nm, is_loopback_only=is_lb)
+                if r and (best_rank == 0 or r < best_rank):
+                    best_rank = r
+        else:
+            best_rank = _rank_listening_process("", is_loopback_only=is_lb)
+        if not best_rank:
+            continue
         for h in _normalize_listen_hosts(addr):
             found.append((best_rank, h, port))
     return found
 
 
-def _discover_listening_endpoints(exclude_urls: Optional[set] = None, max_endpoints: int = 20) -> List[str]:
-    """Best-effort discovery of local listening ports owned by LLM servers/clients (process name only)."""
+def _discover_listening_endpoints(exclude_urls: Optional[set] = None, max_endpoints: int = 40) -> List[str]:
+    """Best-effort discovery of local listening ports (process name only, fast native tools)."""
     os_name = normalize_os()
     entries: List[Tuple[int, str, int]] = []
     if os_name == "windows":
-        ps = run_cmd([
-            "powershell", "-NoProfile", "-Command",
-            "$pm=@{}; Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $pm[$_.Id]=$_.ProcessName }; "
-            "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | "
-            "ForEach-Object { \"$($_.LocalAddress)|$($_.LocalPort)|$($pm[$_.OwningProcess])\" }",
-        ], timeout=4.0)
-        entries = _parse_windows_listening(ps)
+        ns_out = run_cmd(["netstat", "-ano"], timeout=3.0)
+        tl_out = run_cmd(["tasklist", "/FO", "CSV", "/NH"], timeout=3.0)
+        entries = _parse_windows_netstat(ns_out, _parse_windows_tasklist(tl_out))
     elif os_name == "macos":
         lsof_out = run_cmd(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], timeout=2.5)
         entries = _parse_macos_listening(lsof_out)
@@ -1337,34 +1397,51 @@ def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
     auth_cand: Optional[Tuple[str, int]] = None
     empty_cand: Optional[str] = None
 
+    def _probe_one(ep: str, timeout: float) -> Tuple[Optional[Tuple[str, List[str]]], Optional[Tuple[str, int]], Optional[str]]:
+        ep_clean = ep.rstrip("/")
+        root_clean = ep_clean.removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep_clean)
+        local_auth: Optional[Tuple[str, int]] = None
+        local_empty: Optional[str] = None
+        for cand in (ep_clean, root_clean):
+            try:
+                data = http_json(f"{cand}/models", headers=headers, timeout=timeout)
+                models = _extract_model_ids(data)
+                if models:
+                    return (cand, models), local_auth, local_empty
+                if local_empty is None and _is_empty_models_payload(data):
+                    local_empty = cand
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403) and local_auth is None:
+                    local_auth = (cand, e.code)
+                continue
+            except Exception:
+                continue
+        return None, local_auth, local_empty
+
     def _probe_list(endpoints: List[str], timeout: float) -> Optional[Tuple[str, List[str]]]:
         nonlocal auth_cand, empty_cand
-        for ep in endpoints:
-            ep_clean = ep.rstrip("/")
-            root_clean = ep_clean.removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep_clean)
-            for cand in (ep_clean, root_clean):
-                try:
-                    data = http_json(f"{cand}/models", headers=headers, timeout=timeout)
-                    models = _extract_model_ids(data)
-                    if models:
-                        return cand, models
-                    if empty_cand is None and _is_empty_models_payload(data):
-                        empty_cand = cand
-                except urllib.error.HTTPError as e:
-                    if e.code in (401, 403) and auth_cand is None:
-                        auth_cand = (cand, e.code)
-                    continue
-                except Exception:
-                    continue
+        if not endpoints:
+            return None
+        workers = min(16, len(endpoints))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_probe_one, ep, timeout) for ep in endpoints]
+            for fut in futures:
+                hit, l_auth, l_empty = fut.result()
+                if hit:
+                    return hit
+                if auth_cand is None and l_auth:
+                    auth_cand = l_auth
+                if empty_cand is None and l_empty:
+                    empty_cand = l_empty
         return None
 
-    hit = _probe_list(COMMON_ENDPOINTS, timeout=1.5)
+    hit = _probe_list(COMMON_ENDPOINTS, timeout=1.2)
     if hit:
         return hit
 
     dynamic_eps = _discover_listening_endpoints(exclude_urls={e.rstrip("/") for e in COMMON_ENDPOINTS})
     if dynamic_eps:
-        hit = _probe_list(dynamic_eps, timeout=1.2)
+        hit = _probe_list(dynamic_eps, timeout=1.0)
         if hit:
             return hit
 
