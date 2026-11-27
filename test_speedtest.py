@@ -144,6 +144,20 @@ class MappingTests(unittest.TestCase):
             self.assertEqual(speedtest.prompt_launch_mode(), "ui")
         with mock.patch("builtins.input", return_value="ui"):
             self.assertEqual(speedtest.prompt_launch_mode(), "ui")
+        with mock.patch("builtins.input", return_value="q"):
+            self.assertEqual(speedtest.prompt_launch_mode(), "quit")
+
+    def test_welcome_banner_box_alignment(self):
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            speedtest.print_welcome_banner()
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        self.assertGreaterEqual(len(lines), 8)
+        widths = [speedtest._display_width(ln) for ln in lines]
+        self.assertEqual(len(set(widths)), 1)
+        self.assertLessEqual(widths[0], 80)
+        self.assertIn("ITBANANA.COM", buf.getvalue())
+        self.assertIn("https://itbanana.com/llm-speed", buf.getvalue())
 
     def test_persistent_anonymous_client_id(self):
         import os
@@ -164,6 +178,64 @@ class MappingTests(unittest.TestCase):
                 cid3 = speedtest.get_or_create_client_id()
                 self.assertIsNotNone(speedtest.clean_client_id(cid3))
                 self.assertNotEqual(cid3, "not valid!!")
+
+    def test_terminal_cards_never_overflow_border(self):
+        payload = {
+            "hardware": {
+                "hw_raw": "AMD Radeon AI PRO R9700",
+                "gpu_count": 1,
+                "ram_gb": 64,
+                "vram_gb": 32,
+                "os": "linux",
+            },
+            "software": {"engine": "llama.cpp", "kv_cache": ""},
+            "model": {"model_raw": "qwen3.8-flash-next-iq3_s", "quant": "IQ3_S"},
+            "nickname": "一凡",
+            "results": [
+                {"ctx_prompt": 1024, "tg_tps": 118.7, "pp_tps": 915.0, "ttft_ms": 851.7, "runs": 3, "source": "timings"},
+                {"ctx_prompt": 262144, "tg_tps": 88.1, "pp_tps": 2955.2, "ttft_ms": 88587.2, "runs": 3, "source": "timings"},
+            ],
+        }
+        resp = {
+            "record_id": 11,
+            "total_samples": 15,
+            "total_contributors": 3,
+            "ranking": {
+                "same_hw_rank": 1,
+                "same_hw_total": 3,
+                "same_hw_median": 114.6,
+                "vs_median_pct": 4,
+                "same_model_rank": 1,
+                "same_model_total": 3,
+                "gap_to_first": 0.0,
+            },
+        }
+        stats = {"group": {"tg_min": 93.5, "tg_max": 114.6, "tg_median": 94.9, "contributors": 3}}
+
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            speedtest.print_upload_ceremony(payload, resp, stats)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        border_widths = [
+            speedtest._display_width(ln)
+            for ln in lines
+            if ln.startswith(("╔", "║", "╠", "╟", "╚"))
+        ]
+        self.assertTrue(border_widths)
+        self.assertEqual(len(set(border_widths)), 1)
+        box_w = border_widths[0]
+        for ln in lines:
+            self.assertLessEqual(speedtest._display_width(ln), box_w)
+
+        buf2 = io.StringIO()
+        with mock.patch("sys.stderr", buf2):
+            speedtest.print_summary(payload)
+        sum_lines = [ln for ln in buf2.getvalue().splitlines() if ln.strip()]
+        top_w = speedtest._display_width(sum_lines[0])
+        bot_w = speedtest._display_width(sum_lines[-1])
+        self.assertEqual(top_w, bot_w)
+        for ln in sum_lines[1:-1]:
+            self.assertLess(speedtest._display_width(ln), top_w)
 
 
 class EndToEndMockTests(unittest.TestCase):

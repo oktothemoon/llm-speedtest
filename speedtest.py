@@ -23,6 +23,7 @@ import statistics
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -227,10 +228,24 @@ def _supports_color() -> bool:
     return True
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
+
+
 def _c(text: str, code: str) -> str:
     if not _supports_color():
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+def _display_width(text: str) -> int:
+    """Return terminal display column width (ANSI-stripped, East Asian Wide/Fullwidth = 2)."""
+    plain = _ANSI_RE.sub("", text)
+    width = 0
+    for ch in plain:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 def clean_public_text(val: Optional[str], max_chars: int) -> Optional[str]:
@@ -1915,24 +1930,205 @@ def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed
 
 
 def print_welcome_banner() -> None:
-    print(_c("╭────────────────────────────────────────────────────────────╮", "36"), file=sys.stderr)
-    print(_c(f"│  ★ llm-speedtest v{CLIENT_VERSION} · 本地大模型速度天梯图实测工具   │", "1;36"), file=sys.stderr)
-    print(_c("╰────────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
-    print(
-        "[隐私承诺] 100% 开源、零第三方依赖，仅采集本机硬件规格、推理速度与本地随机匿名 client_id，\n"
-        "           绝不收集用户名、主机名、硬件序列号、路径、原始 IP 或 API Key（--anonymous 可关闭）；上传前明文可见。",
-        file=sys.stderr,
-    )
+    # Option D: crisp pixel-block LLM-SPEED logo + ITBANANA.COM brand tag
+    logo_llm = [
+        "█     █     █▄ ▄█ ",
+        "█     █     █ █ █ ",
+        "█     █     █   █ ",
+        "▀▀▀▀▀ ▀▀▀▀▀ ▀   ▀ ",
+    ]
+    logo_dash = [
+        "      ",
+        "▄▄▄▄▄ ",
+        "      ",
+        "      ",
+    ]
+    logo_speed = [
+        "▄▀▀▀▀ █▀▀▀▄ █▀▀▀▀ █▀▀▀▀ █▀▀▀▄",
+        "▀▄▄▄  █▄▄▄▀ █▄▄▄  █▄▄▄  █   █",
+        "    █ █     █     █     █   █",
+        "▀▀▀▀  ▀     ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀ ",
+    ]
+    meta_col = [
+        _c(f"v{CLIENT_VERSION}", "1;36"),
+        f"{_c('by', '90')} {_c('ITBANANA.COM', '1;33')}",
+        "",
+        _c("本地大模型测速", "1"),
+    ]
+    header_rows = [
+        f"  {_c(l, '1;36')}{_c(d, '90')}{_c(s, '1;33')}    {m}" if m else f"  {_c(l, '1;36')}{_c(d, '90')}{_c(s, '1;33')}"
+        for l, d, s, m in zip(logo_llm, logo_dash, logo_speed, meta_col)
+    ]
+    footer_rows = [
+        f"  {_c('●', '32')} 100% 开源 · 零依赖 · 仅采硬件、速度与随机匿名 client_id（--anonymous）",
+        f"  {_c('●', '32')} 绝不收集用户名/主机名/路径/原始 IP/API Key，上传前明文可见",
+        f"  {_c('▸', '36')} 速度天梯图：{_c('https://itbanana.com/llm-speed', '4;36')}",
+    ]
+
+    inner_width = max(76, max(_display_width(r) for r in header_rows + footer_rows) + 2)
+    divider = "  " + _c("─" * (inner_width - 4), "90")
+    rows = header_rows + [divider] + footer_rows
+
+    print("", file=sys.stderr)
+    print(_c(f"╭{'─' * inner_width}╮", "36"), file=sys.stderr)
+    print(_c("│", "36") + " " * inner_width + _c("│", "36"), file=sys.stderr)
+    for row in rows:
+        pad = inner_width - _display_width(row)
+        print(_c("│", "36") + row + " " * pad + _c("│", "36"), file=sys.stderr)
+    print(_c("│", "36") + " " * inner_width + _c("│", "36"), file=sys.stderr)
+    print(_c(f"╰{'─' * inner_width}╯", "36"), file=sys.stderr)
+
+
+def _read_nav_key(fd: Optional[int] = None) -> str:
+    """Read a single navigation keypress from a TTY already in cbreak/raw mode (stdlib only)."""
+    if platform.system().lower().startswith("win"):
+        import msvcrt  # type: ignore
+
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            code = msvcrt.getwch()
+            if code == "H":
+                return "UP"
+            if code == "P":
+                return "DOWN"
+            return ""
+        if ch == "\x03":
+            return "CTRL_C"
+        if ch in ("\r", "\n"):
+            return "ENTER"
+        if ch == "\x1b":
+            return "ESC"
+        if ch == "\t":
+            return "TAB"
+        return ch
+
+    import select
+
+    assert fd is not None
+    raw = os.read(fd, 1)
+    if not raw:
+        return "CTRL_C"
+    ch = raw.decode("utf-8", errors="ignore")
+    if ch == "\x03":
+        return "CTRL_C"
+    if ch in ("\r", "\n"):
+        return "ENTER"
+    if ch == "\t":
+        return "TAB"
+    if ch == "\x1b":
+        if select.select([fd], [], [], 0.05)[0]:
+            seq = os.read(fd, 1)
+            if seq == b"[" and select.select([fd], [], [], 0.05)[0]:
+                code = os.read(fd, 1)
+                if code == b"A":
+                    return "UP"
+                if code == b"B":
+                    return "DOWN"
+        return "ESC"
+    return ch
 
 
 def prompt_launch_mode() -> str:
-    """Let interactive terminal users choose CLI or local WebUI."""
-    print("\n请选择启动方式：", file=sys.stderr)
-    print(f"  {_c('[1]', '1;36')} 终端直接测速（推荐，适合本机或 SSH 终端）", file=sys.stderr)
-    print(f"  {_c('[2]', '1;36')} 打开本地 WebUI 页面（在浏览器里操作）", file=sys.stderr)
-    choice = _ask("请输入 1 或 2，直接回车默认 1", "1").lower()
+    """Let interactive terminal users choose CLI or local WebUI (with arrow-key support on TTY)."""
+    options = [
+        ("cli", "1", "终端直接测速", "推荐", "适合本机或 SSH 终端，1–2 次按键即刻开测"),
+        ("ui", "2", "本地 WebUI 页面", "", "自动打开浏览器可视化面板，点选配置更直观"),
+    ]
+
+    def _render_menu(selected: int) -> List[str]:
+        out: List[str] = []
+        for idx, (_key, num, label, badge, desc) in enumerate(options):
+            badge_str = f"  {_c('(' + badge + ')', '32')}" if badge else ""
+            if idx == selected:
+                out.append(f"  {_c('❯', '1;36')} {_c('[' + num + '] ' + label, '1;36')}{badge_str}")
+                out.append(f"        {desc}")
+            else:
+                out.append(f"    {_c('[' + num + '] ' + label, '90')}{_c('  (' + badge + ')', '90') if badge else ''}")
+                out.append(f"        {_c(desc, '90')}")
+        return out
+
+    # Interactive arrow-key selector when attached to a real terminal
+    is_win = platform.system().lower().startswith("win")
+    can_redraw = sys.stdin.isatty() and sys.stderr.isatty() and (is_win or os.environ.get("TERM", "xterm") != "dumb")
+    if can_redraw:
+        selected = 0
+        print(
+            f"\n  {_c('请选择启动方式', '1')}  {_c('（↑/↓ 切换 · Enter 确认 · 或直接按 1/2）', '90')}\n",
+            file=sys.stderr,
+        )
+        lines = _render_menu(selected)
+        rendered_height = len(lines)
+        fd: Optional[int] = None
+        old_settings = None
+        try:
+            if not is_win:
+                import termios
+                import tty
+
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                # Disable ISIG so Ctrl+C arrives as \x03 cleanly
+                raw_attrs = termios.tcgetattr(fd)
+                raw_attrs[3] &= ~(termios.ISIG | termios.ECHO)
+                termios.tcsetattr(fd, termios.TCSANOW, raw_attrs)
+
+            sys.stderr.write("\033[?25l")
+            sys.stderr.write("\n".join(lines) + "\n")
+            sys.stderr.flush()
+
+            while True:
+                key = _read_nav_key(fd)
+                if key in ("UP", "k", "K"):
+                    selected = (selected - 1) % len(options)
+                elif key in ("DOWN", "j", "J", "TAB"):
+                    selected = (selected + 1) % len(options)
+                elif key == "1":
+                    selected = 0
+                    break
+                elif key == "2":
+                    selected = 1
+                    break
+                elif key == "ENTER":
+                    break
+                elif key in ("CTRL_C", "ESC", "q", "Q"):
+                    sys.stderr.write(f"\033[{rendered_height}A\033[J")
+                    print(f"  {_c('已取消启动。', '90')}", file=sys.stderr)
+                    return "quit"
+                else:
+                    continue
+
+                sys.stderr.write(f"\033[{rendered_height}A\033[J")
+                lines = _render_menu(selected)
+                sys.stderr.write("\n".join(lines) + "\n")
+                sys.stderr.flush()
+
+            sys.stderr.write(f"\033[{rendered_height}A\033[J")
+            lines = _render_menu(selected)
+            sys.stderr.write("\n".join(lines) + "\n")
+            chosen_key, _num, chosen_label, _b, _d = options[selected]
+            print(f"\n  {_c('✓', '1;32')} 已选择：{_c(chosen_label, '1')}", file=sys.stderr)
+            return chosen_key
+        except Exception:
+            # Fall back to standard text prompt if raw TTY fails
+            pass
+        finally:
+            if not is_win and fd is not None and old_settings is not None:
+                import termios
+
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            sys.stderr.write("\033[?25h")
+            sys.stderr.flush()
+
+    # Fallback for non-TTY / piped input / unit tests
+    print(f"\n  {_c('请选择启动方式：', '1')}", file=sys.stderr)
+    for line in _render_menu(0):
+        print(line, file=sys.stderr)
+    choice = _ask("\n  请输入 1 或 2，直接回车默认 1", "1").lower()
     if choice in ("2", "ui", "web", "webui", "w"):
         return "ui"
+    if choice in ("q", "quit", "exit"):
+        return "quit"
     return "cli"
 
 
@@ -2043,25 +2239,34 @@ def print_summary(payload: Dict[str, Any]) -> None:
     ram_str = f"{hw.get('ram_gb') or '?'}GB" + (f" {hw['ram_type']}" if hw.get("ram_type") else "")
     vram_str = f" ({hw['vram_gb']}GB 显存)" if hw.get("vram_gb") else ""
     kv_str = f" | KV Cache：{sw['kv_cache']}" if sw.get("kv_cache") else ""
-    print(_c("\n╭─────────────────────── 测速成绩单 ───────────────────────╮", "36"), file=sys.stderr)
-    print(f"  ◆ 本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']} · 内存 {ram_str} · {hw.get('os') or ''}", file=sys.stderr)
-    print(f"  ◆ 测试模型：{mdl['model_raw']} | 量化：{mdl.get('quant') or '未填'} | 引擎：{sw.get('engine') or '未填'}{kv_str}", file=sys.stderr)
+    lines = [
+        f"  ◆ 本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']} · 内存 {ram_str} · {hw.get('os') or ''}",
+        f"  ◆ 测试模型：{mdl['model_raw']} | 量化：{mdl.get('quant') or '未填'} | 引擎：{sw.get('engine') or '未填'}{kv_str}",
+    ]
     if payload.get("nickname") or payload.get("note"):
         meta_parts = []
         if payload.get("nickname"):
             meta_parts.append(f"署名：{payload['nickname']}")
         if payload.get("note"):
             meta_parts.append(f"备注：{payload['note']}")
-        print(f"  ◆ {' | '.join(meta_parts)}", file=sys.stderr)
+        lines.append(f"  ◆ {' | '.join(meta_parts)}")
     for r in payload["results"]:
         src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
         lbl = format_ctx_label(r["ctx_prompt"])
-        print(
+        lines.append(
             f"  ▸ [{lbl:>4}] ctx≈{r['ctx_prompt']} → 生成 {_c(str(r['tg_tps']) + ' tok/s', '1;33')} | "
-            f"读题 {r.get('pp_tps') or '-'} tok/s | 首字 {r.get('ttft_ms') or '-'} ms（{r['runs']}轮，{src_lbl}）",
-            file=sys.stderr,
+            f"读题 {r.get('pp_tps') or '-'} tok/s | 首字 {r.get('ttft_ms') or '-'} ms（{r['runs']}轮，{src_lbl}）"
         )
-    print(_c("╰──────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
+    header_label = " 测速成绩单 "
+    label_w = _display_width(header_label)
+    inner_width = max(58, max((_display_width(line) for line in lines), default=0) + 1, label_w + 4)
+    dash_total = inner_width - label_w
+    dash_left = dash_total // 2
+    dash_right = dash_total - dash_left
+    print(_c(f"\n╭{'─' * dash_left}{header_label}{'─' * dash_right}╮", "36"), file=sys.stderr)
+    for line in lines:
+        print(line, file=sys.stderr)
+    print(_c(f"╰{'─' * inner_width}╯", "36"), file=sys.stderr)
 
 
 def print_upload_ceremony(
@@ -2092,31 +2297,28 @@ def print_upload_ceremony(
     kv = f" · KV {sw['kv_cache']}" if sw.get("kv_cache") else ""
     author = payload.get("nickname") or "匿名贡献者"
 
-    print("", file=sys.stderr)
-    print(_c("╔══════════════════════════════════════════════════════════════╗", "1;33"), file=sys.stderr)
-    print(_c(f"║   {title}", "1;33"), file=sys.stderr)
-    print(_c("╠══════════════════════════════════════════════════════════════╣", "33"), file=sys.stderr)
-    print(f"  ★ {_c(badge, '1;36')}", file=sys.stderr)
-    print(f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{ram}", file=sys.stderr)
-    print(f"  ◆ 模型：{mdl.get('model_raw', '-')}{quant}{kv}", file=sys.stderr)
+    info_lines: List[str] = [
+        f"  ★ {_c(badge, '1;36')}",
+        f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{ram}",
+        f"  ◆ 模型：{mdl.get('model_raw', '-')}{quant}{kv}",
+    ]
     if len(results) == 1:
-        print(
+        info_lines.append(
             f"  ▸ 成绩：生成 {_c(str(r0.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
-            f"读题 {r0.get('pp_tps') or '-'} tok/s  |  署名：{author}",
-            file=sys.stderr,
+            f"读题 {r0.get('pp_tps') or '-'} tok/s  |  署名：{author}"
         )
     else:
-        print(f"  ▸ 多档实测成绩（共 {len(results)} 档） · 署名：{author}", file=sys.stderr)
+        info_lines.append(f"  ▸ 多档实测成绩（共 {len(results)} 档） · 署名：{author}")
         for r in results:
             lbl = format_ctx_label(r.get("ctx_prompt") or 0)
-            print(
+            info_lines.append(
                 f"     [{lbl:>5}] 生成 {_c(str(r.get('tg_tps', '-')) + ' tok/s', '1;32')}  |  "
-                f"读题 {r.get('pp_tps') or '-'} tok/s  |  首字 {r.get('ttft_ms') or '-'} ms",
-                file=sys.stderr,
+                f"读题 {r.get('pp_tps') or '-'} tok/s  |  首字 {r.get('ttft_ms') or '-'} ms"
             )
     if payload.get("note"):
-        print(f"  ◆ 备注：{payload['note']}", file=sys.stderr)
+        info_lines.append(f"  ◆ 备注：{payload['note']}")
 
+    ranking_lines: List[str] = []
     if ranking:
         gap = float(ranking.get("gap_to_first") or 0)
         gap_txt = "★ 当前同配置榜首！" if gap <= 0.05 else f"距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！"
@@ -2128,34 +2330,52 @@ def print_upload_ceremony(
         )
         same_model_rank = ranking.get("same_model_rank") or ranking.get("overall_rank")
         same_model_total = ranking.get("same_model_total") or ranking.get("overall_total")
-        print(_c("╟──────────────────────────────────────────────────────────────╢", "33"), file=sys.stderr)
-        print(
-            f"  ★ 同配置同模型速度排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}",
-            file=sys.stderr,
+        ranking_lines.append(
+            f"  ★ 同配置同模型速度排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}"
         )
-        print(
-            f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名 · {gap_txt}",
-            file=sys.stderr,
+        ranking_lines.append(
+            f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名 · {gap_txt}"
         )
 
+    community_lines: List[str] = []
     if resp.get("total_contributors"):
-        print(
-            f"  ◆ 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！",
-            file=sys.stderr,
+        community_lines.append(
+            f"  ◆ 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！"
         )
     if stats and isinstance(stats.get("group"), dict) and stats["group"].get("contributors"):
         g = stats["group"]
-        print(
-            f"  ◆ 同配置同模型参考区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位实测用户）",
-            file=sys.stderr,
+        community_lines.append(
+            f"  ◆ 同配置同模型参考区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位实测用户）"
         )
 
     ladder_url = (ranking or {}).get("ladder_url") or (
         f"https://itbanana.com/llm-speed?highlight={rec_id}" if rec_id else "https://itbanana.com/llm-speed"
     )
-    print(_c("╟──────────────────────────────────────────────────────────────╢", "33"), file=sys.stderr)
-    print(f"  → 直达天梯图高亮我的成绩：{_c(ladder_url, '1;4;36')}", file=sys.stderr)
-    print(_c("╚══════════════════════════════════════════════════════════════╝", "1;33"), file=sys.stderr)
+    footer_line = f"  → 直达天梯图高亮我的成绩：{_c(ladder_url, '1;4;36')}"
+
+    all_body_lines = info_lines + ranking_lines + community_lines + [footer_line]
+    title_w = _display_width(title)
+    max_body_w = max((_display_width(line) for line in all_body_lines), default=0)
+    inner_width = max(62, max_body_w + 1, title_w + 4)
+    pad_total = inner_width - title_w
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+
+    print("", file=sys.stderr)
+    print(_c(f"╔{'═' * inner_width}╗", "1;33"), file=sys.stderr)
+    print(_c(f"║{' ' * pad_left}{title}{' ' * pad_right}║", "1;33"), file=sys.stderr)
+    print(_c(f"╠{'═' * inner_width}╣", "33"), file=sys.stderr)
+    for line in info_lines:
+        print(line, file=sys.stderr)
+    if ranking_lines:
+        print(_c(f"╟{'─' * inner_width}╢", "33"), file=sys.stderr)
+        for line in ranking_lines:
+            print(line, file=sys.stderr)
+    for line in community_lines:
+        print(line, file=sys.stderr)
+    print(_c(f"╟{'─' * inner_width}╢", "33"), file=sys.stderr)
+    print(footer_line, file=sys.stderr)
+    print(_c(f"╚{'═' * inner_width}╝", "1;33"), file=sys.stderr)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2192,7 +2412,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         and not args.dry_run
         and not args.interactive
     ):
-        if prompt_launch_mode() == "ui":
+        mode = prompt_launch_mode()
+        if mode == "quit":
+            return 0
+        if mode == "ui":
             import ui as ui_mod
             return ui_mod.serve_ui(
                 sys.modules[__name__],
