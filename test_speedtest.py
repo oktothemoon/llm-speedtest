@@ -1219,7 +1219,7 @@ class TierRunnerTests(unittest.TestCase):
             return {"ctx_prompt": target, "pp_tps": 300.0, "tg_tps": 50.0, "gen_tokens": gen}, 5.6
 
         with mock.patch.object(speedtest, "benchmark_context", side_effect=fake_bc), \
-                mock.patch.object(speedtest, "run_single_completion") as warm:
+                mock.patch.object(speedtest, "run_single_completion", return_value={"source": "timings"}) as warm:
             res = speedtest.run_benchmark_tiers(
                 "http://127.0.0.1:1/v1", "m", [1024, 32768, 65536, 131072], 256, 3,
                 warmup=True, log=lambda m, c=None: lines.append(m),
@@ -1394,3 +1394,74 @@ class ServerNoticeTests(unittest.TestCase):
         out = buf.getvalue()
         self.assertNotIn("等待人工审核", out)
         self.assertIn("已改为匿名展示", out)
+
+
+class PrefillEstimateTests(unittest.TestCase):
+    """Engines without server timings: subtract the fixed per-request overhead from TTFT."""
+
+    def _serve(self, overhead_s=0.15, prefill_tps=5000.0, with_timings=False):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
+                prompt_tokens = max(1, round(len(body["messages"][0]["content"]) / 5.6))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                time.sleep(overhead_s + prompt_tokens / prefill_tps)  # 固定开销 + 真实读题耗时
+                n = body["max_tokens"]
+                for _ in range(n):
+                    self.wfile.write(b'data: {"choices":[{"delta":{"content":"tok "}}]}\n\n')
+                    self.wfile.flush()
+                    time.sleep(0.001)
+                final = {"choices": [], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": n}}
+                if with_timings:
+                    final["timings"] = {"prompt_n": prompt_tokens, "predicted_n": n,
+                                        "prompt_per_second": prefill_tps, "predicted_per_second": 900.0}
+                self.wfile.write(f"data: {json.dumps(final)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}/v1"
+
+    def test_overhead_correction_brings_1k_prefill_close_to_truth(self):
+        ep = self._serve(overhead_s=0.15, prefill_tps=5000.0)
+        overhead = speedtest.measure_ttft_overhead(ep, "m")
+        self.assertIsNotNone(overhead)
+        self.assertAlmostEqual(overhead, 0.15, delta=0.06)
+        prompt = speedtest.build_prompt(1024, "t")
+        raw = speedtest.run_single_completion(ep, "m", prompt, 8)
+        fixed = speedtest.run_single_completion(ep, "m", prompt, 8, ttft_overhead_s=overhead)
+        self.assertLess(raw["pp_tps"], 5000 * 0.7)  # 不扣开销：明显低估
+        self.assertGreater(fixed["pp_tps"], 5000 * 0.8)  # 扣除后接近真实 5000
+        self.assertLess(fixed["pp_tps"], 5000 * 1.25)
+        self.assertEqual(raw["ttft_ms"] // 50, fixed["ttft_ms"] // 50)  # 首字时间本身照实上报，不做修改
+
+    def test_unreliable_overhead_falls_back_to_plain_ttft(self):
+        ep = self._serve(overhead_s=0.0, prefill_tps=200000.0)
+        r = speedtest.run_single_completion(ep, "m", speedtest.build_prompt(1024, "t"), 8, ttft_overhead_s=10.0)
+        self.assertGreater(r["pp_tps"], 0)
+        self.assertLess(r["pp_tps"], 200000 * 1.5)
+
+    def test_no_probe_when_server_reports_timings(self):
+        ep = self._serve(with_timings=True)
+        self.assertIsNone(speedtest.measure_ttft_overhead(ep, "m"))
+        r = speedtest.run_single_completion(ep, "m", "hello", 8, ttft_overhead_s=0.15)
+        self.assertEqual(r["source"], "timings")
+        self.assertEqual(r["pp_tps"], 5000.0)
+
+    def test_runner_measures_overhead_only_for_sse_engines(self):
+        lines: List[str] = []
+        ep = self._serve(overhead_s=0.1, prefill_tps=8000.0)
+        res = speedtest.run_benchmark_tiers(ep, "m", [1024], 16, 1, warmup=True, log=lambda m, c=None: lines.append(m))
+        self.assertTrue(any("固定开销约" in ln for ln in lines))
+        self.assertGreater(res[0]["pp_tps"], 8000 * 0.75)
+
+        lines2: List[str] = []
+        ep2 = self._serve(with_timings=True)
+        speedtest.run_benchmark_tiers(ep2, "m", [1024], 16, 1, warmup=True, log=lambda m, c=None: lines2.append(m))
+        self.assertFalse(any("固定开销约" in ln for ln in lines2))

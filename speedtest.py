@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.13"
+CLIENT_VERSION = "0.3.14"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -1937,6 +1937,7 @@ def run_single_completion(
     gen_tokens: int,
     api_key: Optional[str] = None,
     timeout: float = 300.0,
+    ttft_overhead_s: float = 0.0,
 ) -> Dict[str, Any]:
     url = f"{endpoint.rstrip('/')}/chat/completions"
     ep_key = endpoint.rstrip("/")
@@ -1971,7 +1972,9 @@ def run_single_completion(
     except urllib.error.HTTPError as e:
         if use_ignore_eos and e.code in (400, 422):
             _NO_IGNORE_EOS_ENDPOINTS.add(ep_key)
-            return run_single_completion(endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=timeout)
+            return run_single_completion(
+                endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=timeout, ttft_overhead_s=ttft_overhead_s
+            )
         raise
 
     with resp_cm as resp:
@@ -2028,7 +2031,15 @@ def run_single_completion(
 
     # SSE decode speed: tokens after the first token divided by decode interval.
     sse_tg_tps = max(0.1, (max(1, completion_tokens - 1)) / decode_s) if completion_tokens > 1 else max(0.1, 1.0 / ttft_s)
-    sse_pp_tps = max(0.1, prompt_tokens / ttft_s)
+    # 无服务端计时时只能用首字时间估算读题速度。首字时间里混有网络、排队、套模板与首 token 生成等固定开销，
+    # 短上下文时占比很大（1k 档可低估 40% 以上）。若已测得固定开销，先扣除再估算；
+    # 扣除后剩余时间过短（开销测量不稳或读题极快）时退回原算法，避免算出离谱的大数。
+    prefill_s = ttft_s
+    if ttft_overhead_s > 0:
+        adjusted = ttft_s - ttft_overhead_s
+        if adjusted >= 0.2 * ttft_s:
+            prefill_s = adjusted
+    sse_pp_tps = max(0.1, prompt_tokens / prefill_s)
 
     if timings.get("predicted_per_second"):
         tg_tps = float(timings["predicted_per_second"])
@@ -2049,6 +2060,26 @@ def run_single_completion(
         "source": source,
         "tokens_estimated": tokens_estimated and source != "timings",
     }
+
+
+def measure_ttft_overhead(
+    endpoint: str, model_name: str, api_key: Optional[str] = None, probes: int = 3
+) -> Optional[float]:
+    """Median first-token latency of a near-empty prompt = fixed per-request overhead (seconds).
+
+    Only meaningful for engines without server-side timings. Returns None when the server does
+    report timings (no correction needed) or the probe fails.
+    """
+    vals: List[float] = []
+    for i in range(max(1, probes)):
+        try:
+            r = run_single_completion(endpoint, model_name, f"Hi {i}", 4, api_key=api_key, timeout=60.0)
+        except Exception:
+            return None
+        if r.get("source") == "timings":
+            return None
+        vals.append(float(r["ttft_ms"]) / 1000.0)
+    return statistics.median(vals) if vals else None
 
 
 def tier_quality_warnings(samples: List[Dict[str, Any]], gen_tokens_cap: int) -> List[str]:
@@ -2090,6 +2121,7 @@ def benchmark_context(
     tier_label: Optional[str] = None,
     log: Optional[LogFn] = None,
     timeout: Optional[float] = None,
+    ttft_overhead_s: float = 0.0,
 ) -> Tuple[Dict[str, Any], float]:
     """Run one context tier (median of N runs). Shared by the CLI and the local WebUI."""
     emit = log or _stderr_log
@@ -2104,7 +2136,9 @@ def benchmark_context(
         prompt = build_prompt(ctx_prompt, nonce, chars_per_token=cpt)
         if ctx_prompt >= 16384:
             emit(f"   第 {i + 1}/{tier_runs} 轮进行中（长上下文读题较慢，请耐心等待）...")
-        r = run_single_completion(endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=req_timeout)
+        r = run_single_completion(
+            endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=req_timeout, ttft_overhead_s=ttft_overhead_s
+        )
         samples.append(r)
         if r["prompt_tokens"] >= 200:
             measured_cpt = len(prompt) / float(r["prompt_tokens"])
@@ -2175,9 +2209,22 @@ def run_benchmark_tiers(
             "建议先停止其它请求后再测。",
             "33",
         )
+    warm_source: Optional[str] = None
     if warmup:
         emit("\n▸ 正在发送预热请求（避免冷启动影响成绩）...")
-        run_single_completion(endpoint, model_name, build_warmup_prompt(ctx_limit), 24, api_key=api_key)
+        warm_source = run_single_completion(
+            endpoint, model_name, build_warmup_prompt(ctx_limit), 24, api_key=api_key
+        ).get("source")
+
+    overhead = 0.0
+    if warm_source != "timings":
+        measured = measure_ttft_overhead(endpoint, model_name, api_key=api_key)
+        if measured:
+            overhead = measured
+            emit(
+                f"▸ 该推理服务未提供服务端计时：已测得单次请求固定开销约 {overhead * 1000:.0f} ms，"
+                f"估算读题速度时将扣除这部分开销。"
+            )
 
     results: List[Dict[str, Any]] = []
     cpt = 5.6
@@ -2202,6 +2249,7 @@ def run_benchmark_tiers(
                 tier_label=lbl,
                 log=log,
                 timeout=req_timeout,
+                ttft_overhead_s=overhead,
             )
             results.append(res)
         except KeyboardInterrupt:
