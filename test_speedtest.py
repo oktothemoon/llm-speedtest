@@ -972,3 +972,137 @@ class TestLocalListeningDiscovery(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BenchmarkRobustnessTests(unittest.TestCase):
+    """Mock OpenAI-compatible servers covering early EOS, missing usage, strict params and errors."""
+
+    def _serve(self, mode: str):
+        seen: List[Dict[str, Any]] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                code, data = (200, {"data": [{"id": "Qwen3-8B-Q4_K_M"}]}) if self.path == "/v1/models" else (404, {})
+                raw = json.dumps(data).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
+                seen.append(body)
+                if mode == "err500":
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"model not loaded"}')
+                    return
+                if mode == "strict" and "ignore_eos" in body:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"unknown field ignore_eos"}')
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                n = body["max_tokens"]
+                stop_at = n if body.get("ignore_eos") else min(n, 30)
+                per_chunk = 4 if mode == "multi_chunk_no_usage" else 1
+                sent = 0
+                while sent < stop_at:
+                    k = min(per_chunk, stop_at - sent)
+                    chunk = {"choices": [{"delta": {"content": "tok " * k}}]}
+                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    sent += k
+                    time.sleep(0.001 * k)
+                if mode != "multi_chunk_no_usage":
+                    usage = {"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": sent}}
+                    self.wfile.write(f"data: {json.dumps(usage)}\n\n".encode("utf-8"))
+                self.wfile.write(b"data: [DONE]\n\n")
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        speedtest._NO_IGNORE_EOS_ENDPOINTS.clear()
+        return f"http://127.0.0.1:{srv.server_address[1]}/v1", seen
+
+    def test_ignore_eos_is_sent_so_generation_runs_full_length(self):
+        ep, seen = self._serve("early_eos")
+        r = speedtest.run_single_completion(ep, "m", "hello", 128)
+        self.assertTrue(seen[0].get("ignore_eos"))
+        self.assertEqual(r["gen_tokens"], 128)
+        self.assertFalse(r["tokens_estimated"])
+
+    def test_strict_server_rejecting_ignore_eos_falls_back_once(self):
+        ep, seen = self._serve("strict")
+        r1 = speedtest.run_single_completion(ep, "m", "hello", 128)
+        r2 = speedtest.run_single_completion(ep, "m", "hello", 128)
+        self.assertEqual([("ignore_eos" in b) for b in seen], [True, False, False])
+        self.assertEqual(r1["gen_tokens"], 30)
+        self.assertEqual(r2["gen_tokens"], 30)
+        warns = speedtest.tier_quality_warnings([r1, r2], 128)
+        self.assertTrue(any("不会计入速度天梯" in w for w in warns))
+
+    def test_multi_token_chunks_without_usage_are_not_undercounted(self):
+        ep, _ = self._serve("multi_chunk_no_usage")
+        r = speedtest.run_single_completion(ep, "m", "hello", 256)
+        # 64 chunks × 4 tokens: counting chunks alone would report 64 tokens (4× too slow)
+        self.assertEqual(r["gen_tokens"], 256)
+        self.assertTrue(r["tokens_estimated"])
+        warns = speedtest.tier_quality_warnings([r], 256)
+        self.assertTrue(any("未返回生成 token 数" in w for w in warns))
+
+    def test_no_warnings_for_normal_tier(self):
+        ep, _ = self._serve("early_eos")
+        r = speedtest.run_single_completion(ep, "m", "hello", 256)
+        self.assertEqual(speedtest.tier_quality_warnings([r], 256), [])
+
+    def test_cli_turns_server_error_into_short_message(self):
+        ep, _ = self._serve("err500")
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf), mock.patch("sys.stdout", io.StringIO()):
+            code = speedtest.cli(["--endpoint", ep, "--ctx", "1k", "--runs", "1", "--dry-run",
+                                  "--non-interactive", "--hw-id", "rtx4090"])
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 500", out)
+        self.assertIn("model not loaded", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_cli_ctrl_c_exits_cleanly(self):
+        buf = io.StringIO()
+        with mock.patch.object(speedtest, "main", side_effect=KeyboardInterrupt), mock.patch("sys.stderr", buf):
+            code = speedtest.cli([])
+        self.assertEqual(code, 130)
+        self.assertIn("已中断测速", buf.getvalue())
+
+    def test_ui_server_rejects_foreign_host_header(self):
+        import urllib.error
+        import ui
+
+        srv, tok = ui.create_ui_server(speedtest, "http://127.0.0.1:9/x", "")
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        port = srv.server_address[1]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def _get(host):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/", headers={"Host": host})
+            try:
+                with opener.open(req, timeout=5) as r:
+                    return r.status, r.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                return e.code, ""
+
+        code, body = _get(f"attacker.example:{port}")
+        self.assertEqual(code, 403)
+        self.assertNotIn(tok, body)
+        code, body = _get(f"127.0.0.1:{port}")
+        self.assertEqual(code, 200)
+        self.assertIn(tok, body)
+        self.assertEqual(_get(f"localhost:{port}")[0], 200)

@@ -939,6 +939,8 @@ def create_ui_server(
                         log(f"[{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")
                         break
                     raise
+                for w in st_module.tier_quality_warnings(samples, gen_tokens):
+                    log(f"[{lbl}] ⚠ {w}")
                 results.append({
                     "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
                     "gen_tokens": int(round(statistics.median(s["gen_tokens"] for s in samples))),
@@ -1014,7 +1016,18 @@ def create_ui_server(
             raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
             return json.loads(raw)
 
+        def _host_ok(self) -> bool:
+            """Only serve requests addressed to this loopback server (blocks DNS-rebinding pages)."""
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"):
+                return True
+            self._send_json(403, {"error": "Forbidden host"})
+            return False
+
         def do_GET(self) -> None:
+            if not self._host_ok():
+                return
             path = urllib.parse.urlparse(self.path).path
             if path == "/" or path == "/index.html":
                 self.send_response(200)
@@ -1046,6 +1059,8 @@ def create_ui_server(
                 self._send_json(404, {"error": "Not found"})
 
         def do_POST(self) -> None:
+            if not self._host_ok():
+                return
             if self.headers.get("X-Speedtest-Token") != token:
                 self._send_json(403, {"error": "Invalid session token"})
                 return

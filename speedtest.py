@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.9"
+CLIENT_VERSION = "0.3.10"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -39,6 +39,10 @@ DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
 DEFAULT_CTX_TIERS = [1024, 32768, 65536, 131072, 262144]
 DEFAULT_CTX_STR = "1k,32k,64k,128k,256k"
 CLIENT_ID_RE = re.compile(r"^[0-9a-fA-F-]{16,64}$")
+# 与 itbanana.com 后端 LADDER_MIN_GEN_TOKENS 保持一致：生成 token 数低于此值的成绩不计入天梯
+LADDER_MIN_GEN_TOKENS = 64
+# 记录不接受 ignore_eos 参数的本机服务（首次 400/422 后自动去掉该参数重试，后续请求不再携带）
+_NO_IGNORE_EOS_ENDPOINTS: set = set()
 
 
 def clean_client_id(val: Optional[str]) -> Optional[str]:
@@ -1877,7 +1881,8 @@ def run_single_completion(
     timeout: float = 300.0,
 ) -> Dict[str, Any]:
     url = f"{endpoint.rstrip('/')}/chat/completions"
-    body = {
+    ep_key = endpoint.rstrip("/")
+    body: Dict[str, Any] = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": gen_tokens,
@@ -1885,6 +1890,11 @@ def run_single_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    # 让模型跑满 max_tokens，避免提前结束导致生成数过少（< 64 不计入天梯）。
+    # llama.cpp / vLLM / SGLang 支持该参数；不支持且报 400/422 的服务会自动去掉重试。
+    use_ignore_eos = ep_key not in _NO_IGNORE_EOS_ENDPOINTS
+    if use_ignore_eos:
+        body["ignore_eos"] = True
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream", "User-Agent": USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1894,10 +1904,19 @@ def run_single_completion(
     t_first: Optional[float] = None
     t_end: Optional[float] = None
     chunk_tokens = 0
+    out_chars = 0
     usage: Dict[str, Any] = {}
     timings: Dict[str, Any] = {}
 
-    with _urlopen(req, timeout=timeout) as resp:
+    try:
+        resp_cm = _urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if use_ignore_eos and e.code in (400, 422):
+            _NO_IGNORE_EOS_ENDPOINTS.add(ep_key)
+            return run_single_completion(endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=timeout)
+        raise
+
+    with resp_cm as resp:
         for raw_line in resp:
             line = raw_line.decode("utf-8", errors="ignore").strip()
             if not line or not line.startswith("data:"):
@@ -1925,6 +1944,7 @@ def run_single_completion(
                         t_first = now
                     t_end = now
                     chunk_tokens += 1
+                    out_chars += len(piece)
 
     if t_end is None:
         t_end = time.perf_counter()
@@ -1939,11 +1959,14 @@ def run_single_completion(
         or usage.get("prompt_tokens")
         or max(1, round(len(prompt) / 4))
     )
-    completion_tokens = int(
-        timings.get("predicted_n")
-        or usage.get("completion_tokens")
-        or max(1, chunk_tokens)
-    )
+    server_completion = timings.get("predicted_n") or usage.get("completion_tokens")
+    tokens_estimated = not server_completion
+    if server_completion:
+        completion_tokens = int(server_completion)
+    else:
+        # 服务端未返回 token 数：只按数据包计数会在「一包多 token」（MTP/推测解码/批量推送）时严重低估速度，
+        # 因此同时按输出字符数粗估（英文约 4 字符/token），取两者较大值。
+        completion_tokens = max(1, chunk_tokens, int(round(out_chars / 4.0)))
 
     # SSE decode speed: tokens after the first token divided by decode interval.
     sse_tg_tps = max(0.1, (max(1, completion_tokens - 1)) / decode_s) if completion_tokens > 1 else max(0.1, 1.0 / ttft_s)
@@ -1966,7 +1989,29 @@ def run_single_completion(
         "sse_tg_tps": round(sse_tg_tps, 2),
         "ttft_ms": round(ttft_s * 1000.0, 1),
         "source": source,
+        "tokens_estimated": tokens_estimated and source != "timings",
     }
+
+
+def tier_quality_warnings(samples: List[Dict[str, Any]], gen_tokens_cap: int) -> List[str]:
+    """Human-readable warnings for a finished context tier (shared by CLI and WebUI)."""
+    warns: List[str] = []
+    if not samples:
+        return warns
+    med_gen = int(round(statistics.median(s["gen_tokens"] for s in samples)))
+    if med_gen < LADDER_MIN_GEN_TOKENS:
+        warns.append(
+            f"模型每轮只生成了约 {med_gen} 个 token 就提前结束（天梯要求 ≥{LADDER_MIN_GEN_TOKENS}），"
+            f"本档成绩可以上传但不会计入速度天梯。可换用不会过早停止的模型/对话模板，或确认服务端支持 ignore_eos。"
+        )
+    elif med_gen < min(gen_tokens_cap, 256) * 0.5:
+        warns.append(f"模型每轮只生成了约 {med_gen} 个 token（上限 {gen_tokens_cap}），样本偏短，成绩波动可能较大。")
+    if any(s.get("tokens_estimated") for s in samples):
+        warns.append(
+            "推理服务未返回生成 token 数（usage），已按输出字数估算生成速度，结果可能有偏差；"
+            "建议升级推理服务或使用支持 stream_options.include_usage 的版本。"
+        )
+    return warns
 
 
 def benchmark_context(
@@ -2003,6 +2048,9 @@ def benchmark_context(
             f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）",
             file=sys.stderr,
         )
+
+    for w in tier_quality_warnings(samples, gen_tokens):
+        print(_c(f"   ! {w}", "33"), file=sys.stderr)
 
     res = {
         "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
@@ -2970,5 +3018,48 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+def cli(argv: Optional[List[str]] = None) -> int:
+    """Entry point: run main() and turn unexpected errors into short Chinese hints instead of tracebacks."""
+    debug = os.environ.get("LLM_SPEEDTEST_DEBUG", "").strip() not in ("", "0", "false")
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print(_c("\n已中断测速（Ctrl+C），本次未上传任何数据。", "33"), file=sys.stderr)
+        return 130
+    except urllib.error.HTTPError as e:
+        if debug:
+            raise
+        try:
+            detail = e.read().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            detail = ""
+        detail = re.sub(r"\s+", " ", detail)[:300]
+        print(
+            _c(f"\n✗ 推理服务返回错误 HTTP {e.code}{('：' + detail) if detail else ''}", "1;31")
+            + "\n  请确认模型已正确加载、上下文上限足够，或查看推理服务自身的日志。",
+            file=sys.stderr,
+        )
+        return 1
+    except (urllib.error.URLError, ConnectionError, TimeoutError, socket.timeout) as e:
+        if debug:
+            raise
+        reason = getattr(e, "reason", None) or e
+        print(
+            _c(f"\n✗ 连接推理服务失败或请求超时：{reason}", "1;31")
+            + "\n  请确认推理服务仍在运行；长上下文档位耗时较久，显存/内存不足时服务也可能中途退出。",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as e:
+        if debug:
+            raise
+        print(
+            _c(f"\n✗ 出现意外错误：{type(e).__name__}: {e}", "1;31")
+            + "\n  如需反馈，请设置环境变量 LLM_SPEEDTEST_DEBUG=1 重新运行以获取完整报错信息。",
+            file=sys.stderr,
+        )
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())
