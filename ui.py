@@ -844,7 +844,7 @@ def create_ui_server(
                     for i in range(tier_runs):
                         nonce = f"{target}-{i}-{int(time.time() * 1000) % 100000}"
                         prompt = st_module.build_prompt(target, nonce, chars_per_token=cpt)
-                        log(f"[{lbl}] 正在跑第 {i + 1}/{tier_runs} 轮（目标 ≈{target}）...")
+                        log(f"[{lbl} 上下文] 正在跑第 {i + 1}/{tier_runs} 轮（输入 ≈{target} tok，生成上限 {gen_tokens} tok）...")
                         r = st_module.run_single_completion(
                             endpoint, model, prompt, gen_tokens, api_key=api_key, timeout=req_timeout
                         )
@@ -854,7 +854,7 @@ def create_ui_server(
                             if 3.0 <= measured_cpt <= 8.0:
                                 cpt = measured_cpt
                         src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
-                        log(f"[{lbl}] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（实际 {r['prompt_tokens']} tok，{src_lbl}）")
+                        log(f"[{lbl} 上下文] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）")
                 except Exception as e:
                     if results:
                         log(f"[{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")

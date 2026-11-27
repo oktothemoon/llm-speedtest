@@ -21,12 +21,12 @@
 
 **macOS / Linux：**
 ```bash
-if [ -d llm-speedtest ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
+cd ~ && if [ -d llm-speedtest/.git ]; then git -C llm-speedtest pull --ff-only || true; else git clone https://github.com/oktothemoon/llm-speedtest.git; fi && cd llm-speedtest && python3 speedtest.py
 ```
 
 **Windows（PowerShell）：**
 ```powershell
-if (Test-Path llm-speedtest) { git -C llm-speedtest pull --ff-only } else { git clone https://github.com/oktothemoon/llm-speedtest.git }; cd llm-speedtest; python speedtest.py
+cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-only } else { git clone https://github.com/oktothemoon/llm-speedtest.git }; if (Test-Path llm-speedtest\speedtest.py) { cd llm-speedtest; python speedtest.py }
 ```
 
 运行后会出现中文引导菜单，你可以自由选择：
@@ -53,7 +53,7 @@ if (Test-Path llm-speedtest) { git -C llm-speedtest pull --ff-only } else { git 
 | `--endpoint URL` | 本机 OpenAI 兼容地址或端口号（如 `8080` 或 `http://127.0.0.1:8080/v1`，不填则自动扫描） |
 | `--api-key KEY` | 本机推理服务 API Key（选填，绝不上传；交互模式下遇到 401 也会自动提示输入） |
 | `--ctx 1k,32k,64k,128k,256k` | 要测试的输入上下文档位，逗号分隔、支持 `k` 缩写（默认全测，超限档位自动跳过） |
-| `--gen-tokens 256` | 每轮生成 token 数（默认 `256`） |
+| `--gen-tokens 256` | 每轮生成 token 上限（默认 `256`，各上下文档位统一） |
 | `--runs 3` | 短上下文每档测速轮数，取中位数（默认 `3`；≥64k 自动 1 轮） |
 | `--engine` / `--quant` / `--kv-cache` / `--mtp` | 推理引擎、量化版本、KV Cache 精度（`f16`/`bf16`/`fp8`/`int8`/`q8_0`/`q4_0`）、是否开启 MTP |
 | `--name` / `--note` | 选填：天梯图公开署名（≤20 字）与一句话调优备注（≤120 字），不填默认匿名 |

@@ -534,5 +534,54 @@ class EndToEndMockTests(unittest.TestCase):
             ui_srv.server_close()
 
 
+class TestLocalListeningDiscovery(unittest.TestCase):
+    def test_parse_windows_listening(self):
+        ps_out = "\n".join([
+            "127.0.0.1|17880|strata-server",
+            "::1|41234|Strata",
+            "0.0.0.0|135|svchost",
+            "127.0.0.1|54321|python",
+            "0.0.0.0|80|System",
+        ])
+        entries = speedtest._parse_windows_listening(ps_out)
+        self.assertIn((1, "127.0.0.1", 17880), entries)
+        self.assertIn((1, "[::1]", 41234), entries)
+        self.assertIn((2, "127.0.0.1", 54321), entries)
+        # svchost and port 80 must be filtered out
+        self.assertFalse(any(p == 135 or p == 80 for _, _, p in entries))
+
+    def test_parse_macos_and_linux_listening(self):
+        lsof_out = "\n".join([
+            "COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME",
+            "strata  12345 user   10u  IPv4 0x1234      0t0  TCP 127.0.0.1:17881 (LISTEN)",
+            "Chrome  12346 user   11u  IPv4 0x1235      0t0  TCP 127.0.0.1:9222 (LISTEN)",
+        ])
+        mac_entries = speedtest._parse_macos_listening(lsof_out)
+        self.assertEqual(mac_entries, [(1, "127.0.0.1", 17881)])
+
+        ss_out = "\n".join([
+            "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process",
+            'LISTEN 0 128 127.0.0.1:19999 0.0.0.0:* users:(("llama-server",pid=999,fd=5))',
+            'LISTEN 0 128 127.0.0.1:22 0.0.0.0:* users:(("sshd",pid=100,fd=3))',
+        ])
+        lin_entries = speedtest._parse_linux_listening(ss_out)
+        self.assertEqual(lin_entries, [(1, "127.0.0.1", 19999)])
+
+    def test_discover_endpoint_dynamic_fallback_and_empty_models(self):
+        with mock.patch.object(speedtest, "COMMON_ENDPOINTS", []), \
+             mock.patch.object(speedtest, "_discover_listening_endpoints", return_value=["http://127.0.0.1:41234/v1"]), \
+             mock.patch.object(speedtest, "http_json", return_value={"data": [{"id": "Qwen3.5-27B"}]}):
+            ep, models = speedtest.discover_endpoint()
+            self.assertEqual(ep, "http://127.0.0.1:41234/v1")
+            self.assertEqual(models, ["Qwen3.5-27B"])
+
+        with mock.patch.object(speedtest, "COMMON_ENDPOINTS", []), \
+             mock.patch.object(speedtest, "_discover_listening_endpoints", return_value=["http://127.0.0.1:17880/v1"]), \
+             mock.patch.object(speedtest, "http_json", return_value={"data": []}):
+            with self.assertRaises(RuntimeError) as ctx:
+                speedtest.discover_endpoint()
+            self.assertIn("未加载任何模型", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

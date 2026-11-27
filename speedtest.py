@@ -590,12 +590,15 @@ def is_local_endpoint(endpoint: str) -> bool:
 
 COMMON_ENDPOINTS = [
     "http://127.0.0.1:8080/v1",   # llama-server / Strata / mlx-serve
+    "http://127.0.0.1:17880/v1",  # Strata desktop / launcher alternate port
+    "http://127.0.0.1:9931/v1",   # llama-server newer default
     "http://127.0.0.1:11434/v1",  # Ollama
     "http://127.0.0.1:1234/v1",   # LM Studio
     "http://127.0.0.1:8000/v1",   # vLLM / SGLang
     "http://127.0.0.1:30000/v1",  # SGLang default
     "http://127.0.0.1:8081/v1",   # alternate local port
     "http://127.0.0.1:8082/v1",   # alternate local port
+    "http://127.0.0.1:18080/v1",  # alternate Strata / llama-server port
     "http://127.0.0.1:8001/v1",   # alternate vLLM / OpenAI port
     "http://127.0.0.1:9000/v1",   # custom local port
     "http://127.0.0.1:5000/v1",   # alternate local port
@@ -1061,7 +1064,7 @@ def http_json(url: str, payload: Optional[Dict[str, Any]] = None, headers: Optio
         return json.loads(resp.read().decode("utf-8"))
 
 
-COMMON_PORTS = [8080, 11434, 1234, 8000, 30000, 8081, 8082, 8001, 9000, 5000]
+COMMON_PORTS = [8080, 17880, 9931, 11434, 1234, 8000, 30000, 8081, 8082, 18080, 8001, 9000, 5000]
 
 
 def endpoint_candidates(raw: str) -> List[str]:
@@ -1179,26 +1182,202 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
     )
 
 
+_LLM_PROC_TIER1 = (
+    "strata", "llama", "ollama", "lmstudio", "lm-studio", "lms",
+    "vllm", "sglang", "mlx", "maya", "kobold", "tabby", "jan",
+    "gpt4all", "localai", "exllama", "ik_llama", "llamafile",
+)
+_LLM_PROC_TIER2 = (
+    "python", "python3", "pythonw", "uvicorn", "gunicorn",
+    "node", "bun", "deno", "electron",
+)
+
+
+def _rank_listening_process(proc_name: str) -> int:
+    """Return 1 for known LLM server/client process names, 2 for generic runtimes, 0 to skip."""
+    low = (proc_name or "").strip().lower()
+    if not low:
+        return 0
+    if any(k in low for k in _LLM_PROC_TIER1):
+        return 1
+    if any(low == k or low.startswith(k) for k in _LLM_PROC_TIER2):
+        return 2
+    return 0
+
+
+def _normalize_listen_hosts(addr: str) -> List[str]:
+    """Map a listening bind address to loopback probe host(s)."""
+    a = (addr or "").strip().strip("[]").split("%")[0].lower()
+    if a in ("", "0.0.0.0", "*"):
+        return ["127.0.0.1"]
+    if a.startswith("127."):
+        return [a]
+    if a == "::":
+        return ["127.0.0.1", "[::1]"]
+    if a == "::1":
+        return ["[::1]", "127.0.0.1"]
+    if _is_own_interface_ip(a):
+        return [f"[{a}]" if ":" in a else a]
+    return []
+
+
+def _parse_windows_listening(ps_output: str) -> List[Tuple[int, str, int]]:
+    """Parse 'LocalAddress|LocalPort|ProcessName' lines from PowerShell."""
+    found: List[Tuple[int, str, int]] = []
+    for line in (ps_output or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 3:
+            continue
+        addr, port_s, proc = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        rank = _rank_listening_process(proc)
+        if not rank or not port_s.isdigit():
+            continue
+        port = int(port_s)
+        if port < 1024 or port > 65535:
+            continue
+        for h in _normalize_listen_hosts(addr):
+            found.append((rank, h, port))
+    return found
+
+
+def _parse_macos_listening(lsof_output: str) -> List[Tuple[int, str, int]]:
+    """Parse 'lsof -nP -iTCP -sTCP:LISTEN' output."""
+    found: List[Tuple[int, str, int]] = []
+    for line in (lsof_output or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        proc = parts[0]
+        rank = _rank_listening_process(proc)
+        if not rank:
+            continue
+        addr_port = parts[-2] if parts[-1] == "(LISTEN)" else parts[-1]
+        m = re.match(r"^(.+):(\d+)$", addr_port)
+        if not m:
+            continue
+        addr, port = m.group(1), int(m.group(2))
+        if port < 1024 or port > 65535:
+            continue
+        for h in _normalize_listen_hosts(addr):
+            found.append((rank, h, port))
+    return found
+
+
+def _parse_linux_listening(ss_output: str) -> List[Tuple[int, str, int]]:
+    """Parse 'ss -tlnp' output."""
+    found: List[Tuple[int, str, int]] = []
+    for line in (ss_output or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        names = re.findall(r'\(\("([^"]+)"', line)
+        best_rank = 0
+        for nm in names:
+            r = _rank_listening_process(nm)
+            if r and (best_rank == 0 or r < best_rank):
+                best_rank = r
+        if not best_rank:
+            continue
+        m = re.match(r"^(.+):(\d+)$", parts[3])
+        if not m:
+            continue
+        addr, port = m.group(1), int(m.group(2))
+        if port < 1024 or port > 65535:
+            continue
+        for h in _normalize_listen_hosts(addr):
+            found.append((best_rank, h, port))
+    return found
+
+
+def _discover_listening_endpoints(exclude_urls: Optional[set] = None, max_endpoints: int = 20) -> List[str]:
+    """Best-effort discovery of local listening ports owned by LLM servers/clients (process name only)."""
+    os_name = normalize_os()
+    entries: List[Tuple[int, str, int]] = []
+    if os_name == "windows":
+        ps = run_cmd([
+            "powershell", "-NoProfile", "-Command",
+            "$pm=@{}; Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $pm[$_.Id]=$_.ProcessName }; "
+            "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | "
+            "ForEach-Object { \"$($_.LocalAddress)|$($_.LocalPort)|$($pm[$_.OwningProcess])\" }",
+        ], timeout=4.0)
+        entries = _parse_windows_listening(ps)
+    elif os_name == "macos":
+        lsof_out = run_cmd(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"], timeout=2.5)
+        entries = _parse_macos_listening(lsof_out)
+    elif os_name == "linux":
+        ss_out = run_cmd(["ss", "-tlnp"], timeout=2.5)
+        entries = _parse_linux_listening(ss_out)
+
+    entries.sort(key=lambda x: (x[0], x[2]))
+    seen = set(exclude_urls or ())
+    out: List[str] = []
+    for _rank, host, port in entries:
+        url = f"http://{host}:{port}/v1"
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+        if len(out) >= max_endpoints:
+            break
+    return out
+
+
+def _is_empty_models_payload(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get("data"), list) and len(data["data"]) == 0:
+        return True
+    if isinstance(data.get("models"), list) and len(data["models"]) == 0:
+        return True
+    return False
+
+
 def discover_endpoint(api_key: Optional[str] = None) -> Tuple[str, List[str]]:
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     auth_cand: Optional[Tuple[str, int]] = None
-    for ep in COMMON_ENDPOINTS:
-        for cand in (ep.rstrip("/"), ep.rstrip("/").removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep.rstrip("/"))):
-            try:
-                data = http_json(f"{cand}/models", headers=headers, timeout=2.0)
-                models = _extract_model_ids(data)
-                if models:
-                    return cand, models
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403) and auth_cand is None:
-                    auth_cand = (cand, e.code)
-                continue
-            except Exception:
-                continue
+    empty_cand: Optional[str] = None
+
+    def _probe_list(endpoints: List[str], timeout: float) -> Optional[Tuple[str, List[str]]]:
+        nonlocal auth_cand, empty_cand
+        for ep in endpoints:
+            ep_clean = ep.rstrip("/")
+            root_clean = ep_clean.removesuffix("/v1") if hasattr(str, "removesuffix") else re.sub(r"/v1$", "", ep_clean)
+            for cand in (ep_clean, root_clean):
+                try:
+                    data = http_json(f"{cand}/models", headers=headers, timeout=timeout)
+                    models = _extract_model_ids(data)
+                    if models:
+                        return cand, models
+                    if empty_cand is None and _is_empty_models_payload(data):
+                        empty_cand = cand
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403) and auth_cand is None:
+                        auth_cand = (cand, e.code)
+                    continue
+                except Exception:
+                    continue
+        return None
+
+    hit = _probe_list(COMMON_ENDPOINTS, timeout=1.5)
+    if hit:
+        return hit
+
+    dynamic_eps = _discover_listening_endpoints(exclude_urls={e.rstrip("/") for e in COMMON_ENDPOINTS})
+    if dynamic_eps:
+        hit = _probe_list(dynamic_eps, timeout=1.2)
+        if hit:
+            return hit
+
     if auth_cand:
         raise AuthRequiredError(auth_cand[0], auth_cand[1])
+    if empty_cand:
+        raise RuntimeError(
+            f"已发现本机服务 {empty_cand}，但当前未加载任何模型（/models 返回空列表），请先在客户端中加载并启动模型。"
+        )
     raise RuntimeError(
-        "未在本机常见端口发现运行中的推理服务，请确认服务已启动，或在下方直接输入端口号（如 8080）。"
+        "未在本机常见端口及本地推理进程中发现已启动的 OpenAI 兼容服务。\n"
+        "  · 如果你使用的是 Strata / LM Studio 等桌面客户端，请确认已加载模型并开启本地 API 服务；\n"
+        "  · 如果使用了自定义端口，可在下方直接输入端口号（如 8080 或 17880）。"
     )
 
 
@@ -1418,7 +1597,7 @@ def benchmark_context(
     ctx_lbl = tier_label or format_ctx_label(ctx_prompt)
     cpt = chars_per_token
     print(
-        _c(f"\n>> 开始测速 [{ctx_lbl}]（目标 ≈{ctx_prompt} tokens，共 {tier_runs} 轮，每轮生成 {gen_tokens} tokens）：", "1;36"),
+        _c(f"\n>> 开始测速 [{ctx_lbl} 上下文]（输入 ≈{ctx_prompt} tok，每轮生成上限 {gen_tokens} tok，共 {tier_runs} 轮）：", "1;36"),
         file=sys.stderr,
     )
     for i in range(tier_runs):
@@ -1433,7 +1612,7 @@ def benchmark_context(
         src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
         print(
             f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33')} tok/s | "
-            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（实际 {r['prompt_tokens']} tok，{src_lbl}）",
+            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）",
             file=sys.stderr,
         )
 
@@ -1480,7 +1659,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     # Benchmark parameters
     p.add_argument("--ctx", default=None, help=f"测试上下文档位，逗号分隔，支持 k 缩写（默认 {DEFAULT_CTX_STR}）")
-    p.add_argument("--gen-tokens", type=int, default=256, help="每轮生成 token 数（默认 256）")
+    p.add_argument("--gen-tokens", type=int, default=256, help="每轮生成 token 上限（默认 256，各上下文档位统一）")
     p.add_argument("--runs", type=int, default=3, help="短上下文每档测速轮数，取中位数（默认 3；≥64k 自动 1 轮）")
     p.add_argument("--no-warmup", action="store_true", help="跳过预热请求")
 
