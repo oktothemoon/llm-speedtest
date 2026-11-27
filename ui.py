@@ -941,7 +941,7 @@ def create_ui_server(
                     "local_endpoint": ep,
                     "local_models": models,
                     "guessed_engine": st_module.infer_engine_auto(ep or "", first_m) if ep else None,
-                    "guessed_quant": st_module.infer_quant(first_m) if first_m else None,
+                    "guessed_quant": st_module.detect_server_quant(ep or "", first_m) if (ep and first_m) else (st_module.infer_quant(first_m) if first_m else None),
                 })
             elif path == "/api/status":
                 with lock:
@@ -968,8 +968,8 @@ def create_ui_server(
                     self._send_json(200, {
                         "endpoint": ep,
                         "models": models,
-                        "guessed_engine": st_module.infer_engine_auto(ep, first_m),
-                        "guessed_quant": st_module.infer_quant(first_m),
+                        "guessed_engine": st_module.infer_engine_auto(ep, first_m, api_key=body.get("api_key")),
+                        "guessed_quant": st_module.detect_server_quant(ep, first_m, api_key=body.get("api_key")),
                     })
                 except Exception as e:
                     self._send_json(400, {"error": str(e)})

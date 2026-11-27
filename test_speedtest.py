@@ -38,6 +38,8 @@ class MappingTests(unittest.TestCase):
     def test_model_and_quant_inference(self):
         self.assertEqual(speedtest.map_model_id("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"), "qwen38-flash-next")
         self.assertEqual(speedtest.infer_quant("Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"), "GSQ-RCO IQ3_S")
+        self.assertEqual(speedtest.infer_quant("ISTA-DASLab-Qwen3.8-Flash-Next-IQ3_XXS.gguf"), "GSQ-RCO IQ3_XXS")
+        self.assertEqual(speedtest.infer_quant("Qwen3.8-Flash-Next-UD-IQ3_XXS.gguf"), "UD-IQ3_XXS")
         self.assertEqual(speedtest.map_model_id("Qwen3.8-27B-Q4_K_M.gguf"), "qwen38-27b")
         self.assertEqual(speedtest.infer_quant("Qwen3.8-27B-Q4_K_M.gguf"), "Q4_K_M")
         self.assertEqual(speedtest.map_model_id("DeepSeek-V4.1-Flash-UD-IQ4_XS"), "ds-v41-flash")

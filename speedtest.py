@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.5"
+CLIENT_VERSION = "0.3.6"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -352,6 +352,10 @@ def parse_human_note(text: str) -> Dict[str, Any]:
     q = infer_quant(raw)
     if q:
         out["quant"] = q
+    elif re.search(r"\b(?:gsq[\s_-]*rco|gsq|ista[\s_-]*daslab)\b", low):
+        out["quant_prefix"] = "GSQ-RCO"
+    elif re.search(r"\b(?:unsloth|ud)\b", low):
+        out["quant_prefix"] = "UD"
 
     if re.search(r"(?:不开|关闭|关|no\s*|without\s*)mtp|mtp\s*=\s*(?:false|0|off)", low):
         out["mtp"] = "false"
@@ -726,9 +730,7 @@ def map_model_id(raw: str) -> Optional[str]:
 
 def infer_quant(raw: str) -> Optional[str]:
     s = raw or ""
-    gsq = re.search(r"GSQ-RCO[\s_-]+(IQ[1-4]_[A-Z]+|Q[2-8]_[01K][A-Z_]*)", s, re.IGNORECASE)
-    if gsq:
-        return f"GSQ-RCO {gsq.group(1).upper()}"
+    has_gsq = bool(re.search(r"gsq[\s_-]*rco|ista[\s_-]*daslab", s, re.IGNORECASE))
     m = re.search(
         r"(UD-(?:IQ[1-4]_[A-Z]+|Q[2-8]_K_[A-Z]+)"
         r"|IQ[1-4]_(?:XXS|XS|S|M|NL|KS|K)"
@@ -742,7 +744,11 @@ def infer_quant(raw: str) -> Optional[str]:
     if not m:
         return None
     val = m.group(1).strip()
-    return val.lower() if val.lower().endswith("bit") else val.upper()
+    norm = val.lower() if val.lower().endswith("bit") else val.upper()
+    if has_gsq and not norm.startswith("GSQ-RCO"):
+        base = norm[3:] if norm.startswith("UD-") else norm
+        return f"GSQ-RCO {base}"
+    return norm
 
 
 STANDARD_RAM_GB = (4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048)
@@ -1153,6 +1159,31 @@ def fetch_models(endpoint: str, api_key: Optional[str] = None) -> List[str]:
     return [m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
 
 
+def detect_server_quant(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Best-effort quant detection: checks model_name first, then enriches from local /props filename in memory ONLY (path is never stored or uploaded)."""
+    q_from_name = infer_quant(model_name)
+    if q_from_name and (q_from_name.startswith("GSQ-RCO") or q_from_name.startswith("UD-")):
+        return q_from_name
+    if endpoint and is_local_endpoint(endpoint):
+        ep = endpoint.rstrip("/")
+        root = re.sub(r"/v1$", "", ep, flags=re.IGNORECASE)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            props = http_json(f"{root}/props", headers=headers, timeout=1.5)
+            if isinstance(props, dict):
+                # Inspect basename only in memory to detect GSQ-RCO / ISTA-DASLab / UD- prefix; never persist path
+                for key in ("model_path", "model_alias"):
+                    v = props.get(key)
+                    if isinstance(v, str) and v:
+                        base = os.path.basename(v.replace("\\", "/"))
+                        q_prop = infer_quant(base)
+                        if q_prop and (not q_from_name or len(q_prop) > len(q_from_name)):
+                            return q_prop
+        except Exception:
+            pass
+    return q_from_name
+
+
 def detect_server_ctx_limit(endpoint: str, api_key: Optional[str] = None) -> Optional[int]:
     """Best-effort detection of the running server's configured context limit (n_ctx / max_model_len)."""
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -1504,8 +1535,14 @@ def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed
             hw["os"] = parsed["os"]
     if parsed.get("engine") and not args.engine:
         args.engine = parsed["engine"]
-    if parsed.get("quant") and not args.quant:
+    if parsed.get("quant"):
         args.quant = parsed["quant"]
+    elif parsed.get("quant_prefix") and args.quant:
+        base_q = re.sub(r"^(?:GSQ-RCO\s+|UD-)", "", args.quant, flags=re.IGNORECASE)
+        if parsed["quant_prefix"] == "GSQ-RCO":
+            args.quant = f"GSQ-RCO {base_q}"
+        elif parsed["quant_prefix"] == "UD":
+            args.quant = f"UD-{base_q}"
     if parsed.get("kv_cache") and not args.kv_cache:
         args.kv_cache = parsed["kv_cache"]
     if parsed.get("mtp") is not None and args.mtp is None:
@@ -1577,7 +1614,9 @@ def run_interactive_wizard(
 
     if not args.engine:
         args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
-    guessed_q = args.quant or infer_quant(model_name)
+    if not args.quant:
+        args.quant = detect_server_quant(endpoint, model_name, api_key=args.api_key)
+    guessed_q = args.quant
     ctx_str = args.ctx or DEFAULT_CTX_STR
 
     vram_part = f" {hw['vram_gb']}GB" if hw.get("vram_gb") and str(hw["vram_gb"]) not in str(hw.get("hw_raw", "")) else ""
@@ -1857,6 +1896,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ctx_str = args.ctx or DEFAULT_CTX_STR
         if not args.engine:
             args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
+        if not args.quant:
+            args.quant = detect_server_quant(endpoint, model_name, api_key=args.api_key)
 
     if not args.no_warmup:
         print("\n▸ 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
