@@ -1930,7 +1930,7 @@ def _apply_parsed(args: argparse.Namespace, hw: Optional[Dict[str, Any]], parsed
 
 
 def print_welcome_banner() -> None:
-    # Option D: crisp pixel-block LLM-SPEED logo + ITBANANA.COM brand tag
+    # Crisp pixel-block LLM-SPEEDTEST logo + ITBANANA.COM brand subtitle (fits <= 80 cols)
     logo_llm = [
         "█     █     █▄ ▄█ ",
         "█     █     █ █ █ ",
@@ -1938,36 +1938,35 @@ def print_welcome_banner() -> None:
         "▀▀▀▀▀ ▀▀▀▀▀ ▀   ▀ ",
     ]
     logo_dash = [
-        "      ",
-        "▄▄▄▄▄ ",
-        "      ",
-        "      ",
+        "    ",
+        "▄▄▄ ",
+        "    ",
+        "    ",
     ]
-    logo_speed = [
-        "▄▀▀▀▀ █▀▀▀▄ █▀▀▀▀ █▀▀▀▀ █▀▀▀▄",
-        "▀▄▄▄  █▄▄▄▀ █▄▄▄  █▄▄▄  █   █",
-        "    █ █     █     █     █   █",
-        "▀▀▀▀  ▀     ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀ ",
+    logo_speedtest = [
+        "▄▀▀▀▀ █▀▀▀▄ █▀▀▀▀ █▀▀▀▀ █▀▀▀▄ ▀▀█▀▀ █▀▀▀▀ ▄▀▀▀▀ ▀▀█▀▀",
+        "▀▄▄▄  █▄▄▄▀ █▄▄▄  █▄▄▄  █   █   █   █▄▄▄  ▀▄▄▄    █  ",
+        "    █ █     █     █     █   █   █   █         █   █  ",
+        "▀▀▀▀  ▀     ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀    ▀   ▀▀▀▀▀ ▀▀▀▀    ▀  ",
     ]
-    meta_col = [
-        _c(f"v{CLIENT_VERSION}", "1;36"),
-        f"{_c('by', '90')} {_c('ITBANANA.COM', '1;33')}",
-        "",
-        _c("本地大模型测速", "1"),
+    logo_rows = [
+        f" {_c(l, '1;36')}{_c(d, '90')}{_c(s, '1;33')}"
+        for l, d, s in zip(logo_llm, logo_dash, logo_speedtest)
     ]
-    header_rows = [
-        f"  {_c(l, '1;36')}{_c(d, '90')}{_c(s, '1;33')}    {m}" if m else f"  {_c(l, '1;36')}{_c(d, '90')}{_c(s, '1;33')}"
-        for l, d, s, m in zip(logo_llm, logo_dash, logo_speed, meta_col)
-    ]
+    meta_row = (
+        f" {_c('v' + CLIENT_VERSION, '1;36')}  {_c('·', '90')}  "
+        f"{_c('by', '90')} {_c('ITBANANA.COM', '1;33')}  {_c('·', '90')}  "
+        f"{_c('本地大模型速度天梯图官方实测工具', '1')}"
+    )
     footer_rows = [
-        f"  {_c('●', '32')} 100% 开源 · 零依赖 · 仅采硬件、速度与随机匿名 client_id（--anonymous）",
-        f"  {_c('●', '32')} 绝不收集用户名/主机名/路径/原始 IP/API Key，上传前明文可见",
-        f"  {_c('▸', '36')} 速度天梯图：{_c('https://itbanana.com/llm-speed', '4;36')}",
+        f" {_c('●', '32')} 100% 开源 · 零依赖 · 仅采硬件、速度与随机匿名 client_id（--anonymous）",
+        f" {_c('●', '32')} 绝不收集用户名/主机名/路径/原始 IP/API Key，上传前明文可见",
+        f" {_c('▸', '36')} 速度天梯图：{_c('https://itbanana.com/llm-speed', '4;36')}",
     ]
 
-    inner_width = max(76, max(_display_width(r) for r in header_rows + footer_rows) + 2)
-    divider = "  " + _c("─" * (inner_width - 4), "90")
-    rows = header_rows + [divider] + footer_rows
+    inner_width = max(77, max(_display_width(r) for r in logo_rows + [meta_row] + footer_rows) + 1)
+    divider = " " + _c("─" * (inner_width - 2), "90")
+    rows = logo_rows + ["", meta_row, divider] + footer_rows
 
     print("", file=sys.stderr)
     print(_c(f"╭{'─' * inner_width}╮", "36"), file=sys.stderr)

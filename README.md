@@ -3,7 +3,7 @@
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.svg">
       <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.svg">
-      <img alt="LLM-SPEED by ITBANANA.COM" src="./assets/banner-dark.svg" width="820">
+      <img alt="LLM-SPEEDTEST by ITBANANA.COM" src="./assets/banner-dark.svg" width="820">
     </picture>
   </a>
 
