@@ -221,9 +221,7 @@
 
   <!-- Subtitle & brand row -->
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace">
-    <rect x="48" y="118" width="66" height="24" rx="12" fill="#e0f2fe" stroke="#7dd3fc" stroke-width="1"/>
-    <text x="81" y="134" text-anchor="middle" font-size="12" font-weight="700" fill="#0369a1">v0.3.7</text>
-    <text x="126" y="135" font-size="13" font-weight="600" fill="#64748b">by <tspan fill="#d97706" font-weight="700">ITBANANA.COM</tspan></text>
+    <text x="48" y="135" font-size="13" font-weight="600" fill="#64748b">by <tspan fill="#d97706" font-weight="700">ITBANANA.COM</tspan></text>
     <text x="772" y="135" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, sans-serif" font-size="13.5" font-weight="600" fill="#0f172a">本地大模型速度天梯图 · 官方实测工具</text>
   </g>
 
