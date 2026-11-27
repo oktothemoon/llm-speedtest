@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="168" height="20" role="img" aria-label="速度天梯图: itbanana.com">
+  <title>速度天梯图: itbanana.com</title>
+  <g shape-rendering="crispEdges">
+    <rect width="74" height="20" fill="#555"/>
+    <rect x="74" width="94" height="20" fill="#f59e0b"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, PingFang SC, Microsoft YaHei, Verdana, Geneva, DejaVu Sans, sans-serif" font-size="11">
+    <text x="37" y="14">速度天梯图</text>
+    <text x="121" y="14" font-family="Verdana, Geneva, DejaVu Sans, sans-serif">itbanana.com</text>
+  </g>
+</svg>

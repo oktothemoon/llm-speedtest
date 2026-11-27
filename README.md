@@ -8,7 +8,7 @@
   </a>
 
   <p>
-    <a href="https://itbanana.com/llm-speed"><img src="https://img.shields.io/badge/Leaderboard-itbanana.com-f59e0b?style=flat-square" alt="速度天梯图"></a>
+    <a href="https://itbanana.com/llm-speed"><img src="./assets/badge-leaderboard.svg" alt="速度天梯图 itbanana.com"></a>
     <img src="https://img.shields.io/badge/Python-3.9%2B-38bdf8?style=flat-square&logo=python&logoColor=white" alt="Python 3.9+">
     <img src="https://img.shields.io/badge/Dependencies-Zero-22c55e?style=flat-square" alt="Zero Dependencies">
     <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-64748b?style=flat-square" alt="Cross Platform">
