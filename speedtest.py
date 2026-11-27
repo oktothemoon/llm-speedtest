@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.16"
+CLIENT_VERSION = "0.3.17"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2286,6 +2286,7 @@ def run_benchmark_tiers(
             )
 
     results: List[Dict[str, Any]] = []
+    done: List[Tuple[str, int, float]] = []  # (档位标签, 实际输入目标, 超时)，与 results 一一对应，供异常重测使用
     cpt = 5.6
     for c in ctx_list:
         lbl = format_ctx_label(c)
@@ -2295,7 +2296,7 @@ def run_benchmark_tiers(
             continue
         req_timeout, est = estimate_tier_timeout(target, results[-1] if results else None)
         if est is not None and est >= 120:
-            emit(f"▸ [{lbl}] 按上一档读题速度估算，每轮约需 {est / 60:.0f} 分钟（单轮最长等待 {req_timeout / 60:.0f} 分钟）")
+            emit(f"▸ [{lbl}] 预计每轮约 {est / 60:.0f} 分钟")
         try:
             res, cpt = benchmark_context(
                 endpoint,
@@ -2311,6 +2312,7 @@ def run_benchmark_tiers(
                 ttft_overhead_s=overhead,
             )
             results.append(res)
+            done.append((lbl, target, req_timeout))
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -2318,7 +2320,47 @@ def run_benchmark_tiers(
                 emit(f"! [{lbl}] 测速失败（可能超出当前上下文上限、显存不足或等待超时：{e}），已保留已完成档位成绩并停止更高档位。", "33")
                 break
             raise
+
+    # 异常重测：上下文越长生成越慢是常态；若某档比任何一个更长的档位还慢 3% 以上，多半是那一轮碰上了偶发波动
+    # （后台任务、降频等）。全部测完后只重测这一档一次，取较好的一次。256k 等最长档只作参照、不重测。
+    for i in range(len(results) - 1):
+        cur = results[i]
+        lbl, target, req_timeout = done[i]
+        if target >= REMEASURE_MAX_CTX or not cur.get("tg_tps"):
+            continue
+        longer = [(done[j][0], results[j]["tg_tps"]) for j in range(i + 1, len(results)) if results[j].get("tg_tps")]
+        if not longer:
+            continue
+        ref_lbl, ref_tg = max(longer, key=lambda x: x[1])
+        if cur["tg_tps"] >= ref_tg * (1 - REMEASURE_TOLERANCE):
+            continue
+        emit(
+            f"\n▸ [{lbl}] 生成速度（{cur['tg_tps']} tok/s）低于更长的 [{ref_lbl}]（{ref_tg} tok/s），"
+            f"可能受偶发波动影响，正在重测该档一次..."
+        )
+        try:
+            again, _ = benchmark_context(
+                endpoint, model_name, target, gen_tokens, 1,
+                api_key=api_key, chars_per_token=cpt, tier_label=lbl, log=log,
+                timeout=req_timeout, ttft_overhead_s=overhead,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            emit(f"! [{lbl}] 重测未完成（{e}），保留原成绩。", "33")
+            continue
+        if again["tg_tps"] > cur["tg_tps"]:
+            again["runs"] = int(cur.get("runs") or 1) + 1
+            results[i] = again
+            emit(f"   [{lbl}] 采用重测成绩 {again['tg_tps']} tok/s（原 {cur['tg_tps']} tok/s）")
+        else:
+            emit(f"   [{lbl}] 重测结果 {again['tg_tps']} tok/s，保留原成绩 {cur['tg_tps']} tok/s")
     return results
+
+
+# 异常重测参数：比任一更长档位慢超过该比例才重测；输入 ≥192k（即 256k 档）不重测，避免多等一两分钟以上
+REMEASURE_TOLERANCE = 0.03
+REMEASURE_MAX_CTX = 196608
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

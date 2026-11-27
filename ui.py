@@ -561,7 +561,7 @@ $('btn-run').onclick = async () => {{
   $('btn-run').textContent = '测速中...';
   $('result-box').classList.add('hidden');
   $('upload-msg').classList.add('hidden');
-  $('run-log').textContent = '正在预热并执行测速，请稍候（约 15–40 秒）...';
+  $('run-log').textContent = '正在预热并执行测速，请稍候，进度会实时显示在这里...';
   $('run-log').classList.remove('hidden');
 
   try {{

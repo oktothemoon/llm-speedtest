@@ -1572,3 +1572,63 @@ class TitleSemanticsTests(unittest.TestCase):
         self.assertNotIn("感谢第 2 位贡献者", out)
         old = self._out({"same_hw_rank": 1, "same_hw_total": 1})
         self.assertIn("条测速记录，来自 2 位贡献者", old)
+
+
+class RemeasureTests(unittest.TestCase):
+    """A tier slower than a longer-context tier is re-measured once (256k never), best result kept."""
+
+    def _run(self, tg_by_ctx, rerun_tg):
+        calls: List[int] = []
+        lines: List[str] = []
+
+        def fake_bc(endpoint, model, target, gen, runs, **kw):
+            calls.append(target)
+            first = calls.count(target) == 1
+            tg = tg_by_ctx[target] if first else rerun_tg.get(target, tg_by_ctx[target])
+            return {"ctx_prompt": target, "tg_tps": tg, "pp_tps": 3000.0, "gen_tokens": 256, "runs": 1 if target >= 65536 else 3}, 5.6
+
+        ctxs = list(tg_by_ctx)
+        with mock.patch.object(speedtest, "benchmark_context", side_effect=fake_bc), \
+                mock.patch.object(speedtest, "server_busy", return_value=False), \
+                mock.patch.object(speedtest, "measure_ttft_overhead", return_value=None):
+            res = speedtest.run_benchmark_tiers("http://127.0.0.1:1/v1", "m", ctxs, 256, 3, ctx_limit=300000,
+                                                warmup=False, log=lambda m, c=None: lines.append(m))
+        return res, calls, lines
+
+    def test_r9700_case_64k_dip_is_remeasured_and_better_result_kept(self):
+        # #70 的真实数据：64k 87.5 比 256k 91.3 低 4.2%
+        tg = {1024: 123.6, 32768: 107.05, 65536: 87.5, 131072: 89.3, 262144: 91.3}
+        res, calls, lines = self._run(tg, {65536: 100.2})
+        self.assertEqual(calls.count(65536), 2)
+        self.assertEqual(calls.count(262144), 1)  # 256k 不重测
+        self.assertEqual(calls.count(131072), 1)  # 128k 比 256k 只低 2.2%，在正常波动范围内
+        r64 = next(r for r in res if r["ctx_prompt"] == 65536)
+        self.assertEqual(r64["tg_tps"], 100.2)
+        self.assertEqual(r64["runs"], 2)
+        self.assertTrue(any("正在重测该档一次" in ln for ln in lines))
+        self.assertTrue(any("采用重测成绩 100.2" in ln for ln in lines))
+
+    def test_remeasure_keeps_original_when_not_better(self):
+        tg = {1024: 120, 65536: 85, 131072: 92}
+        res, calls, lines = self._run(tg, {65536: 84})
+        self.assertEqual(calls.count(65536), 2)
+        self.assertEqual(next(r for r in res if r["ctx_prompt"] == 65536)["tg_tps"], 85)
+        self.assertTrue(any("保留原成绩 85" in ln for ln in lines))
+
+    def test_normal_small_wiggle_and_monotonic_curves_are_not_remeasured(self):
+        # 5070 Ti 的真实数据：32k 63.65 比 64k 65.3 低 2.6%，属于正常波动
+        tg = {1024: 71.8, 32768: 63.65, 65536: 65.3, 131072: 64.3}
+        _, calls, lines = self._run(tg, {})
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(any("重测" in ln for ln in lines))
+
+    def test_no_max_wait_wording_in_logs(self):
+        lines: List[str] = []
+        with mock.patch.object(speedtest, "benchmark_context",
+                               side_effect=lambda e, m, t, g, r, **kw: ({"ctx_prompt": t, "tg_tps": 50.0, "pp_tps": 100.0}, 5.6)), \
+                mock.patch.object(speedtest, "server_busy", return_value=False), \
+                mock.patch.object(speedtest, "measure_ttft_overhead", return_value=None):
+            speedtest.run_benchmark_tiers("http://127.0.0.1:1/v1", "m", [1024, 262144], 256, 1, ctx_limit=300000,
+                                          warmup=False, log=lambda m, c=None: lines.append(m))
+        self.assertTrue(any("预计每轮约" in ln for ln in lines))
+        self.assertFalse(any("最长等待" in ln for ln in lines))
