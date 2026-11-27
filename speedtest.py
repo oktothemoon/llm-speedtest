@@ -876,14 +876,188 @@ def detect_ram_gb() -> Optional[int]:
     return None
 
 
+def clean_cpu_name(raw: Optional[str]) -> Optional[str]:
+    """Normalize verbose OS CPU brand strings into clean, readable model names."""
+    if not raw:
+        return None
+    s = re.sub(r"\((?:R|TM|C)\)", "", str(raw), flags=re.IGNORECASE)
+    s = re.sub(r"^\d+(?:st|nd|rd|th)\s+Gen\s+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+w(?:ith|/)?\s+Radeon(?:\(TM\))?\s+[\w\s-]*Graphics\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+\d+-Core\s+Processor\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+(?:Dual|Quad|Six|Eight|Twelve|Sixteen)-Core\s+Processor\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+CPU\s*@\s*[\d.]+\s*[GM]Hz\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*@\s*[\d.]+\s*[GM]Hz\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+Processor\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" -")
+    return s[:80] if s else None
+
+
+def detect_cpu_raw(os_name: Optional[str] = None) -> Optional[str]:
+    """Detect local CPU model name without requiring elevated privileges."""
+    sys_name = os_name or normalize_os()
+    raw = ""
+    if sys_name == "macos":
+        raw = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"])
+    elif sys_name == "linux":
+        try:
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        raw = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+        if not raw:
+            lscpu = run_cmd(["lscpu"])
+            for line in lscpu.splitlines():
+                if line.lower().startswith("model name:"):
+                    raw = line.split(":", 1)[1].strip()
+                    break
+    elif sys_name == "windows":
+        raw = run_cmd([
+            "powershell", "-NoProfile", "-Command",
+            "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
+        ])
+    return clean_cpu_name(raw)
+
+
+def parse_smbios_memory_type(
+    smbios_code: Optional[int],
+    mem_type: Optional[int] = None,
+    speed_mhz: Optional[int] = None,
+) -> Optional[str]:
+    """Map DMTF SMBIOS MemoryType code (with conservative speed fallback) to DDR generation."""
+    code_map = {
+        24: "DDR3",
+        26: "DDR4",
+        27: "LPDDR3",
+        28: "LPDDR3",
+        29: "LPDDR3",
+        30: "LPDDR4",
+        34: "DDR5",
+        35: "LPDDR5",
+        36: "LPDDR5X",
+    }
+    if smbios_code in code_map:
+        return code_map[smbios_code]
+    if mem_type == 24:
+        return "DDR3"
+    if speed_mhz and speed_mhz > 0:
+        if speed_mhz >= 4800:
+            return "DDR5"
+        if 2133 <= speed_mhz <= 3600:
+            return "DDR4"
+        if 800 <= speed_mhz <= 1866:
+            return "DDR3"
+    return None
+
+
+def infer_ram_type_from_cpu(cpu_raw: Optional[str]) -> Optional[str]:
+    """High-confidence DDR4/DDR5 inference from CPU platform (leaves dual-support CPUs as None)."""
+    if not cpu_raw:
+        return None
+    s = cpu_raw.lower()
+
+    # Explicitly leave dual-support platforms (Intel 12th/13th/14th Gen) as None
+    if re.search(r"\bi[3579]-1[234]\d{3}[a-z0-9]*\b", s):
+        return None
+
+    # DDR5-only platforms
+    if (
+        re.search(r"ryzen\s+[3579]\s+[789]\d{3}[a-z0-9]*\b", s)
+        or re.search(r"ryzen\s+ai\s+", s)
+        or re.search(r"threadripper.*\b[79]\d{3}[a-z0-9]*\b", s)
+        or re.search(r"epyc\s+[89]\d{2}[45][a-z0-9]*\b", s)
+        or re.search(r"core\s+ultra\b", s)
+        or re.search(r"xeon.*?\b(?:84|64|54|44|34|85|65|55|45|67|69)\d{2}[a-z0-9]*\b", s)
+    ):
+        return "DDR5"
+
+    # DDR4-only platforms
+    if (
+        re.search(r"ryzen\s+[3579]\s+[12345]\d{3}[a-z0-9]*\b", s)
+        or re.search(r"threadripper.*\b[1235]\d{3}[a-z0-9]*\b", s)
+        or re.search(r"epyc\s+7\d{2}[123][a-z0-9]*\b", s)
+        or re.search(r"\bi[3579]-(?:[6789]\d{3}|10\d{3}|11\d{3})[a-z0-9]*\b", s)
+        or re.search(r"e5-\d{4}\s*v[34]\b", s)
+        or re.search(r"xeon.*?\b(?:81|61|51|41|31|82|62|52|42|32|83|63|53|43)\d{2}[a-z0-9]*\b", s)
+    ):
+        return "DDR4"
+
+    return None
+
+
+def _parse_dmidecode_ram_type(text: str) -> Optional[str]:
+    """Extract DDR generation from `dmidecode -t memory` output."""
+    for line in text.splitlines():
+        m = re.match(r"^\s*Type:\s*(LPDDR5X|LPDDR5|LPDDR4X|LPDDR4|DDR5|DDR4|DDR3)\b", line, re.IGNORECASE)
+        if m:
+            val = m.group(1).upper()
+            return "LPDDR4" if val == "LPDDR4X" else val
+    return None
+
+
+def detect_ram_type(os_name: Optional[str] = None, cpu_raw: Optional[str] = None) -> Optional[str]:
+    """Detect system RAM generation (DDR4/DDR5/LPDDR5/DDR3) on Windows/Linux with CPU fallback."""
+    sys_name = os_name or normalize_os()
+    if sys_name == "windows":
+        ps = run_cmd([
+            "powershell", "-NoProfile", "-Command",
+            (
+                "Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | "
+                "ForEach-Object { \"$($_.SMBIOSMemoryType)|$($_.MemoryType)|$($_.ConfiguredClockSpeed)|$($_.Speed)\" }"
+            ),
+        ])
+        for line in ps.splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 4:
+                continue
+            smbios = int(parts[0]) if parts[0].isdigit() else None
+            mtype = int(parts[1]) if parts[1].isdigit() else None
+            spd = int(parts[2]) if parts[2].isdigit() and int(parts[2]) > 0 else (
+                int(parts[3]) if parts[3].isdigit() and int(parts[3]) > 0 else None
+            )
+            parsed = parse_smbios_memory_type(smbios, mtype, spd)
+            if parsed:
+                return parsed
+    elif sys_name == "linux":
+        # 1. EDAC sysfs (often readable by non-root users on AMD/Intel Linux)
+        try:
+            edac_root = "/sys/devices/system/edac/mc"
+            if os.path.isdir(edac_root):
+                for mc in sorted(os.listdir(edac_root)):
+                    mc_dir = os.path.join(edac_root, mc)
+                    if not os.path.isdir(mc_dir):
+                        continue
+                    for entry in sorted(os.listdir(mc_dir)):
+                        p = os.path.join(mc_dir, entry, "mem_type")
+                        if os.path.isfile(p):
+                            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                                txt = f.read().strip().upper()
+                            m = re.search(r"(LPDDR5X|LPDDR5|LPDDR4|DDR5|DDR4|DDR3)", txt)
+                            if m:
+                                return m.group(1)
+        except Exception:
+            pass
+        # 2. dmidecode (works when root or CAP_SYS_RAWIO)
+        dmi_out = run_cmd(["dmidecode", "-t", "memory"], timeout=3.0)
+        if dmi_out:
+            parsed = _parse_dmidecode_ram_type(dmi_out)
+            if parsed:
+                return parsed
+
+    return infer_ram_type_from_cpu(cpu_raw)
+
+
 def detect_hardware() -> Dict[str, Any]:
     """Collect hardware specs ONLY (no hostname, username, UUID, serial, or paths)."""
     os_name = normalize_os()
     ram_gb = detect_ram_gb()
+    cpu_raw = detect_cpu_raw(os_name)
 
     # 1. Apple Silicon (unified memory)
     if os_name == "macos" and platform.machine() == "arm64":
-        chip = run_cmd(["sysctl", "-n", "machdep.cpu.brand_string"]) or "Apple Silicon"
+        chip = cpu_raw or "Apple Silicon"
         disp = run_cmd(["system_profiler", "SPDisplaysDataType"])
         cores_match = re.search(r"Total Number of Cores:\s*(\d+)", disp)
         gpu_cores = int(cores_match.group(1)) if cores_match else None
@@ -892,6 +1066,7 @@ def detect_hardware() -> Dict[str, Any]:
             "kind": "unified",
             "hw_id": map_apple_id(chip, gpu_cores),
             "hw_raw": hw_raw,
+            "cpu_raw": chip,
             "gpu_count": 1,
             "vram_gb": None,
             "ram_gb": ram_gb,
@@ -924,6 +1099,7 @@ def detect_hardware() -> Dict[str, Any]:
                     "kind": "unified",
                     "hw_id": "dgxspark",
                     "hw_raw": name,
+                    "cpu_raw": cpu_raw,
                     "gpu_count": len(gpus),
                     "vram_gb": None,
                     "ram_gb": ram_gb or 128,
@@ -935,35 +1111,22 @@ def detect_hardware() -> Dict[str, Any]:
                 "kind": "gpu",
                 "hw_id": map_gpu_id(name, vram),
                 "hw_raw": name,
+                "cpu_raw": cpu_raw,
                 "gpu_count": len(gpus),
                 "vram_gb": vram or None,
                 "ram_gb": ram_gb,
-                "ram_type": None,
+                "ram_type": detect_ram_type(os_name, cpu_raw),
                 "ram_channels": None,
                 "os": os_name,
             }
 
     # 3. AMD Ryzen AI Max+ 395 (unified) on Linux/Windows
-    cpu_brand = ""
-    if os_name == "linux":
-        try:
-            with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.lower().startswith("model name"):
-                        cpu_brand = line.split(":", 1)[1].strip()
-                        break
-        except Exception:
-            pass
-    elif os_name == "windows":
-        cpu_brand = run_cmd([
-            "powershell", "-NoProfile", "-Command",
-            "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
-        ])
-    if "ai max" in cpu_brand.lower() and "395" in cpu_brand.lower():
+    if cpu_raw and "ai max" in cpu_raw.lower() and "395" in cpu_raw.lower():
         return {
             "kind": "unified",
             "hw_id": "aimax395",
-            "hw_raw": cpu_brand,
+            "hw_raw": cpu_raw,
+            "cpu_raw": cpu_raw,
             "gpu_count": 1,
             "vram_gb": None,
             "ram_gb": ram_gb,
@@ -1003,10 +1166,11 @@ def detect_hardware() -> Dict[str, Any]:
                 "kind": "gpu",
                 "hw_id": map_gpu_id(name, vram),
                 "hw_raw": name,
+                "cpu_raw": cpu_raw,
                 "gpu_count": sum(1 for c in cands if c[0] == name),
                 "vram_gb": vram,
                 "ram_gb": ram_gb,
-                "ram_type": None,
+                "ram_type": detect_ram_type(os_name, cpu_raw),
                 "ram_channels": None,
                 "os": os_name,
             }
@@ -1040,10 +1204,11 @@ def detect_hardware() -> Dict[str, Any]:
                 "kind": "gpu",
                 "hw_id": map_gpu_id(name, vram),
                 "hw_raw": name,
+                "cpu_raw": cpu_raw,
                 "gpu_count": len(non_nv),
                 "vram_gb": vram,
                 "ram_gb": ram_gb,
-                "ram_type": None,
+                "ram_type": detect_ram_type(os_name, cpu_raw),
                 "ram_channels": None,
                 "os": os_name,
             }
@@ -1051,11 +1216,12 @@ def detect_hardware() -> Dict[str, Any]:
     return {
         "kind": "gpu",
         "hw_id": None,
-        "hw_raw": cpu_brand or "Unknown Hardware",
+        "hw_raw": cpu_raw or "Unknown Hardware",
+        "cpu_raw": cpu_raw,
         "gpu_count": 1,
         "vram_gb": None,
         "ram_gb": ram_gb,
-        "ram_type": None,
+        "ram_type": detect_ram_type(os_name, cpu_raw),
         "ram_channels": None,
         "os": os_name,
     }
@@ -2237,9 +2403,14 @@ def print_summary(payload: Dict[str, Any]) -> None:
     mdl = payload["model"]
     ram_str = f"{hw.get('ram_gb') or '?'}GB" + (f" {hw['ram_type']}" if hw.get("ram_type") else "")
     vram_str = f" ({hw['vram_gb']}GB 显存)" if hw.get("vram_gb") else ""
+    cpu_str = (
+        f" · CPU {hw['cpu_raw']}"
+        if hw.get("cpu_raw") and hw.get("kind") != "unified" and hw["cpu_raw"] != hw.get("hw_raw")
+        else ""
+    )
     kv_str = f" | KV Cache：{sw['kv_cache']}" if sw.get("kv_cache") else ""
     lines = [
-        f"  ◆ 本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']} · 内存 {ram_str} · {hw.get('os') or ''}",
+        f"  ◆ 本机硬件：{hw['hw_raw']}{vram_str} ×{hw['gpu_count']}{cpu_str} · 内存 {ram_str} · {hw.get('os') or ''}",
         f"  ◆ 测试模型：{mdl['model_raw']} | 量化：{mdl.get('quant') or '未填'} | 引擎：{sw.get('engine') or '未填'}{kv_str}",
     ]
     if payload.get("nickname") or payload.get("note"):
@@ -2291,14 +2462,20 @@ def print_upload_ceremony(
     )
     badge = f"实测编号 #{rec_id} · [本机实采认证]" if rec_id else "[本机实采认证]"
     cnt = f" ×{hw['gpu_count']}" if (hw.get("gpu_count") or 1) > 1 else ""
-    ram = f" · {hw['ram_gb']}GB" if hw.get("ram_gb") else ""
+    cpu_part = (
+        f" · {hw['cpu_raw']}"
+        if hw.get("cpu_raw") and hw.get("kind") != "unified" and hw["cpu_raw"] != hw.get("hw_raw")
+        else ""
+    )
+    ram_t = f" {hw['ram_type']}" if hw.get("ram_type") and hw.get("ram_type") != "Unified" else ""
+    ram = f" · {hw['ram_gb']}GB{ram_t}" if hw.get("ram_gb") else (f" ·{ram_t}" if ram_t else "")
     quant = f" · {mdl['quant']}" if mdl.get("quant") else ""
     kv = f" · KV {sw['kv_cache']}" if sw.get("kv_cache") else ""
     author = payload.get("nickname") or "匿名贡献者"
 
     info_lines: List[str] = [
         f"  ★ {_c(badge, '1;36')}",
-        f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{ram}",
+        f"  ◆ 硬件：{hw.get('hw_raw', 'Unknown')}{cnt}{cpu_part}{ram}",
         f"  ◆ 模型：{mdl.get('model_raw', '-')}{quant}{kv}",
     ]
     if len(results) == 1:
@@ -2426,9 +2603,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 1. Detect local hardware first
     hw = resolve_hardware(args)
     vram_hint = f" ({hw['vram_gb']}GB 显存)" if hw.get("vram_gb") else ""
-    ram_hint = f" · 内存 {hw['ram_gb']}GB" if hw.get("ram_gb") else ""
+    cpu_hint = (
+        f" · CPU {hw['cpu_raw']}"
+        if hw.get("cpu_raw") and hw.get("kind") != "unified" and hw["cpu_raw"] != hw.get("hw_raw")
+        else ""
+    )
+    ram_type_hint = f" {hw['ram_type']}" if hw.get("ram_type") and hw.get("ram_type") != "Unified" else ""
+    ram_hint = f" · 内存 {hw['ram_gb']}GB{ram_type_hint}" if hw.get("ram_gb") else ""
     print(
-        f"\n◆ 本机硬件：{_c(hw['hw_raw'] + vram_hint, '1')} ×{hw['gpu_count']}{ram_hint} · 系统 {hw.get('os') or ''}",
+        f"\n◆ 本机硬件：{_c(hw['hw_raw'] + vram_hint, '1')} ×{hw['gpu_count']}{cpu_hint}{ram_hint} · 系统 {hw.get('os') or ''}",
         file=sys.stderr,
     )
 

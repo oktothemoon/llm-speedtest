@@ -237,6 +237,56 @@ class MappingTests(unittest.TestCase):
         for ln in sum_lines[1:-1]:
             self.assertLess(speedtest._display_width(ln), top_w)
 
+    def test_cpu_name_cleanup_and_ram_type_detection(self):
+        self.assertEqual(
+            speedtest.clean_cpu_name("AMD Ryzen 9 9950X 16-Core Processor"),
+            "AMD Ryzen 9 9950X",
+        )
+        self.assertEqual(
+            speedtest.clean_cpu_name("13th Gen Intel(R) Core(TM) i9-13900K"),
+            "Intel Core i9-13900K",
+        )
+        self.assertEqual(
+            speedtest.clean_cpu_name("Intel(R) Xeon(R) Gold 6430 CPU @ 2.10GHz"),
+            "Intel Xeon Gold 6430",
+        )
+        self.assertEqual(
+            speedtest.clean_cpu_name("AMD Ryzen 7 7840HS w/ Radeon 780M Graphics"),
+            "AMD Ryzen 7 7840HS",
+        )
+        self.assertEqual(speedtest.clean_cpu_name("Apple M4 Max"), "Apple M4 Max")
+
+        # SMBIOS memory type codes
+        self.assertEqual(speedtest.parse_smbios_memory_type(26), "DDR4")
+        self.assertEqual(speedtest.parse_smbios_memory_type(34), "DDR5")
+        self.assertEqual(speedtest.parse_smbios_memory_type(35), "LPDDR5")
+        self.assertEqual(speedtest.parse_smbios_memory_type(36), "LPDDR5X")
+        self.assertEqual(speedtest.parse_smbios_memory_type(0, 0, 6000), "DDR5")
+        self.assertEqual(speedtest.parse_smbios_memory_type(0, 0, 3200), "DDR4")
+
+        # High-confidence CPU -> DDR inference
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("AMD Ryzen 9 9950X"), "DDR5")
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("AMD EPYC 9654"), "DDR5")
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("Intel Core Ultra 9 285K"), "DDR5")
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("AMD Ryzen 9 5950X"), "DDR4")
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("AMD EPYC 7763"), "DDR4")
+        self.assertEqual(speedtest.infer_ram_type_from_cpu("Intel Core i9-10900K"), "DDR4")
+        # Intel 12/13/14th Gen supports both DDR4 & DDR5 -> must stay None
+        self.assertIsNone(speedtest.infer_ram_type_from_cpu("Intel Core i9-13900K"))
+        self.assertIsNone(speedtest.infer_ram_type_from_cpu("Intel Core i7-14700K"))
+
+        # dmidecode parsing
+        dmi = "Memory Device\n\tSize: 32 GB\n\tType: DDR5\n\tSpeed: 6000 MT/s\n"
+        self.assertEqual(speedtest._parse_dmidecode_ram_type(dmi), "DDR5")
+
+        # Windows SMBIOS mock
+        with mock.patch.object(speedtest, "run_cmd", return_value="34|0|6000|6000\n34|0|6000|6000"):
+            self.assertEqual(speedtest.detect_ram_type("windows", "Intel Core i9-13900K"), "DDR5")
+        # Linux non-root fallback to CPU platform
+        with mock.patch.object(speedtest, "run_cmd", return_value=""):
+            self.assertEqual(speedtest.detect_ram_type("linux", "AMD Ryzen 9 9950X"), "DDR5")
+            self.assertIsNone(speedtest.detect_ram_type("linux", "Intel Core i9-13900K"))
+
 
 class EndToEndMockTests(unittest.TestCase):
     def setUp(self):

@@ -426,8 +426,12 @@ function formatHwSummary(hw) {{
   const vram = hw.vram_gb ? ` (${{hw.vram_gb}}GB 显存)` : '';
   const main = `${{hw.hw_raw}}${{vram}}${{cnt}}`;
   const parts = [];
+  if (hw.cpu_raw && hw.kind !== 'unified' && hw.cpu_raw !== hw.hw_raw) parts.push('CPU: ' + hw.cpu_raw);
   if (hw.hw_id) parts.push('ID: ' + hw.hw_id);
-  if (hw.ram_gb) parts.push((hw.kind === 'unified' ? '统一内存 ' : '系统内存 ') + hw.ram_gb + 'GB');
+  if (hw.ram_gb) {{
+    const rt = (hw.ram_type && hw.ram_type !== 'Unified') ? ' ' + hw.ram_type : '';
+    parts.push((hw.kind === 'unified' ? '统一内存 ' : '系统内存 ') + hw.ram_gb + 'GB' + rt);
+  }}
   if (hw.os) parts.push('系统: ' + hw.os);
   return {{ main, meta: parts.join(' · ') }};
 }}
@@ -438,11 +442,23 @@ function renderLocalHw() {{
   $('local-hw-main').textContent = s.main;
   $('local-hw-meta').textContent = s.meta;
   $('local-hw-os').textContent = localHw.kind === 'unified' ? '统一内存设备' : '独立显卡设备';
+  const sel = $('ram-preset');
   if (localHw.kind === 'unified') {{
-    $('ram-preset').value = 'Unified|';
+    sel.value = 'Unified|';
     $('ram-type-wrap').classList.add('hidden');
   }} else {{
     $('ram-type-wrap').classList.remove('hidden');
+    if (localHw.ram_type && !sel.value) {{
+      const autoVal = localHw.ram_type + '|';
+      let opt = Array.from(sel.options).find((o) => o.value === autoVal);
+      if (!opt) {{
+        opt = document.createElement('option');
+        opt.value = autoVal;
+        opt.textContent = `已自动识别：${{localHw.ram_type}}（可改选通道数）`;
+        sel.insertBefore(opt, sel.options[1] || null);
+      }}
+      sel.value = autoVal;
+    }}
   }}
 }}
 
