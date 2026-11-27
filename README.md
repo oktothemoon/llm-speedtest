@@ -57,6 +57,7 @@ if (Test-Path llm-speedtest) { git -C llm-speedtest pull --ff-only } else { git 
 | `--runs 3` | 短上下文每档测速轮数，取中位数（默认 `3`；≥64k 自动 1 轮） |
 | `--engine` / `--quant` / `--kv-cache` / `--mtp` | 推理引擎、量化版本、KV Cache 精度（`f16`/`bf16`/`fp8`/`int8`/`q8_0`/`q4_0`）、是否开启 MTP |
 | `--name` / `--note` | 选填：天梯图公开署名（≤20 字）与一句话调优备注（≤120 字），不填默认匿名 |
+| `--anonymous` / `--client-id ID` | 不附带本地随机匿名 `client_id` / 手动指定 `client_id`（换新机时可沿用旧记录） |
 | `--ram-type` / `--ram-channels` | 内存代数（`DDR4`/`DDR5` 等）与通道数 |
 | `--detect-only` | 仅打印本机自动识别的硬件规格并退出 |
 | `--dry-run` / `--non-interactive` / `--yes` | 仅测不传 / 关闭交互向导 / 免确认直接上传 |
@@ -66,6 +67,7 @@ if (Test-Path llm-speedtest) { git -C llm-speedtest pull --ff-only } else { git 
 ## 隐私说明（零个人信息，欢迎交给你的 AI 审计源码）
 
 - **绝不采集**：用户名、主机名、本地文件路径、命令行参数、API Key、MAC 地址、GPU UUID、硬件序列号、环境变量。
+- **本地随机匿名 `client_id`**：首次运行时会在本地生成并保存一个纯随机 UUID（`~/.config/llm-speedtest/client_id`，不含任何机器或个人隐私），方便你日后升级显卡/内存或调优后再测速时关联历史成绩；如需完全不附带可加 `--anonymous` 或删除本地文件。
 - **上传前明文可见**：界面和终端都会完整展示即将发送的 JSON，默认需你手动确认才会上传。
 - **服务端不保存原始 IP**：接收端仅使用加盐单向哈希做每小时限流与同机去重。
 - **零第三方依赖**：全部代码只有 `speedtest.py` 和 `ui.py` 两个纯 Python 标准库文件，不放心可以直接丢给你的 AI 检查源码后再运行。

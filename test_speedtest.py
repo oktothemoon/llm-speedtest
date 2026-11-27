@@ -145,9 +145,38 @@ class MappingTests(unittest.TestCase):
         with mock.patch("builtins.input", return_value="ui"):
             self.assertEqual(speedtest.prompt_launch_mode(), "ui")
 
+    def test_persistent_anonymous_client_id(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            cid_path = os.path.join(td, "nested", "client_id")
+            with mock.patch.dict(os.environ, {"LLM_SPEEDTEST_CLIENT_ID_FILE": cid_path}):
+                cid1 = speedtest.get_or_create_client_id()
+                self.assertIsNotNone(speedtest.clean_client_id(cid1))
+                self.assertTrue(os.path.isfile(cid_path))
+                cid2 = speedtest.get_or_create_client_id()
+                self.assertEqual(cid1, cid2)
+
+                # Corrupted file should regenerate cleanly
+                with open(cid_path, "w", encoding="utf-8") as f:
+                    f.write("not valid!!\n")
+                cid3 = speedtest.get_or_create_client_id()
+                self.assertIsNotNone(speedtest.clean_client_id(cid3))
+                self.assertNotEqual(cid3, "not valid!!")
+
 
 class EndToEndMockTests(unittest.TestCase):
     def setUp(self):
+        import os
+        import tempfile
+
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._cid_env = mock.patch.dict(
+            os.environ,
+            {"LLM_SPEEDTEST_CLIENT_ID_FILE": os.path.join(self._tmp_dir.name, "client_id")},
+        )
+        self._cid_env.start()
         self.uploaded: List[Dict[str, Any]] = []
         self.user_agents: List[str] = []
         uploaded_ref = self.uploaded
@@ -246,6 +275,8 @@ class EndToEndMockTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.server.server_close()
+        self._cid_env.stop()
+        self._tmp_dir.cleanup()
 
     def test_local_requests_bypass_http_proxy(self):
         base = f"http://127.0.0.1:{self.port}"
@@ -345,11 +376,55 @@ class EndToEndMockTests(unittest.TestCase):
         self.assertEqual(p["hardware"]["ram_channels"], 2)
         self.assertEqual(p["nickname"], "老曹")
         self.assertEqual(p["note"], "Strata 0.2.15 + fa=on")
+        self.assertIsNotNone(speedtest.clean_client_id(p.get("client_id")))
         self.assertEqual(len(p["results"]), 2)
         err_text = err_buf.getvalue()
         self.assertIn("新王登基", err_text)
+        self.assertIn("同配置同模型速度排名", err_text)
+        self.assertIn("同模型速度排名", err_text)
+        self.assertIn("位实测用户", err_text)
+        self.assertNotIn("同好", err_text)
         self.assertIn("实测编号 #1", err_text)
         self.assertIn("https://itbanana.com/llm-speed?highlight=1", err_text)
+
+    def test_anonymous_and_custom_client_id_flags(self):
+        base = f"http://127.0.0.1:{self.port}"
+        rc1 = speedtest.main([
+            "--endpoint", f"{base}/v1",
+            "--model", "Qwen3.8-27B-Q4_K_M",
+            "--hw-id", "rtx4090-48",
+            "--hw-raw", "NVIDIA GeForce RTX 4090",
+            "--ctx", "1k",
+            "--gen-tokens", "20",
+            "--runs", "1",
+            "--no-warmup",
+            "--non-interactive",
+            "--yes",
+            "--anonymous",
+            "--submit-url", f"{base}/api/llm-speedtest/submit",
+            "--stats-url", f"{base}/api/llm-speedtest/stats",
+        ])
+        self.assertEqual(rc1, 0)
+        self.assertNotIn("client_id", self.uploaded[-1])
+
+        custom_cid = "11111111-2222-4333-8444-555555555555"
+        rc2 = speedtest.main([
+            "--endpoint", f"{base}/v1",
+            "--model", "Qwen3.8-27B-Q4_K_M",
+            "--hw-id", "rtx4090-48",
+            "--hw-raw", "NVIDIA GeForce RTX 4090",
+            "--ctx", "1k",
+            "--gen-tokens", "20",
+            "--runs", "1",
+            "--no-warmup",
+            "--non-interactive",
+            "--yes",
+            "--client-id", custom_cid,
+            "--submit-url", f"{base}/api/llm-speedtest/submit",
+            "--stats-url", f"{base}/api/llm-speedtest/stats",
+        ])
+        self.assertEqual(rc2, 0)
+        self.assertEqual(self.uploaded[-1].get("client_id"), custom_cid)
 
     def test_local_web_ui_end_to_end(self):
         import urllib.error
@@ -375,6 +450,9 @@ class EndToEndMockTests(unittest.TestCase):
                 html = resp.read().decode("utf-8")
                 self.assertIn("llm-speedtest", html)
                 self.assertIn(token, html)
+                self.assertIn("anonymous-toggle", html)
+                self.assertIn("同配置同模型速度排名", html)
+                self.assertIn("同模型速度排名", html)
                 self.assertNotIn("tab-lan", html)
                 self.assertNotIn("api/ssh-detect", html)
 
@@ -423,6 +501,7 @@ class EndToEndMockTests(unittest.TestCase):
                 time.sleep(0.05)
             self.assertEqual(st["state"], "done")
             self.assertEqual(st["payload"]["hardware"]["detected_by"], "local")
+            self.assertIsNotNone(speedtest.clean_client_id(st["payload"].get("client_id")))
             self.assertEqual(st["payload"]["software"]["kv_cache"], "int8")
             self.assertEqual(st["payload"]["software"]["ctx_limit"], 270000)
             self.assertEqual(len(st["payload"]["results"]), 3)
@@ -433,6 +512,23 @@ class EndToEndMockTests(unittest.TestCase):
             self.assertTrue(up["ok"])
             self.assertEqual(len(self.uploaded), 1)
             self.assertEqual(self.uploaded[0]["hardware"]["detected_by"], "local")
+
+            # 7. Anonymous mode in UI omits client_id
+            speedtest.http_json(f"{ui_base}/api/start", payload={
+                "endpoint": f"{base}/v1",
+                "model": "Qwen3.8-27B-Q4_K_M",
+                "ctx": "1k",
+                "runs": 1,
+                "anonymous": True,
+            }, headers=hdrs)
+            st2 = {}
+            for _ in range(50):
+                st2 = speedtest.http_json(f"{ui_base}/api/status")
+                if st2["state"] in ("done", "error"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(st2["state"], "done")
+            self.assertNotIn("client_id", st2["payload"])
         finally:
             ui_srv.shutdown()
             ui_srv.server_close()

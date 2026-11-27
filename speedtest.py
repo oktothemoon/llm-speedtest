@@ -24,9 +24,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.6"
+CLIENT_VERSION = "0.3.7"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -34,6 +35,54 @@ DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
 
 DEFAULT_CTX_TIERS = [1024, 32768, 65536, 131072, 262144]
 DEFAULT_CTX_STR = "1k,32k,64k,128k,256k"
+CLIENT_ID_RE = re.compile(r"^[0-9a-fA-F-]{16,64}$")
+
+
+def clean_client_id(val: Optional[str]) -> Optional[str]:
+    """Validate an anonymous random client_id string (hex/UUID-like, no personal info)."""
+    if not val:
+        return None
+    s = str(val).strip().lower()
+    return s if CLIENT_ID_RE.fullmatch(s) else None
+
+
+def get_client_id_path() -> str:
+    """Return local file path for persisting the random anonymous client_id."""
+    override = os.environ.get("LLM_SPEEDTEST_CLIENT_ID_FILE")
+    if override:
+        return os.path.expanduser(override)
+    if platform.system().lower().startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "llm-speedtest", "client_id")
+
+
+def get_or_create_client_id() -> str:
+    """Load or create a purely random local anonymous UUIDv4 for hardware-upgrade continuity."""
+    path = get_client_id_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                existing = clean_client_id(f.read())
+            if existing:
+                return existing
+    except OSError:
+        pass
+
+    new_id = str(uuid.uuid4())
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_id + "\n")
+        if os.name == "posix":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return new_id
 
 
 def parse_ctx_list(ctx_str: Optional[str]) -> List[int]:
@@ -1438,6 +1487,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Optional leaderboard identity & tuning note (voluntary public fields; anonymous if omitted)
     p.add_argument("--name", "--nickname", dest="nickname", help="选填：天梯图公开署名（≤20字，不含网址，留空匿名）")
     p.add_argument("--note", help="选填：一句话调优备注（≤120字，如 'Strata 0.2.15 + fa=on'）")
+    p.add_argument("--anonymous", action="store_true", help="不附带本地随机匿名 client_id（完全匿名，不关联后续升级设备记录）")
+    p.add_argument("--client-id", help="选填：手动指定本地匿名 client_id（换新机时可用于沿用旧记录）")
 
     # Mode / upload / interaction controls
     p.add_argument("--ui", action="store_true", help="直接启动本地 WebUI 可视化页面并打开浏览器")
@@ -1554,8 +1605,8 @@ def print_welcome_banner() -> None:
     print(_c(f"│  ★ llm-speedtest v{CLIENT_VERSION} · 本地大模型速度天梯图实测工具   │", "1;36"), file=sys.stderr)
     print(_c("╰────────────────────────────────────────────────────────────╯", "36"), file=sys.stderr)
     print(
-        "[隐私承诺] 100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
-        "           绝不收集用户名、主机名、路径、原始 IP 或 API Key；上传前明文可见。",
+        "[隐私承诺] 100% 开源、零第三方依赖，仅采集本机硬件规格、推理速度与本地随机匿名 client_id，\n"
+        "           绝不收集用户名、主机名、硬件序列号、路径、原始 IP 或 API Key（--anonymous 可关闭）；上传前明文可见。",
         file=sys.stderr,
     )
 
@@ -1695,7 +1746,7 @@ def print_upload_ceremony(
 
     is_king = bool(ranking and ranking.get("same_hw_rank") == 1)
     title = (
-        "★ 新王登基！你的本机实测已登顶同款硬件榜首！ ★"
+        "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
         if is_king
         else ("★ 恭喜上榜！实测成绩已载入速度天梯图 ★" if ranking else "★ 恭喜！你的本机实测已成功上榜 ★")
     )
@@ -1733,20 +1784,22 @@ def print_upload_ceremony(
 
     if ranking:
         gap = float(ranking.get("gap_to_first") or 0)
-        gap_txt = "★ 当前同卡第一！" if gap <= 0.05 else f"距同卡第一仅差 {gap:g} tok/s，调优后再冲一次！"
+        gap_txt = "★ 当前同配置榜首！" if gap <= 0.05 else f"距同配置第一仅差 {gap:g} tok/s，调优后再冲一次！"
         vs_med = ranking.get("vs_median_pct")
         med_txt = (
-            f"（较同卡中位 {ranking.get('same_hw_median')} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
+            f"（较同配置中位 {ranking.get('same_hw_median')} tok/s {'+' if vs_med >= 0 else ''}{vs_med}%）"
             if vs_med is not None
             else ""
         )
+        same_model_rank = ranking.get("same_model_rank") or ranking.get("overall_rank")
+        same_model_total = ranking.get("same_model_total") or ranking.get("overall_total")
         print(_c("╟──────────────────────────────────────────────────────────────╢", "33"), file=sys.stderr)
         print(
-            f"  ★ 同款硬件排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}",
+            f"  ★ 同配置同模型速度排名：第 {_c(str(ranking.get('same_hw_rank')), '1;33')} / {ranking.get('same_hw_total')} 名{med_txt}",
             file=sys.stderr,
         )
         print(
-            f"  ★ 全榜综合排名：第 {_c(str(ranking.get('overall_rank')), '1;36')} / {ranking.get('overall_total')} 名 · {gap_txt}",
+            f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名 · {gap_txt}",
             file=sys.stderr,
         )
 
@@ -1758,7 +1811,7 @@ def print_upload_ceremony(
     if stats and isinstance(stats.get("group"), dict) and stats["group"].get("contributors"):
         g = stats["group"]
         print(
-            f"  ◆ 同配置社区区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位同好）",
+            f"  ◆ 同配置同模型参考区间：{g['tg_min']}–{g['tg_max']} tok/s（中位 {g['tg_median']} tok/s，共 {g['contributors']} 位实测用户）",
             file=sys.stderr,
         )
 
@@ -1939,9 +1992,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(_c("✗ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)
         return 1
 
+    client_id = None if args.anonymous else (clean_client_id(args.client_id) or get_or_create_client_id())
     payload: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "client_version": CLIENT_VERSION,
+        **({"client_id": client_id} if client_id else {}),
         "hardware": hw,
         "software": {
             "engine": args.engine,

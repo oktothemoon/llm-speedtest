@@ -20,8 +20,8 @@ from typing import Any, Dict, List, Optional
 
 
 PRIVACY_BANNER_CLI = (
-    "🔒 隐私承诺：本工具 100% 开源、零第三方依赖，仅采集本机硬件规格与推理速度，\n"
-    "   绝不收集用户名、主机名、文件路径、原始 IP、API Key 或任何个人数据。\n"
+    "🔒 隐私承诺：本工具 100% 开源、零第三方依赖，仅采集本机硬件规格、推理速度与本地随机匿名 client_id，\n"
+    "   绝不收集用户名、主机名、硬件序列号、文件路径、原始 IP、API Key 或任何个人数据。\n"
     "   上传前会展示完整明文 JSON，欢迎直接把源码交给你的 AI 审计后再运行。"
 )
 
@@ -221,7 +221,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
 
   <div class="trust">
     <strong>🔒 零个人数据承诺（欢迎交给你的 AI 检查源码）：</strong>
-    本工具 100% 开源、纯 Python 标准库零第三方依赖，仅采集本机硬件型号与测速数值，<strong>绝不收集</strong>用户名、主机名、本地路径、原始 IP 或 API Key。测速完成后可先完整审查下方明文 JSON，点击确认才会上传。
+    本工具 100% 开源、纯 Python 标准库零第三方依赖，仅采集本机硬件型号、测速数值与本地随机匿名 <code>client_id</code>（可在高级设置关闭），<strong>绝不收集</strong>用户名、主机名、硬件序列号、本地路径、原始 IP 或 API Key。测速完成后可先完整审查下方明文 JSON，点击确认才会上传。
   </div>
 
   <!-- Step 1: Server & Model -->
@@ -342,7 +342,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
     </div>
 
     <details>
-      <summary>高级设置（自定义上下文、轮数、本地 API Key）</summary>
+      <summary>高级设置（自定义上下文、轮数、本地 API Key、匿名选项）</summary>
       <div class="row row-3" style="margin-top:10px;">
         <div>
           <label for="ctx-input">测试上下文（支持 k 缩写）</label>
@@ -356,6 +356,12 @@ def _render_html(token: str, default_submit_url: str) -> str:
           <label for="apikey-input">本地服务 API Key（绝不上传）</label>
           <input id="apikey-input" type="password" placeholder="选填" />
         </div>
+      </div>
+      <div style="margin-top:10px;">
+        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin:0;color:var(--text);">
+          <input id="anonymous-toggle" type="checkbox" style="width:auto;" />
+          完全匿名（不附带本地随机匿名 client_id，不关联后续硬件升级记录）
+        </label>
       </div>
     </details>
   </section>
@@ -534,6 +540,7 @@ $('btn-run').onclick = async () => {{
     runs: Number($('runs-input').value) || 3,
     ram_type: ramType || null,
     ram_channels: ramCh ? Number(ramCh) : null,
+    anonymous: Boolean($('anonymous-toggle').checked),
   }};
 
   $('btn-run').disabled = true;
@@ -672,15 +679,17 @@ $('btn-upload').onclick = async () => {{
 
     let extraLine = '';
     if (ranking) {{
+      const sameModelRank = ranking.same_model_rank ?? ranking.overall_rank;
+      const sameModelTotal = ranking.same_model_total ?? ranking.overall_total;
       const gap = Number(ranking.gap_to_first || 0);
-      const gapTxt = gap <= 0.05 ? '当前同卡第一！' : `距同卡第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
-      extraLine = `🏆 同款硬件排第 ${{ranking.same_hw_rank}} / ${{ranking.same_hw_total}} 名（中位 ${{ranking.same_hw_median}} tok/s），全榜第 ${{ranking.overall_rank}} / ${{ranking.overall_total}} 名，${{gapTxt}}`;
+      const gapTxt = gap <= 0.05 ? '当前同配置榜首！' : `距同配置第一仅差 ${{gap}} tok/s，调优后再冲一次！`;
+      extraLine = `🏆 同配置同模型速度排名第 ${{ranking.same_hw_rank}} / ${{ranking.same_hw_total}} 名（中位 ${{ranking.same_hw_median}} tok/s），同模型速度排名第 ${{sameModelRank}} / ${{sameModelTotal}} 名，${{gapTxt}}`;
     }} else if (resp.total_contributors) {{
       extraLine = `全站累计已收录 ${{resp.total_samples || 1}} 条实测，你是第 ${{resp.total_contributors}} 位贡献实测数据的玩家！`;
-      if (res.stats && res.stats.group && res.stats.group.contributors) {{
-        const g = res.stats.group;
-        extraLine += ` 同配置社区区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}}）。`;
-      }}
+    }}
+    if (res.stats && res.stats.group && res.stats.group.contributors) {{
+      const g = res.stats.group;
+      extraLine += `${{extraLine ? ' ' : ''}}同配置同模型参考区间 ${{g.tg_min}}–${{g.tg_max}} tok/s（中位 ${{g.tg_median}} tok/s，共 ${{g.contributors}} 位实测用户）。`;
     }}
 
     const ctaText = ranking
@@ -865,9 +874,13 @@ def create_ui_server(
             if not results:
                 raise RuntimeError("所有上下文档位均未能完成测速，请检查服务端上下文上限设置")
 
+            client_id = None if cfg.get("anonymous") else (
+                st_module.clean_client_id(cfg.get("client_id")) or st_module.get_or_create_client_id()
+            )
             payload = {
                 "schema_version": st_module.SCHEMA_VERSION,
                 "client_version": st_module.CLIENT_VERSION,
+                **({"client_id": client_id} if client_id else {}),
                 "hardware": hw,
                 "software": {
                     "engine": cfg.get("engine"),

@@ -18,6 +18,7 @@
 - `--ram-type` / `--ram-channels`：如 `DDR4`、`DDR5` 和通道数（若已知）
 - `--fit`：`gpu`（全放显存）或 `hybrid`（显存 + 内存）
 - `--name` / `--note`（完全可选）：若用户想在 [速度天梯图（itbanana.com/llm-speed）](https://itbanana.com/llm-speed) 上署名或留下调优参数备注，可传入自定义昵称（≤20 字）与调优说明（≤120 字，勿包含网址或个人信息）；用户未提供则留空保持匿名。
+- `--anonymous` / `--client-id`（可选）：默认会自动附带本地随机匿名 `client_id`（保存在 `~/.config/llm-speedtest/client_id`，不含任何机器或个人隐私），便于日后升级硬件关联历史成绩；若用户希望完全不附带，可加 `--anonymous`。
 
 ## 第 2 步：先跑一次 `--non-interactive --dry-run`（仅本地测速，不上传）
 默认会依次测试 `1k / 32k / 64k / 128k / 256k` 全套上下文档位（自动探测服务端上限，超出上限的档位自动跳过）。AI Agent 执行时请务必带上 `--non-interactive`（避免触发终端交互问答卡住）：
@@ -39,7 +40,7 @@ python3 speedtest.py \
 ## 第 3 步：向用户展示明文 JSON 并征得确认
 把终端输出的完整 JSON 展示给用户确认：
 - 核对硬件型号（特别是魔改大显存卡，如 `rtx4090-48`、`rtx4080s-32`）、内存、量化与速度是否准确；
-- 确认里面**不包含任何个人信息**（无用户名、主机名、文件路径、序列号、IP）。
+- 确认里面**不包含任何个人信息**（无用户名、主机名、文件路径、硬件序列号、IP；`client_id` 仅为本地纯随机 UUID）。
 
 ## 第 4 步：用户同意后再上传
 如果用户之前已明确授权自动上传，或在第 3 步确认同意，去掉 `--dry-run` 加上 `--yes` 执行上传（上传至 `https://itbanana.com/api/llm-speedtest/submit`）：
