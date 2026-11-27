@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.11"
+CLIENT_VERSION = "0.3.12"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -2169,6 +2169,12 @@ def run_benchmark_tiers(
     server's context/VRAM limit); a failure on the very first tier is raised to the caller.
     """
     emit = log or _stderr_log
+    if server_busy(endpoint, api_key=api_key):
+        emit(
+            "! 推理服务当前正在处理其他请求（例如有人正在聊天或有后台任务），测出的速度会偏低；"
+            "建议先停止其它请求后再测。",
+            "33",
+        )
     if warmup:
         emit("\n▸ 正在发送预热请求（避免冷启动影响成绩）...")
         run_single_completion(endpoint, model_name, build_warmup_prompt(ctx_limit), 24, api_key=api_key)
@@ -2257,6 +2263,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--interactive", "-i", action="store_true", help="强制开启终端命令行交互模式")
     p.add_argument("--non-interactive", action="store_true", help="关闭所有交互提示（适合脚本与 AI Agent 调用）")
     p.add_argument("--yes", "-y", action="store_true", help="测速完成后跳过确认直接上传（命令行模式）")
+    p.add_argument(
+        "--resubmit",
+        nargs="?",
+        const="latest",
+        metavar="JSON文件",
+        help="重新上传之前保存的成绩（上传失败时使用；不填文件则取最近一次未上传成功的成绩）",
+    )
     p.add_argument("--submit-url", default=DEFAULT_SUBMIT_URL, help=f"上传接口地址（默认 {DEFAULT_SUBMIT_URL}）")
     p.add_argument("--stats-url", default=DEFAULT_STATS_URL, help=f"社区统计接口地址（默认 {DEFAULT_STATS_URL}）")
     return p.parse_args(argv)
@@ -2702,6 +2715,95 @@ def print_summary(payload: Dict[str, Any]) -> None:
     print(_c(f"╰{'─' * inner_width}╯", "36"), file=sys.stderr)
 
 
+REVIEW_REASON_TEXT = {
+    "outlier_vs_median": "明显高于同配置其他用户的成绩",
+    "outlier_vs_best": "明显高于同配置目前的最高成绩",
+    "unknown_hw_id": "你的硬件型号还没有收录进硬件库",
+    "over_bandwidth_cap": "超过了该硬件的理论显存带宽上限",
+    "sse_timings_mismatch": "服务端计时与客户端计时差距过大",
+    "manual_hardware": "硬件信息是手动指定的",
+}
+
+
+def review_notice(resp: Dict[str, Any]) -> List[str]:
+    """Explain flagged (pending manual review) tiers and tiers the server dropped as invalid."""
+    lines: List[str] = []
+    res = resp.get("results") if isinstance(resp.get("results"), list) else []
+    flagged = [r for r in res if isinstance(r, dict) and r.get("status") == "flagged"]
+    if flagged:
+        reasons: List[str] = []
+        for r in flagged:
+            key = str(r.get("flag_reason") or "").split(":", 1)[0]
+            txt = REVIEW_REASON_TEXT.get(key, "触发了自动质检规则")
+            if txt not in reasons:
+                reasons.append(txt)
+        tiers = "、".join(str(r.get("ctx_tier") or format_ctx_label(int(r.get("ctx_prompt") or 0))) for r in flagged)
+        lines.append(
+            f"成绩已收到，但 [{tiers}] 档因{'；'.join(reasons)}，需要人工审核通过后才会出现在速度天梯上（通常 1–2 天）。"
+        )
+    dropped = resp.get("dropped") if isinstance(resp.get("dropped"), list) else []
+    if dropped:
+        lines.append(f"有 {len(dropped)} 档数据未通过服务端格式校验，未被收录：" + "；".join(str(d.get("error")) for d in dropped if isinstance(d, dict)))
+    return lines
+
+
+def get_results_dir() -> str:
+    """Local folder for saved benchmark payloads (allows re-uploading after a network failure)."""
+    return os.path.join(os.path.dirname(get_client_id_path()), "results")
+
+
+def save_pending_payload(payload: Dict[str, Any]) -> Optional[str]:
+    """Save the payload before uploading so a failed upload can be retried with --resubmit."""
+    try:
+        d = get_results_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S") + ".json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return path
+    except OSError:
+        return None
+
+
+def mark_uploaded(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.replace(path, path[: -len(".json")] + ".uploaded.json")
+    except OSError:
+        pass
+
+
+def find_latest_pending() -> Optional[str]:
+    d = get_results_dir()
+    try:
+        files = sorted(
+            f for f in os.listdir(d) if f.endswith(".json") and not f.endswith(".uploaded.json")
+        )
+    except OSError:
+        return None
+    return os.path.join(d, files[-1]) if files else None
+
+
+def server_busy(endpoint: str, api_key: Optional[str] = None) -> Optional[bool]:
+    """llama.cpp-style /slots: True if any slot is processing another request, None if unknown."""
+    root = re.sub(r"/v1/?$", "", endpoint.rstrip("/"))
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    try:
+        data = http_json(f"{root}/slots", headers=headers, timeout=3.0)
+    except Exception:
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    busy = False
+    for slot in data:
+        if not isinstance(slot, dict):
+            continue
+        if slot.get("is_processing") is True or slot.get("state") == 1:
+            busy = True
+    return busy
+
+
 def personal_best_info(ranking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Normalise "is this upload a personal best?" across backend versions.
 
@@ -2759,7 +2861,10 @@ def print_upload_ceremony(
     is_king = bool(ranking and same_hw_rank == 1 and not is_sole_hw and pb["is_pb"])
     is_pioneer = bool(ranking and same_hw_rank == 1 and is_sole_hw and pb["is_pb"])
 
-    if is_king:
+    review = review_notice(resp)
+    if review and not ranking:
+        title = "★ 成绩已提交，等待人工审核后上榜 ★"
+    elif is_king:
         title = "★ 新王登基！你的本机实测已登顶同配置同模型榜首！ ★"
     elif is_pioneer:
         title = "★ 首位开荒！你为该配置+模型立下了首条实测基准！ ★"
@@ -2842,7 +2947,7 @@ def print_upload_ceremony(
                 f"  ★ 同模型速度排名：第 {_c(str(same_model_rank), '1;36')} / {same_model_total} 名"
             )
 
-    community_lines: List[str] = []
+    community_lines: List[str] = [f"  ! {line}" for line in review]
     if resp.get("total_contributors"):
         community_lines.append(
             f"  ◆ 全站已汇聚 {resp.get('total_samples') or 1} 条真实测速，感谢第 {resp.get('total_contributors')} 位贡献者！"
@@ -2897,6 +3002,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_console()
     raw_argv = sys.argv[1:] if argv is None else argv
     args = parse_args(raw_argv)
+
+    if args.resubmit:
+        return resubmit(args.resubmit, args.submit_url, args.stats_url)
 
     if args.detect_only:
         hw = resolve_hardware(args)
@@ -3033,6 +3141,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         model_name = args.model or models[0]
         ctx_str = args.ctx or DEFAULT_CTX_STR
+        print(f"▸ 测试模型：{_c(model_name, '1')}", file=sys.stderr)
+        if not args.model and len(models) > 1:
+            others = "、".join(models[1:6]) + ("…" if len(models) > 6 else "")
+            print(
+                _c(f"  ! 服务上加载了 {len(models)} 个模型，默认测第一个；如需测其它模型（{others}）请加 --model <模型名>", "33"),
+                file=sys.stderr,
+            )
         if not args.engine:
             args.engine = infer_engine_auto(endpoint, model_name, api_key=args.api_key)
         if not args.quant:
@@ -3100,47 +3215,92 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n--- 即将上传的完整明文 JSON（零个人隐私，请核对） ---")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
+    saved_path = save_pending_payload(payload)
+
     if args.dry_run:
         print(_c("\n✓ 试运行完成（--dry-run 模式，未上传数据）。", "32"), file=sys.stderr)
+        if saved_path:
+            print(f"  成绩已保存到 {saved_path}，之后可用 --resubmit \"{saved_path}\" 上传。", file=sys.stderr)
         return 0
 
     if not args.yes:
         if not interactive:
             print("未传入 --yes，跳过上传（如需自动上传请加 --yes）。", file=sys.stderr)
+            if saved_path:
+                print(f"成绩已保存到 {saved_path}，之后可用 --resubmit 上传。", file=sys.stderr)
             return 0
         try:
             ans = input("\n确认将这份实测成绩上传至 itbanana.com 速度天梯图？[Y/n，直接回车立即上榜]：").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            print("\n已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
+            print("\n已取消上传，本次测速成绩仅保留在本地。", file=sys.stderr)
             return 0
         if ans and ans not in ("y", "yes"):
-            print("已取消上传，本次测速成绩仅保留在本地终端。", file=sys.stderr)
+            print("已取消上传，本次测速成绩仅保留在本地。", file=sys.stderr)
+            if saved_path:
+                print(f"  （已保存到 {saved_path}，改主意了可用 --resubmit 上传）", file=sys.stderr)
             return 0
 
+    return upload_payload(payload, args.submit_url, args.stats_url, saved_path)
+
+
+def upload_payload(
+    payload: Dict[str, Any],
+    submit_url: str,
+    stats_url: Optional[str],
+    saved_path: Optional[str] = None,
+) -> int:
+    """Upload a finished payload, then show the ranking card. Shared by normal runs and --resubmit."""
     print("\n▸ 正在将实测成绩刻入 itbanana.com 速度天梯图...", file=sys.stderr)
+    retry_hint = (
+        f"\n  成绩已保存在 {saved_path}，网络恢复后运行：python speedtest.py --resubmit" if saved_path else ""
+    )
     try:
-        resp = http_json(args.submit_url, payload=payload, timeout=15.0)
+        resp = http_json(submit_url, payload=payload, timeout=30.0)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="ignore")
-        print(_c(f"\n✗ 上传失败（HTTP {e.code}）：{detail}", "1;31"), file=sys.stderr)
+        try:
+            detail = json.loads(detail).get("error") or detail
+        except Exception:
+            pass
+        print(_c(f"\n✗ 上传失败（HTTP {e.code}）：{detail}", "1;31") + (retry_hint if e.code in (429, 500, 502, 503, 504) else ""), file=sys.stderr)
         return 1
     except Exception as e:
-        print(_c(f"\n✗ 上传失败：{e}", "1;31"), file=sys.stderr)
+        print(_c(f"\n✗ 上传失败：{e}", "1;31") + retry_hint, file=sys.stderr)
         return 1
 
-    # Optionally fetch aggregate stats for this hardware + model
+    mark_uploaded(saved_path)
+
     stats: Optional[Dict[str, Any]] = None
+    hw = payload.get("hardware") or {}
     hw_id = hw.get("hw_id")
-    model_id = payload["model"].get("model_id")
-    if hw_id and model_id and args.stats_url:
+    model_id = (payload.get("model") or {}).get("model_id")
+    if hw_id and model_id and stats_url:
         try:
-            q = urllib.parse.urlencode({"hw_id": hw_id, "model_id": model_id, "gpu_count": hw["gpu_count"]})
-            stats = http_json(f"{args.stats_url}?{q}", timeout=5.0)
+            q = urllib.parse.urlencode({"hw_id": hw_id, "model_id": model_id, "gpu_count": hw.get("gpu_count") or 1})
+            stats = http_json(f"{stats_url}?{q}", timeout=5.0)
         except Exception:
             pass
 
     print_upload_ceremony(payload, resp, stats=stats)
     return 0
+
+
+def resubmit(target: str, submit_url: str, stats_url: Optional[str]) -> int:
+    path = find_latest_pending() if target == "latest" else os.path.expanduser(target)
+    if not path or not os.path.isfile(path):
+        print(_c("✗ 没有找到待上传的成绩文件。", "1;31") + f"（保存目录：{get_results_dir()}）", file=sys.stderr)
+        return 1
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError) as e:
+        print(_c(f"✗ 读取成绩文件失败：{e}", "1;31"), file=sys.stderr)
+        return 1
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        print(_c("✗ 这不是 llm-speedtest 保存的成绩文件。", "1;31"), file=sys.stderr)
+        return 1
+    print(f"▸ 重新上传 {path}", file=sys.stderr)
+    return upload_payload(payload, submit_url, stats_url, saved_path=path)
 
 
 def cli(argv: Optional[List[str]] = None) -> int:

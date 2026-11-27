@@ -1235,3 +1235,140 @@ class TierRunnerTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 speedtest.run_benchmark_tiers("http://127.0.0.1:1/v1", "m", [1024], 256, 3, warmup=False,
                                               log=lambda m, c=None: None)
+
+
+class EdgeCaseTests(unittest.TestCase):
+    """Pending review notices, saved payloads + --resubmit, busy server detection, multi-model hint."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"LLM_SPEEDTEST_CLIENT_ID_FILE": os.path.join(self._tmp.name, "client_id")})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _server(self, routes):
+        """routes: {(method, path): callable(body) -> (status, json_obj)}"""
+        calls: List[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def _handle(self, method):
+                n = int(self.headers.get("Content-Length", "0") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else None
+                path = self.path.split("?")[0]
+                calls.append(f"{method} {path}")
+                fn = routes.get((method, path))
+                status, obj = fn(body) if fn else (404, {"error": "not found"})
+                raw = json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def do_POST(self):
+                self._handle("POST")
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}", calls
+
+    def test_review_notice_explains_flagged_and_dropped(self):
+        notes = speedtest.review_notice({
+            "results": [
+                {"ctx_tier": "1k", "status": "flagged", "flag_reason": "outlier_vs_median:5.95x"},
+                {"ctx_tier": "32k", "status": "approved"},
+            ],
+            "dropped": [{"index": 2, "error": "results[2] 数值字段无效或超出范围"}],
+        })
+        self.assertEqual(len(notes), 2)
+        self.assertIn("[1k]", notes[0])
+        self.assertIn("明显高于同配置其他用户", notes[0])
+        self.assertIn("人工审核", notes[0])
+        self.assertIn("1 档数据未通过", notes[1])
+        self.assertEqual(speedtest.review_notice({"results": [{"status": "approved"}]}), [])
+
+    def test_ceremony_shows_pending_review_instead_of_congrats(self):
+        payload = {"hardware": {"hw_raw": "RTX 4090"}, "software": {}, "model": {"model_raw": "m"},
+                   "results": [{"ctx_prompt": 1024, "tg_tps": 1000}]}
+        resp = {"record_id": 9, "results": [{"ctx_tier": "1k", "status": "flagged", "flag_reason": "unknown_hw_id:rtx9090"}]}
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            speedtest.print_upload_ceremony(payload, resp, None)
+        out = buf.getvalue()
+        self.assertIn("等待人工审核", out)
+        self.assertIn("硬件型号还没有收录", out)
+        self.assertNotIn("成功上榜", out)
+
+    def test_failed_upload_is_saved_and_resubmit_uploads_it(self):
+        state = {"fail": True, "got": []}
+
+        def submit(body):
+            if state["fail"]:
+                return 503, {"ok": False, "error": "服务暂时不可用"}
+            state["got"].append(body)
+            return 200, {"ok": True, "record_id": 1, "results": [{"id": 1, "status": "approved", "ctx_tier": "1k"}]}
+
+        base, _ = self._server({("POST", "/submit"): submit})
+        payload = {"schema_version": 1, "hardware": {"hw_raw": "x"}, "model": {"model_raw": "m"},
+                   "results": [{"ctx_prompt": 1024, "tg_tps": 50}]}
+        path = speedtest.save_pending_payload(payload)
+        self.assertTrue(path and path.endswith(".json"))
+
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            code = speedtest.upload_payload(payload, f"{base}/submit", None, saved_path=path)
+        self.assertEqual(code, 1)
+        self.assertIn("--resubmit", buf.getvalue())
+        self.assertEqual(speedtest.find_latest_pending(), path)
+
+        state["fail"] = False
+        with mock.patch("sys.stderr", io.StringIO()):
+            code = speedtest.cli(["--resubmit", "--submit-url", f"{base}/submit", "--stats-url", ""])
+        self.assertEqual(code, 0)
+        self.assertEqual(state["got"][0]["results"][0]["tg_tps"], 50)
+        self.assertIsNone(speedtest.find_latest_pending())  # marked as uploaded
+
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(speedtest.cli(["--resubmit"]), 1)
+        self.assertIn("没有找到待上传的成绩", err.getvalue())
+
+    def test_server_busy_reads_llamacpp_slots(self):
+        base, _ = self._server({("GET", "/slots"): lambda b: (200, [{"id": 0, "is_processing": True}, {"id": 1, "is_processing": False}])})
+        self.assertTrue(speedtest.server_busy(f"{base}/v1"))
+        base2, _ = self._server({("GET", "/slots"): lambda b: (200, [{"id": 0, "state": 0}])})
+        self.assertFalse(speedtest.server_busy(f"{base2}/v1"))
+        base3, _ = self._server({})
+        self.assertIsNone(speedtest.server_busy(f"{base3}/v1"))  # /slots disabled or not llama.cpp
+
+    def test_busy_warning_is_emitted_before_benchmark(self):
+        lines: List[str] = []
+        with mock.patch.object(speedtest, "server_busy", return_value=True), \
+                mock.patch.object(speedtest, "benchmark_context", return_value=({"ctx_prompt": 1024, "pp_tps": 1}, 5.6)):
+            speedtest.run_benchmark_tiers("http://127.0.0.1:1/v1", "m", [1024], 64, 1, warmup=False,
+                                          log=lambda m, c=None: lines.append(m))
+        self.assertTrue(any("正在处理其他请求" in ln for ln in lines))
+
+    def test_non_interactive_run_names_the_model_and_warns_about_others(self):
+        def chat(body):
+            return 200, {}
+
+        base, _ = self._server({("GET", "/v1/models"): lambda b: (200, {"data": [{"id": "model-a"}, {"id": "model-b"}]})})
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), mock.patch("sys.stdout", io.StringIO()), \
+                mock.patch.object(speedtest, "run_benchmark_tiers", return_value=[]):
+            speedtest.cli(["--endpoint", f"{base}/v1", "--non-interactive", "--dry-run", "--hw-id", "rtx4090"])
+        out = err.getvalue()
+        self.assertIn("测试模型：", out)
+        self.assertIn("model-a", out)
+        self.assertIn("--model", out)

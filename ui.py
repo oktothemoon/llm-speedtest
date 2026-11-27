@@ -763,6 +763,12 @@ $('btn-upload').onclick = async () => {{
       extraLine += `${{extraLine ? ' ' : ''}}${{refTxt}}`;
     }}
 
+    const reviewNotes = Array.isArray(res.review_notes) ? res.review_notes : [];
+    if (reviewNotes.length) {{
+      if (!ranking) celebTitle = '⏳ 成绩已提交，等待人工审核后上榜';
+      const escTxt = (t) => String(t).replace(/[&<>"]/g, (c) => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }}[c]));
+      extraLine = reviewNotes.map((n) => '⚠ ' + escTxt(n)).join(' ') + (extraLine ? ' ' + extraLine : '');
+    }}
     const ctaText = ranking
       ? (bestRecId && bestRecId !== recId
         ? `🏆 去速度天梯图查看我的最佳成绩 #${{bestRecId}} 排名与同卡配方 →`
@@ -1093,7 +1099,12 @@ def create_ui_server(
                         stats = st_module.http_json(f"{stats_url}?{q}", timeout=5.0)
                     except Exception:
                         pass
-                self._send_json(200, {"ok": True, "response": resp, "stats": stats})
+                self._send_json(200, {
+                    "ok": True,
+                    "response": resp,
+                    "stats": stats,
+                    "review_notes": st_module.review_notice(resp) if isinstance(resp, dict) else [],
+                })
             else:
                 self._send_json(404, {"error": "Not found"})
 

@@ -87,6 +87,7 @@ cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-onl
 | `--ram-type` / `--ram-channels` | 内存代数（`DDR4`/`DDR5` 等）与通道数 |
 | `--detect-only` | 仅打印本机自动识别的硬件规格并退出 |
 | `--dry-run` / `--non-interactive` / `--yes` | 仅测不传 / 关闭交互向导 / 免确认直接上传 |
+| `--resubmit [文件]` | 重新上传之前保存的成绩（每次测完都会自动保存到 `~/.config/llm-speedtest/results/`（Windows 为 `%APPDATA%\llm-speedtest\results\`），上传失败或暂不上传时可稍后补传；不填文件则取最近一次未上传成功的成绩） |
 
 ---
 
