@@ -25,7 +25,7 @@
 > - 🏷️ **支持自由署名 & 留下一句话调优配方**（如引擎版本、KV Cache 精度、MTP 开关等），晒出你的神级调优，也让同卡玩家直接抄作业
 > - 🔒 **100% 本机实测锁定硬件**，真实可信、零水分、零个人隐私采集
 
-支持所有本机运行中的 OpenAI 兼容接口（`llama.cpp`、`Strata`、`vLLM`、`SGLang`、`Ollama`、`LM Studio`、`MLX`、`Project Maya` 等）。
+支持所有本机运行中的 OpenAI 兼容接口（`llama.cpp`、`Strata`、`Basalt`、`vLLM`、`SGLang`、`Ollama`、`LM Studio`、`MLX`、`Project Maya` 等）。
 
 > **仅限本机实测**：为保证硬件规格 100% 真实可信，本工具仅允许在运行大模型的本机测速（`127.0.0.1` / `localhost` / 本机网卡 IP）。如果模型跑在远端 Linux 服务器上，请先 SSH 登录后直接在该服务器上运行。
 
@@ -106,6 +106,9 @@ cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-onl
 - 先发 1 次短预热请求（不计入成绩），避免冷启动影响。
 - 每轮 prompt 开头带有不同的随机轮次标识，防止引擎命中 KV 前缀缓存导致读题速度虚高。
 - 优先读取引擎精确返回的 `timings`（`predicted_per_second` / `prompt_per_second`），同时独立记录客户端 SSE 流式测算的 `sse_tg_tps` 供服务端交叉校验。
+- Ollama 自动改走原生 `/api/chat` 接口，读取引擎内部计时（`prompt_eval_duration` / `eval_duration`），并通过 `/api/ps` 读取实际分配的上下文长度，超出的档位自动跳过（Ollama 的 OpenAI 兼容接口会静默截断超长输入）。
+- 服务端返回 MTP / 推测解码草稿统计（`draft_n` / `draft_n_accepted`）时自动记为开启 MTP，并记录每档的草稿接受率；Strata / Basalt 默认开启 MTP，开关对成绩影响极大，未能确认时会要求填写。
+- 多张不同型号显卡都加载了模型时（如 RTX 5090 + RTX 5060 Ti），成绩会附带 `gpu_mix` 标记为混搭配置，不按单卡排名。
 - 自动识别常见魔改大显存卡（例如根据 `RTX 4090` + `48GB` 显存自动映射为 `rtx4090-48`）。
 
 ## 运行自测

@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.17"
+CLIENT_VERSION = "0.3.19"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -43,6 +43,8 @@ CLIENT_ID_RE = re.compile(r"^[0-9a-fA-F-]{16,64}$")
 LADDER_MIN_GEN_TOKENS = 64
 # 记录不接受 ignore_eos 参数的本机服务（首次 400/422 后自动去掉该参数重试，后续请求不再携带）
 _NO_IGNORE_EOS_ENDPOINTS: set = set()
+# endpoint -> Ollama 原生 API 根地址（None 表示不是 Ollama 或原生接口不可用）
+_OLLAMA_NATIVE_ROOTS: Dict[str, Optional[str]] = {}
 
 
 def clean_client_id(val: Optional[str]) -> Optional[str]:
@@ -370,6 +372,9 @@ HW_DEFAULT_VRAM = {
 
 def infer_engine_from_text(text: str) -> Optional[str]:
     low = (text or "").lower()
+    # Basalt 是 Strata 的 Blackwell 专用分叉，名字/日志里可能同时出现 strata，必须先判断
+    if re.search(r"\bbasalt\b", low):
+        return "basalt"
     if re.search(r"\bstrata\b", low):
         return "strata"
     if re.search(r"\b(?:llama\.?cpp|llamacpp|llama[-_]?server|ik[-_]?llama|ollama|lm\s*studio|koboldcpp)\b", low):
@@ -419,7 +424,7 @@ def _detect_local_process_engine(port: Optional[int]) -> Optional[str]:
     return None
 
 
-def _detect_http_engine(endpoint: str, api_key: Optional[str] = None) -> Optional[str]:
+def _detect_http_engine(endpoint: str, api_key: Optional[str] = None, shape_guess: bool = True) -> Optional[str]:
     """Inspect local server HTTP Server header or /props build_info for engine name."""
     if not endpoint or not is_local_endpoint(endpoint):
         return None
@@ -446,11 +451,15 @@ def _detect_http_engine(endpoint: str, api_key: Optional[str] = None) -> Optiona
                                 eng = infer_engine_from_text(v)
                                 if eng:
                                     return eng
-                        for k in ("model_path", "model_alias", "model"):
-                            v = obj.get(k)
-                            if isinstance(v, str) and re.search(r"gsq[\s_-]*rco|ista[\s_-]*daslab", v, re.IGNORECASE):
-                                return "strata"
-                        if any(k in obj for k in ("default_generation_settings", "total_slots")):
+                        model_strs = [obj.get(k) for k in ("model_path", "model_alias", "model")]
+                        model_strs = [v for v in model_strs if isinstance(v, str)]
+                        # Basalt 的权重是单个 .basalt 文件；GSQ-RCO 量化 Strata 和 Basalt 都支持，不能直接判成 Strata
+                        if any(re.search(r"\.basalt\b", v, re.IGNORECASE) for v in model_strs):
+                            return "basalt"
+                        if any(re.search(r"gsq[\s_-]*rco|ista[\s_-]*daslab", v, re.IGNORECASE) for v in model_strs):
+                            return "strata"
+                        # 只凭 /props 的结构猜 llama.cpp 是弱信号（Strata/Basalt 也提供同结构的 /props）
+                        if shape_guess and any(k in obj for k in ("default_generation_settings", "total_slots")):
                             return "llamacpp"
         except Exception:
             continue
@@ -459,8 +468,9 @@ def _detect_http_engine(endpoint: str, api_key: Optional[str] = None) -> Optiona
 
 def infer_engine_auto(endpoint: str, model_name: str, api_key: Optional[str] = None) -> Optional[str]:
     """Best-effort engine detection from model name, local process name, HTTP headers, or port."""
-    if "gsq-rco" in (model_name or "").lower():
-        return "strata"
+    low_model = (model_name or "").lower()
+    if re.search(r"\.basalt\b|\bbasalt\b", low_model):
+        return "basalt"
     try:
         port = urllib.parse.urlparse(endpoint).port
     except Exception:
@@ -469,9 +479,16 @@ def infer_engine_auto(endpoint: str, model_name: str, api_key: Optional[str] = N
         proc_eng = _detect_local_process_engine(port)
         if proc_eng:
             return proc_eng
-        http_eng = _detect_http_engine(endpoint, api_key=api_key)
+        http_eng = _detect_http_engine(endpoint, api_key=api_key, shape_guess=False)
         if http_eng:
             return http_eng
+    # 模型名带 GSQ-RCO、又没有进程名 / 服务头 / .basalt 文件等明确线索时，按 Strata 兜底（Basalt 也支持该量化）
+    if "gsq-rco" in low_model:
+        return "strata"
+    if endpoint and is_local_endpoint(endpoint):
+        shape_eng = _detect_http_engine(endpoint, api_key=api_key, shape_guess=True)
+        if shape_eng:
+            return shape_eng
     if port in (11434, 1234):
         return "llamacpp"
     return None
@@ -1196,11 +1213,17 @@ def detect_hardware() -> Dict[str, Any]:
         name, vram, count, others = choose_gpu_group([(g["name"], g["vram_gb"]) for g in pool])
         if nv_active and len(nv_active) < len(nv):
             _note(f"检测到 {len(nv)} 张 NVIDIA 显卡，其中 {len(nv_active)} 张已加载模型（显存占用 ≥{NV_ACTIVE_USED_MB // 1024}GB），按这 {len(nv_active)} 张中的同型号卡统计。")
-        if others:
+        mix = gpu_mix_from(pool) if (nv_active and others) else None
+        if mix:
+            _note(f"检测到多卡混搭且都已加载模型（{format_gpu_mix(mix)}），成绩会标记为混搭配置，不按单卡 {name} 排名。")
+        elif others:
             _note(f"检测到不同型号的显卡（{'、'.join(others)}），按 {name} ×{count} 统计；如不对请用 --hw-id / --gpu-count 手动指定。")
         if other_dgpu:
             _note(f"同时检测到非 NVIDIA 显卡（{'、'.join(g[0] for g in other_dgpu)}），按 NVIDIA 显卡统计；如模型实际跑在其它卡上请用 --hw-id 指定。")
-        return _gpu_spec(name, vram, count)
+        spec = _gpu_spec(name, vram, count)
+        if mix:
+            spec["gpu_mix"] = mix
+        return spec
 
     if nv and other_dgpu:
         _note(f"NVIDIA 显卡（{nv[0]['name']}）上未发现已加载的模型，按 {other_dgpu[0][0]} 统计；如不对请用 --hw-id 手动指定。")
@@ -1271,6 +1294,28 @@ def parse_nvidia_smi(out: str) -> List[Dict[str, Any]]:
                 used = None  # e.g. "[N/A]"
         gpus.append({"name": parts[0], "vram_gb": vram, "used_mb": used})
     return gpus
+
+
+def gpu_mix_from(gpus: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group GPUs holding the model by model name: [{"name", "vram_gb", "count"}], largest first."""
+    mix: List[Dict[str, Any]] = []
+    for g in gpus:
+        for m in mix:
+            if m["name"] == g["name"]:
+                m["count"] += 1
+                break
+        else:
+            mix.append({"name": g["name"], "vram_gb": g.get("vram_gb"), "count": 1})
+    for m in mix:
+        # 服务端按各卡 hw_id 查带宽，核验混搭配置的物理速度上限
+        m["hw_id"] = map_gpu_id(m["name"], m["vram_gb"])
+    mix.sort(key=lambda m: (1 if m["hw_id"] else 0, m["vram_gb"] or 0), reverse=True)
+    return mix
+
+
+def format_gpu_mix(mix: List[Dict[str, Any]]) -> str:
+    short = lambda n: re.sub(r"^(?:NVIDIA\s+)?(?:GeForce\s+)?", "", n).strip()
+    return " + ".join(f"{short(m['name'])}" + (f" ×{m['count']}" if m["count"] > 1 else "") for m in mix)
 
 
 def choose_gpu_group(cands: List[Tuple[str, Optional[int]]]) -> Tuple[str, Optional[int], int, List[str]]:
@@ -1511,7 +1556,7 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
 
 
 _LLM_PROC_TIER1 = (
-    "strata", "llama", "ollama", "lmstudio", "lm-studio", "lms",
+    "strata", "basalt", "llama", "ollama", "lmstudio", "lm-studio", "lms",
     "vllm", "sglang", "mlx", "maya", "kobold", "tabby", "jan",
     "gpt4all", "localai", "exllama", "ik_llama", "llamafile",
 )
@@ -1931,7 +1976,21 @@ def detect_server_ctx_limit(endpoint: str, api_key: Optional[str] = None) -> Opt
     except Exception:
         pass
 
-    # 2. vLLM / SGLang / llama.cpp /v1/models metadata
+    # 2. Ollama：/api/ps 返回当前已加载模型实际分配的 context_length（OpenAI 接口超长会被静默截断）
+    o_root = ollama_native_root(endpoint, api_key=api_key)
+    if o_root:
+        try:
+            ps = http_json(f"{o_root}/api/ps", headers=headers, timeout=2.0)
+            models = ps.get("models") if isinstance(ps, dict) else None
+            if isinstance(models, list):
+                lens = [int(m["context_length"]) for m in models
+                        if isinstance(m, dict) and isinstance(m.get("context_length"), int) and m["context_length"] > 0]
+                if lens:
+                    return max(lens)
+        except Exception:
+            pass
+
+    # 3. vLLM / SGLang / llama.cpp /v1/models metadata
     try:
         data = http_json(f"{ep}/models", headers=headers, timeout=2.0)
         items = data.get("data") if isinstance(data, dict) else None
@@ -1989,6 +2048,112 @@ def build_prompt(target_tokens: int, nonce: str, chars_per_token: float = 5.6) -
     return header + body
 
 
+def ollama_native_root(endpoint: str, api_key: Optional[str] = None) -> Optional[str]:
+    """Return the Ollama native API root (e.g. http://127.0.0.1:11434) when the endpoint is Ollama, else None.
+
+    Ollama's OpenAI-compatible /v1 stream carries no server-side timings, but its native /api/chat
+    reports prompt_eval_duration / eval_duration measured inside the engine, so we prefer that.
+    """
+    ep = (endpoint or "").rstrip("/")
+    if ep in _OLLAMA_NATIVE_ROOTS:
+        return _OLLAMA_NATIVE_ROOTS[ep]
+    root: Optional[str] = None
+    if ep and is_local_endpoint(ep):
+        cand = re.sub(r"/v1$", "", ep, flags=re.IGNORECASE)
+        headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            data = http_json(f"{cand}/api/version", headers=headers, timeout=1.5)
+            if isinstance(data, dict) and isinstance(data.get("version"), str) and data["version"]:
+                root = cand
+        except Exception:
+            root = None
+    _OLLAMA_NATIVE_ROOTS[ep] = root
+    return root
+
+
+def _run_ollama_native_completion(
+    root: str,
+    model_name: str,
+    prompt: str,
+    gen_tokens: int,
+    api_key: Optional[str] = None,
+    timeout: float = 300.0,
+) -> Dict[str, Any]:
+    """Stream one request through Ollama's native /api/chat and convert its engine timings."""
+    body: Dict[str, Any] = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "options": {"temperature": 0, "num_predict": gen_tokens},
+    }
+    headers = {"Content-Type": "application/json", "Accept": "application/x-ndjson", "User-Agent": USER_AGENT}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(f"{root}/api/chat", data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    t_start = time.perf_counter()
+    t_first: Optional[float] = None
+    t_end: Optional[float] = None
+    final: Dict[str, Any] = {}
+    with _urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("error"):
+                raise RuntimeError(f"Ollama error: {obj.get('error')}")
+            msg = obj.get("message") or {}
+            piece = (msg.get("content") or "") + (msg.get("thinking") or "") if isinstance(msg, dict) else ""
+            if piece:
+                now = time.perf_counter()
+                if t_first is None:
+                    t_first = now
+                t_end = now
+            if obj.get("done"):
+                final = obj
+                break
+    if t_end is None:
+        t_end = time.perf_counter()
+    if t_first is None:
+        raise RuntimeError("Server returned no generated tokens.")
+
+    ttft_s = max(0.001, t_first - t_start)
+    decode_s = max(0.001, t_end - t_first)
+    eval_n = int(final.get("eval_count") or 0)
+    eval_ns = float(final.get("eval_duration") or 0)
+    prompt_n = int(final.get("prompt_eval_count") or 0)
+    prompt_ns = float(final.get("prompt_eval_duration") or 0)
+    completion_tokens = max(1, eval_n)
+    prompt_tokens = prompt_n or max(1, round(len(prompt) / 4))
+    sse_tg_tps = max(0.1, (max(1, completion_tokens - 1)) / decode_s) if completion_tokens > 1 else max(0.1, 1.0 / ttft_s)
+
+    if eval_n > 0 and eval_ns > 0:
+        tg_tps = eval_n / (eval_ns / 1e9)
+        pp_tps = prompt_n / (prompt_ns / 1e9) if (prompt_n > 0 and prompt_ns > 0) else max(0.1, prompt_tokens / ttft_s)
+        source = "timings"
+    else:
+        tg_tps = sse_tg_tps
+        pp_tps = max(0.1, prompt_tokens / ttft_s)
+        source = "sse"
+    return {
+        "prompt_tokens": prompt_tokens,
+        "gen_tokens": completion_tokens,
+        "tg_tps": round(tg_tps, 2),
+        "pp_tps": round(pp_tps, 2),
+        "sse_tg_tps": round(sse_tg_tps, 2),
+        "ttft_ms": round(ttft_s * 1000.0, 1),
+        "source": source,
+        "tokens_estimated": eval_n <= 0,
+    }
+
+
 def run_single_completion(
     endpoint: str,
     model_name: str,
@@ -1998,6 +2163,18 @@ def run_single_completion(
     timeout: float = 300.0,
     ttft_overhead_s: float = 0.0,
 ) -> Dict[str, Any]:
+    ollama_root = ollama_native_root(endpoint, api_key=api_key)
+    if ollama_root:
+        try:
+            return _run_ollama_native_completion(
+                ollama_root, model_name, prompt, gen_tokens, api_key=api_key, timeout=timeout
+            )
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 405, 501):
+                raise
+            # 原生接口不可用（反代只暴露了 /v1 等）：退回 OpenAI 兼容接口
+            _OLLAMA_NATIVE_ROOTS[endpoint.rstrip("/")] = None
+
     url = f"{endpoint.rstrip('/')}/chat/completions"
     ep_key = endpoint.rstrip("/")
     body: Dict[str, Any] = {
@@ -2118,7 +2295,29 @@ def run_single_completion(
         "ttft_ms": round(ttft_s * 1000.0, 1),
         "source": source,
         "tokens_estimated": tokens_estimated and source != "timings",
+        **_draft_stats(timings),
     }
+
+
+def _draft_stats(timings: Dict[str, Any]) -> Dict[str, Any]:
+    """llama.cpp-style servers report draft_n / draft_n_accepted when MTP or speculative decoding is on."""
+    try:
+        n = int(timings.get("draft_n") or 0)
+        acc = int(timings.get("draft_n_accepted") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if n <= 0:
+        return {}
+    return {"draft_n": n, "draft_accepted": max(0, min(acc, n))}
+
+
+# 默认开启 MTP、且 MTP 开关对成绩影响极大的引擎：必须记录 MTP 状态，天梯图才能分开排
+MTP_SENSITIVE_ENGINES = ("strata", "basalt")
+
+
+def infer_mtp_from_results(results: List[Dict[str, Any]]) -> Optional[bool]:
+    """True when the server reported draft tokens (MTP / speculative decoding active); otherwise unknown."""
+    return True if any((r or {}).get("draft_accept_rate") is not None for r in results) else None
 
 
 def measure_ttft_overhead(
@@ -2207,6 +2406,7 @@ def benchmark_context(
         emit(
             f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33') if log is None else r['tg_tps']} tok/s | "
             f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）"
+            + (f" | MTP 接受率 {r['draft_accepted'] / r['draft_n']:.0%}" if r.get("draft_n") else "")
         )
 
     for w in tier_quality_warnings(samples, gen_tokens):
@@ -2222,6 +2422,9 @@ def benchmark_context(
         "runs": tier_runs,
         "source": "timings" if all(s["source"] == "timings" for s in samples) else "sse",
     }
+    draft_n = sum(int(s.get("draft_n") or 0) for s in samples)
+    if draft_n > 0:
+        res["draft_accept_rate"] = round(sum(int(s.get("draft_accepted") or 0) for s in samples) / draft_n, 3)
     return res, cpt
 
 
@@ -2372,7 +2575,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--model", help="指定要测试的模型名（默认取 /v1/models 返回的第一个模型）")
     p.add_argument("--model-id", help="标准模型 ID（例如 qwen38-flash-next、qwen38-27b）")
     p.add_argument("--quant", help="量化版本（例如 'GSQ-RCO IQ3_S'、'Q4_K_M'、'FP8'）")
-    p.add_argument("--engine", help="推理引擎（strata / llamacpp / vllm / sglang / mlx / maya）")
+    p.add_argument("--engine", help="推理引擎（strata / basalt / llamacpp / vllm / sglang / mlx / maya）")
     p.add_argument("--engine-version", help="推理引擎版本号（例如 0.2.15）")
     p.add_argument("--backend", help="计算后端（cuda / rocm / vulkan / metal）")
     p.add_argument("--kv-cache", help="KV Cache 精度（f16 / bf16 / fp8 / int8 / q8_0 / q4_0 / int4）")
@@ -2798,8 +3001,9 @@ def run_interactive_wizard(
     q_part = f" | 量化: {guessed_q}" if guessed_q else ""
     kv_part = f" | KV: {normalize_kv_cache(args.kv_cache)}" if args.kv_cache else ""
     lim_part = f"（服务上限 ≈{format_ctx_label(detected_ctx_limit)}，超限档位自动跳过）" if detected_ctx_limit else ""
+    hw_label = f"{format_gpu_mix(hw['gpu_mix'])}（混搭）" if hw.get("gpu_mix") else f"{hw['hw_raw'] + vram_part} ×{hw['gpu_count']}"
     print(
-        f"\n◆ 即将测速：{_c(hw['hw_raw'] + vram_part, '1')} ×{hw['gpu_count']}{ram_part}{ddr_part}"
+        f"\n◆ 即将测速：{_c(hw_label, '1')}{ram_part}{ddr_part}"
         f" | 模型: {_c(model_name, '1')}{q_part}{eng_part}{kv_part}",
         file=sys.stderr,
     )
@@ -2812,6 +3016,12 @@ def run_interactive_wizard(
         missing.append("KV如 kv int8/q8_0/fp8/f16")
     if hw.get("kind") == "gpu" and not hw.get("ram_type"):
         missing.append("内存如 DDR4/DDR5 双通道")
+    if args.mtp is None and (args.engine or "").lower() in MTP_SENSITIVE_ENGINES:
+        ans = _ask(f"{args.engine} 默认开启 MTP，开关对生成速度影响很大。本次是否开启了 MTP？[y=开启 / n=关闭 / 回车=不确定]").lower()
+        if ans in ("y", "yes", "1", "开", "开启", "是"):
+            args.mtp = "true"
+        elif ans in ("n", "no", "0", "关", "关闭", "否"):
+            args.mtp = "false"
     if args.mtp is None:
         missing.append("开MTP/不开MTP")
     if missing:
@@ -3373,6 +3583,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not results:
         print(_c("✗ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)
         return 1
+
+    if args.mtp is None and infer_mtp_from_results(results):
+        args.mtp = "true"
+        print("▸ 推理服务返回了 MTP / 推测解码草稿统计，已自动记为「开启 MTP」。", file=sys.stderr)
+    if args.mtp is None and (args.engine or "").lower() in MTP_SENSITIVE_ENGINES:
+        print(
+            _c(f"! {args.engine} 的 MTP 开关对成绩影响很大，但本次未能确认是否开启；"
+               f"建议加 --mtp true/false 重新上传，否则天梯图无法与同配置成绩对比。", "33"),
+            file=sys.stderr,
+        )
 
     resolved_model_id = args.model_id or map_model_id(model_name)
     resolved_model_raw = resolve_model_raw(endpoint, model_name, model_id=resolved_model_id, api_key=args.api_key)

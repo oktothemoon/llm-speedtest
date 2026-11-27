@@ -8,10 +8,10 @@
 不要替用户下载模型，直接检查本机已经跑起来的 OpenAI 兼容服务：
 
 1. 运行 `python3 speedtest.py --detect-only` 检查脚本自动识别的本机硬件规格（显卡型号、显存、内存）。
-2. 如用户没有告知端口，检查本机常见推理端口（`8080`、`11434`、`1234`、`8000`、`30000`、`8081`）或查看当前运行的推理进程名（如 `llama-server`、`strata`、`vllm`、`sglang`、`ollama`、`mlx`、`maya`）。
+2. 如用户没有告知端口，检查本机常见推理端口（`8080`、`11434`、`1234`、`8000`、`30000`、`8081`）或查看当前运行的推理进程名（如 `llama-server`、`strata`、`basalt`、`vllm`、`sglang`、`ollama`、`mlx`、`maya`）。
 
 从进程参数、启动命令或向用户确认中提取精确的元信息（**不要提取任何绝对路径、用户名或密钥**）：
-- `--engine`：`strata` / `llamacpp` / `vllm` / `sglang` / `mlx` / `maya`
+- `--engine`：`strata` / `basalt` / `llamacpp` / `vllm` / `sglang` / `mlx` / `maya`
 - `--quant`：如 `GSQ-RCO IQ3_S`、`Q4_K_M`、`UD-Q4_K_XL`、`FP8`、`NVFP4`
 - `--kv-cache`：KV Cache 精度，如 `f16`、`bf16`、`fp8`、`int8`、`q8_0`、`q4_0`（从启动参数如 `-ctk`/`--cache-type-k`/`--kv-cache-dtype` 或向用户确认）
 - `--mtp`：`true` 或 `false`（确认是否开启 MTP / 推测解码）

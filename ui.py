@@ -281,6 +281,7 @@ def _render_html(token: str, default_submit_url: str) -> str:
         <select id="engine-select">
           <option value="">不确定 / 跳过</option>
           <option value="strata">Strata</option>
+          <option value="basalt">Basalt（Strata 的 50 系分叉）</option>
           <option value="llamacpp">llama.cpp / Ollama / LM Studio</option>
           <option value="vllm">vLLM</option>
           <option value="sglang">SGLang</option>
@@ -538,6 +539,11 @@ $('btn-run').onclick = async () => {{
   const model = $('model-select').value;
   if (!ep || !model) {{
     alert('请先连接本机推理服务并选择模型');
+    return;
+  }}
+  const engVal = $('engine-select').value;
+  if ((engVal === 'strata' || engVal === 'basalt') && mtpVal === '') {{
+    alert(engVal + ' 默认开启 MTP，开关对生成速度影响很大，请先选择本次是否开启了 MTP');
     return;
   }}
 
@@ -962,7 +968,7 @@ def create_ui_server(
                     "engine_version": None,
                     "backend": None,
                     "kv_cache": st_module.normalize_kv_cache(cfg.get("kv_cache")),
-                    "mtp": cfg.get("mtp"),
+                    "mtp": cfg.get("mtp") if cfg.get("mtp") is not None else st_module.infer_mtp_from_results(results),
                     "ctx_limit": ctx_limit,
                 },
                 "model": {

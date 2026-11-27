@@ -636,8 +636,9 @@ class EndToEndMockTests(unittest.TestCase):
 
     def test_interactive_wizard_flow_and_ceremony(self):
         base = f"http://127.0.0.1:{self.port}"
-        # Pick model #2, one optional note line with kv int8, nickname, tuning note, press Enter (default Y) to upload
-        answers = iter(["2", "DDR4 双通道 开MTP kv int8", "老曹", "Strata 0.2.15 + fa=on", ""])
+        # Pick model #2, skip the Strata MTP question (Enter), one optional note line with kv int8 + 开MTP,
+        # nickname, tuning note, press Enter (default Y) to upload
+        answers = iter(["2", "", "DDR4 双通道 开MTP kv int8", "老曹", "Strata 0.2.15 + fa=on", ""])
         err_buf = io.StringIO()
         with mock.patch("builtins.input", side_effect=lambda _prompt="": next(answers)), \
              mock.patch("sys.stderr", err_buf):
@@ -1632,3 +1633,140 @@ class RemeasureTests(unittest.TestCase):
                                           warmup=False, log=lambda m, c=None: lines.append(m))
         self.assertTrue(any("预计每轮约" in ln for ln in lines))
         self.assertFalse(any("最长等待" in ln for ln in lines))
+
+
+class OllamaNativeTimingTests(unittest.TestCase):
+    """Ollama: prefer native /api/chat engine timings over client-side SSE estimates."""
+
+    def _serve(self, native: bool = True):
+        seen: List[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def _json(self, code, data):
+                raw = json.dumps(data).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/api/version":
+                    self._json(200, {"version": "0.12.0"})
+                elif self.path == "/api/ps":
+                    self._json(200, {"models": [{"name": "qwen3:8b", "context_length": 32768}]})
+                elif self.path == "/v1/models":
+                    self._json(200, {"data": [{"id": "qwen3:8b"}]})
+                else:
+                    self._json(404, {})
+
+            def do_POST(self):
+                seen.append(self.path)
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode("utf-8"))
+                if self.path == "/api/chat" and not native:
+                    self._json(404, {"error": "not found"})
+                    return
+                self.send_response(200)
+                self.end_headers()
+                if self.path == "/api/chat":
+                    n = body["options"]["num_predict"]
+                    for i in range(n):
+                        self.wfile.write((json.dumps({"message": {"content": "tok "}, "done": False}) + "\n").encode())
+                    final = {"message": {"content": ""}, "done": True, "prompt_eval_count": 1000,
+                             "prompt_eval_duration": 500_000_000, "eval_count": n, "eval_duration": 1_000_000_000}
+                    self.wfile.write((json.dumps(final) + "\n").encode())
+                else:
+                    for _ in range(body["max_tokens"]):
+                        self.wfile.write(f"data: {json.dumps({'choices': [{'delta': {'content': 'tok '}}]})}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        speedtest._OLLAMA_NATIVE_ROOTS.clear()
+        speedtest._NO_IGNORE_EOS_ENDPOINTS.clear()
+        return f"http://127.0.0.1:{srv.server_address[1]}/v1", seen
+
+    def test_native_timings_are_used(self):
+        ep, seen = self._serve()
+        r = speedtest.run_single_completion(ep, "qwen3:8b", "hello", 64)
+        self.assertEqual(seen, ["/api/chat"])
+        self.assertEqual(r["source"], "timings")
+        self.assertEqual(r["tg_tps"], 64.0)
+        self.assertEqual(r["pp_tps"], 2000.0)
+        self.assertEqual(r["prompt_tokens"], 1000)
+        self.assertFalse(r["tokens_estimated"])
+
+    def test_ctx_limit_from_api_ps(self):
+        ep, _ = self._serve()
+        self.assertEqual(speedtest.detect_server_ctx_limit(ep), 32768)
+
+    def test_falls_back_to_openai_when_native_missing(self):
+        ep, seen = self._serve(native=False)
+        r = speedtest.run_single_completion(ep, "qwen3:8b", "hello", 64)
+        self.assertEqual(seen[0], "/api/chat")
+        self.assertEqual(seen[-1], "/v1/chat/completions")
+        self.assertEqual(r["source"], "sse")
+
+    def test_non_ollama_server_is_not_detected(self):
+        speedtest._OLLAMA_NATIVE_ROOTS.clear()
+        self.assertIsNone(speedtest.ollama_native_root("http://127.0.0.1:1/v1"))
+
+
+class BasaltAndMtpTests(unittest.TestCase):
+    """Basalt (Blackwell-only Strata fork) detection, MTP recording and mixed-GPU reporting."""
+
+    def test_basalt_name_wins_over_strata(self):
+        self.assertEqual(speedtest.infer_engine_from_text("basalt"), "basalt")
+        self.assertEqual(speedtest.infer_engine_from_text("Basalt (a Strata fork)"), "basalt")
+        self.assertEqual(speedtest.infer_engine_from_text("strata.exe"), "strata")
+
+    def test_basalt_model_file_is_not_reported_as_strata(self):
+        with mock.patch.object(speedtest, "is_local_endpoint", return_value=False):
+            self.assertEqual(
+                speedtest.infer_engine_auto("http://127.0.0.1:8080/v1", "Qwen3.8-FN-GSQ-RCO-Q2.basalt"), "basalt"
+            )
+            # 只有模型名带 GSQ-RCO 且没有其它线索时才兜底为 Strata
+            self.assertEqual(speedtest.infer_engine_auto("http://127.0.0.1:8080/v1", "Qwen3.8-FN-gsq-rco"), "strata")
+
+    def test_gsq_rco_process_signal_beats_model_name_fallback(self):
+        with mock.patch.object(speedtest, "is_local_endpoint", return_value=True), \
+                mock.patch.object(speedtest, "_detect_local_process_engine", return_value="basalt"):
+            self.assertEqual(speedtest.infer_engine_auto("http://127.0.0.1:8080/v1", "Qwen3.8-FN-gsq-rco"), "basalt")
+
+    def test_draft_stats_and_mtp_inference(self):
+        self.assertEqual(speedtest._draft_stats({"draft_n": 100, "draft_n_accepted": 77}),
+                         {"draft_n": 100, "draft_accepted": 77})
+        self.assertEqual(speedtest._draft_stats({}), {})
+        self.assertTrue(speedtest.infer_mtp_from_results([{"tg_tps": 1}, {"draft_accept_rate": 0.7}]))
+        self.assertIsNone(speedtest.infer_mtp_from_results([{"tg_tps": 1}]))
+
+    def _detect(self, smi: str):
+        def fake_run_cmd(cmd, timeout=5.0):
+            return smi if cmd[0] == "nvidia-smi" else ""
+
+        with mock.patch.object(speedtest, "run_cmd", side_effect=fake_run_cmd), \
+                mock.patch.object(speedtest, "normalize_os", return_value="linux"), \
+                mock.patch.object(speedtest, "detect_ram_gb", return_value=32), \
+                mock.patch.object(speedtest, "detect_cpu_raw", return_value="AMD Ryzen 9 9950X"), \
+                mock.patch.object(speedtest, "detect_ram_type", return_value="DDR5"), \
+                mock.patch("os.path.isdir", return_value=False):
+            speedtest.LAST_DETECT_NOTES.clear()
+            hw = speedtest.detect_hardware()
+        return hw, list(speedtest.LAST_DETECT_NOTES)
+
+    def test_busy_5090_plus_5060ti_is_reported_as_mix(self):
+        hw, notes = self._detect("NVIDIA GeForce RTX 5090, 32607, 30000\nNVIDIA GeForce RTX 5060 Ti, 16311, 14000\n")
+        self.assertIn("5090", hw["hw_raw"])
+        self.assertEqual([m["count"] for m in hw["gpu_mix"]], [1, 1])
+        self.assertIn("5060 Ti", hw["gpu_mix"][1]["name"])
+        self.assertEqual([m["hw_id"] for m in hw["gpu_mix"]], ["rtx5090", "rtx5060ti16"])
+        self.assertEqual(speedtest.format_gpu_mix(hw["gpu_mix"]), "RTX 5090 + RTX 5060 Ti")
+        self.assertTrue(any("混搭" in n for n in notes))
+
+    def test_idle_second_card_is_not_a_mix(self):
+        hw, _ = self._detect("NVIDIA GeForce RTX 5090, 32607, 30000\nNVIDIA GeForce RTX 5060 Ti, 16311, 300\n")
+        self.assertNotIn("gpu_mix", hw)
