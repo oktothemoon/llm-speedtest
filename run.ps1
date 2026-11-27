@@ -224,8 +224,15 @@ function Invoke-LlmSpeedtest {
 
     if (-not $syncedByGit) {
         Write-Info "正在下载最新测速脚本到 $InstallDir ..."
-        $ok1 = Download-FileSafe -Url "$BaseUrl/speedtest.py" -Dest $speedtestPath
-        $ok2 = Download-FileSafe -Url "$BaseUrl/ui.py" -Dest $uiPath
+        # 两个文件都下载成功后再一起替换，避免只更新了一个导致新旧版本混用
+        $ok1 = Download-FileSafe -Url "$BaseUrl/speedtest.py" -Dest "$speedtestPath.new"
+        $ok2 = $ok1 -and (Download-FileSafe -Url "$BaseUrl/ui.py" -Dest "$uiPath.new")
+        if ($ok1 -and $ok2) {
+            Move-Item -Path "$speedtestPath.new" -Destination $speedtestPath -Force
+            Move-Item -Path "$uiPath.new" -Destination $uiPath -Force
+        } else {
+            Remove-Item -Path "$speedtestPath.new", "$uiPath.new" -Force -ErrorAction SilentlyContinue
+        }
         if (-not ($ok1 -and $ok2)) {
             if ((Test-Path $speedtestPath) -and (Test-Path $uiPath)) {
                 Write-Warn "在线更新失败（可能是 GitHub 网络连接超时），将继续使用本地已有版本。"

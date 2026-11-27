@@ -1106,3 +1106,132 @@ class BenchmarkRobustnessTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn(tok, body)
         self.assertEqual(_get(f"localhost:{port}")[0], 200)
+
+
+class HardwareSelectionTests(unittest.TestCase):
+    """GPU counting for mixed cards, NVIDIA + AMD boxes and stale Windows adapters."""
+
+    def _detect(self, outputs: Dict[str, str], os_name: str = "linux"):
+        def fake_run_cmd(cmd, timeout=5.0):
+            return outputs.get(cmd[0], "")
+
+        with mock.patch.object(speedtest, "run_cmd", side_effect=fake_run_cmd), \
+                mock.patch.object(speedtest, "normalize_os", return_value=os_name), \
+                mock.patch.object(speedtest, "detect_ram_gb", return_value=64), \
+                mock.patch.object(speedtest, "detect_cpu_raw", return_value="AMD Ryzen 9 9950X"), \
+                mock.patch.object(speedtest, "detect_ram_type", return_value="DDR5"), \
+                mock.patch("os.path.isdir", return_value=False):
+            hw = speedtest.detect_hardware()
+        return hw, list(speedtest.LAST_DETECT_NOTES)
+
+    def test_parse_nvidia_smi_handles_na_memory_used(self):
+        gpus = speedtest.parse_nvidia_smi("NVIDIA GeForce RTX 4090, 24564, 21000\nNVIDIA GeForce RTX 3060, 12288, [N/A]\n")
+        self.assertEqual(gpus[0], {"name": "NVIDIA GeForce RTX 4090", "vram_gb": 24, "used_mb": 21000})
+        self.assertIsNone(gpus[1]["used_mb"])
+
+    def test_mixed_models_are_not_counted_as_same_card(self):
+        name, vram, count, others = speedtest.choose_gpu_group(
+            [("NVIDIA GeForce RTX 3060", 12), ("NVIDIA GeForce RTX 4090", 24)]
+        )
+        self.assertEqual((name, vram, count), ("NVIDIA GeForce RTX 4090", 24, 1))
+        self.assertEqual(others, ["NVIDIA GeForce RTX 3060"])
+
+    def test_only_gpus_holding_the_model_are_counted(self):
+        hw, notes = self._detect({"nvidia-smi": (
+            "NVIDIA GeForce RTX 4090, 24564, 22000\n"
+            "NVIDIA GeForce RTX 4090, 24564, 350\n"
+        )})
+        self.assertEqual(hw["gpu_count"], 1)
+        self.assertTrue(any("1 张已加载模型" in n for n in notes))
+
+    def test_two_identical_busy_gpus_count_as_two(self):
+        hw, notes = self._detect({"nvidia-smi": (
+            "NVIDIA GeForce RTX 4090, 24564, 20000\n"
+            "NVIDIA GeForce RTX 4090, 24564, 19000\n"
+        )})
+        self.assertEqual(hw["gpu_count"], 2)
+        self.assertEqual(notes, [])
+
+    def test_idle_nvidia_plus_amd_dgpu_reports_the_amd_card(self):
+        hw, notes = self._detect({
+            "nvidia-smi": "NVIDIA GeForce RTX 5070 Ti, 16303, 420\n",
+            "lspci": "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)\n",
+            "rocm-smi": "",
+        })
+        self.assertIn("R9700", hw["hw_raw"])
+        self.assertTrue(any("未发现已加载的模型" in n for n in notes))
+
+    def test_busy_nvidia_plus_amd_dgpu_reports_nvidia_with_note(self):
+        hw, notes = self._detect({
+            "nvidia-smi": "NVIDIA GeForce RTX 5070 Ti, 16303, 14000\n",
+            "lspci": "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)\n",
+        })
+        self.assertIn("5070 Ti", hw["hw_raw"])
+        self.assertTrue(any("非 NVIDIA" in n for n in notes))
+
+    def test_unknown_nvidia_usage_keeps_previous_behaviour(self):
+        hw, _ = self._detect({
+            "nvidia-smi": "NVIDIA GeForce RTX 5070 Ti, 16303, [N/A]\n",
+            "lspci": "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon AI PRO R9700] (rev c0)\n",
+        })
+        self.assertIn("5070 Ti", hw["hw_raw"])
+
+    def test_windows_lines_skip_nvidia_and_virtual_adapters(self):
+        cands = speedtest.parse_windows_gpu_lines(
+            "NVIDIA GeForce RTX 4090|25757220864\n"
+            "Microsoft Basic Display Adapter|0\n"
+            "AMD Radeon RX 7900 XTX|25753026560\n"
+            "AMD Radeon RX 7900 XTX|25753026560\n"
+        )
+        self.assertEqual(cands, [("AMD Radeon RX 7900 XTX", 24), ("AMD Radeon RX 7900 XTX", 24)])
+
+    def test_windows_query_starts_from_present_adapters(self):
+        # Stale registry entries for removed cards must not be enumerated on their own
+        self.assertIn("Win32_VideoController", speedtest._WIN_GPU_PS)
+        self.assertLess(
+            speedtest._WIN_GPU_PS.index("Get-CimInstance Win32_VideoController"),
+            speedtest._WIN_GPU_PS.index("ForEach-Object"),
+        )
+
+
+class TierRunnerTests(unittest.TestCase):
+    def test_long_context_timeout_scales_with_measured_prefill_speed(self):
+        base, est = speedtest.estimate_tier_timeout(262144, None)
+        self.assertEqual(base, 900.0)
+        self.assertIsNone(est)
+        # Slow box: 300 tok/s prefill at 128k → 256k needs far more than the fixed 900 s
+        t, est = speedtest.estimate_tier_timeout(262144, {"ctx_prompt": 131072, "pp_tps": 300})
+        self.assertGreater(est, 1500)
+        self.assertGreater(t, est)
+        self.assertLessEqual(t, speedtest.MAX_REQUEST_TIMEOUT)
+        # Fast box keeps the default
+        t, _ = speedtest.estimate_tier_timeout(262144, {"ctx_prompt": 131072, "pp_tps": 20000})
+        self.assertEqual(t, 900.0)
+
+    def test_shared_runner_keeps_finished_tiers_and_uses_log_callback(self):
+        lines: List[str] = []
+        calls: List[Dict[str, Any]] = []
+
+        def fake_bc(endpoint, model, target, gen, runs, **kw):
+            calls.append({"target": target, "timeout": kw.get("timeout")})
+            if target > 40000:
+                raise RuntimeError("out of memory")
+            return {"ctx_prompt": target, "pp_tps": 300.0, "tg_tps": 50.0, "gen_tokens": gen}, 5.6
+
+        with mock.patch.object(speedtest, "benchmark_context", side_effect=fake_bc), \
+                mock.patch.object(speedtest, "run_single_completion") as warm:
+            res = speedtest.run_benchmark_tiers(
+                "http://127.0.0.1:1/v1", "m", [1024, 32768, 65536, 131072], 256, 3,
+                warmup=True, log=lambda m, c=None: lines.append(m),
+            )
+        self.assertEqual(warm.call_count, 1)
+        self.assertEqual([r["ctx_prompt"] for r in res], [1024, 32768])
+        self.assertEqual(len(calls), 3)  # stops after the 64k failure
+        self.assertGreater(calls[2]["timeout"], 600.0)  # 64k timeout scaled from the 32k prefill speed
+        self.assertTrue(any("停止更高档位" in ln for ln in lines))
+
+    def test_first_tier_failure_is_raised(self):
+        with mock.patch.object(speedtest, "benchmark_context", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                speedtest.run_benchmark_tiers("http://127.0.0.1:1/v1", "m", [1024], 256, 3, warmup=False,
+                                              log=lambda m, c=None: None)

@@ -9,10 +9,8 @@ from __future__ import annotations
 import http.server
 import json
 import secrets
-import statistics
 import sys
 import threading
-import time
 import urllib.error
 import urllib.parse
 import webbrowser
@@ -904,53 +902,20 @@ def create_ui_server(
                 if cfg.get("ram_channels"):
                     hw["ram_channels"] = int(cfg["ram_channels"])
 
-            if not no_warmup:
-                log("正在发送预热请求...")
-                st_module.run_single_completion(endpoint, model, st_module.build_warmup_prompt(ctx_limit), 24, api_key=api_key)
+            for note in getattr(st_module, "LAST_DETECT_NOTES", []):
+                log(f"⚠ {note}")
 
-            results: List[Dict[str, Any]] = []
-            cpt = 5.6
-            for c in ctx_list:
-                lbl = st_module.format_ctx_label(c)
-                target = st_module.effective_ctx_target(c, gen_tokens, ctx_limit)
-                if target is None:
-                    log(f"跳过 [{lbl}]（当前服务上下文上限 {ctx_limit} tokens）")
-                    continue
-                tier_runs = st_module.effective_runs_for_ctx(target, runs)
-                req_timeout = st_module.timeout_for_ctx(target)
-                samples = []
-                try:
-                    for i in range(tier_runs):
-                        nonce = f"{target}-{i}-{int(time.time() * 1000) % 100000}"
-                        prompt = st_module.build_prompt(target, nonce, chars_per_token=cpt)
-                        log(f"[{lbl} 上下文] 正在跑第 {i + 1}/{tier_runs} 轮（输入 ≈{target} tok，生成上限 {gen_tokens} tok）...")
-                        r = st_module.run_single_completion(
-                            endpoint, model, prompt, gen_tokens, api_key=api_key, timeout=req_timeout
-                        )
-                        samples.append(r)
-                        if r["prompt_tokens"] >= 200:
-                            measured_cpt = len(prompt) / float(r["prompt_tokens"])
-                            if 3.0 <= measured_cpt <= 8.0:
-                                cpt = measured_cpt
-                        src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
-                        log(f"[{lbl} 上下文] 第 {i + 1}/{tier_runs} 轮完成：生成 {r['tg_tps']} tok/s，读题 {r['pp_tps']} tok/s（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）")
-                except Exception as e:
-                    if results:
-                        log(f"[{lbl}] 超出当前上下文限制或显存不足（{e}），已保留已完成档位成绩并停止更高档位。")
-                        break
-                    raise
-                for w in st_module.tier_quality_warnings(samples, gen_tokens):
-                    log(f"[{lbl}] ⚠ {w}")
-                results.append({
-                    "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
-                    "gen_tokens": int(round(statistics.median(s["gen_tokens"] for s in samples))),
-                    "tg_tps": round(statistics.median(s["tg_tps"] for s in samples), 2),
-                    "pp_tps": round(statistics.median(s["pp_tps"] for s in samples), 2),
-                    "sse_tg_tps": round(statistics.median(s["sse_tg_tps"] for s in samples), 2),
-                    "ttft_ms": round(statistics.median(s["ttft_ms"] for s in samples), 1),
-                    "runs": tier_runs,
-                    "source": "timings" if all(s["source"] == "timings" for s in samples) else "sse",
-                })
+            results: List[Dict[str, Any]] = st_module.run_benchmark_tiers(
+                endpoint,
+                model,
+                ctx_list,
+                gen_tokens,
+                runs,
+                api_key=api_key,
+                ctx_limit=ctx_limit,
+                warmup=not no_warmup,
+                log=lambda msg, color=None: log(st_module.strip_ansi(msg).strip()),
+            )
 
             if not results:
                 raise RuntimeError("所有上下文档位均未能完成测速，请检查服务端上下文上限设置")

@@ -28,9 +28,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.10"
+CLIENT_VERSION = "0.3.11"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
@@ -233,6 +233,11 @@ def _supports_color() -> bool:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z~]")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove terminal color codes (for log lines shown in the WebUI)."""
+    return _ANSI_RE.sub("", str(text))
 
 
 def _c(text: str, code: str) -> str:
@@ -1061,6 +1066,7 @@ def detect_ram_type(os_name: Optional[str] = None, cpu_raw: Optional[str] = None
 
 def detect_hardware() -> Dict[str, Any]:
     """Collect hardware specs ONLY (no hostname, username, UUID, serial, or paths)."""
+    LAST_DETECT_NOTES.clear()
     os_name = normalize_os()
     ram_gb = detect_ram_gb()
     cpu_raw = detect_cpu_raw(os_name)
@@ -1085,53 +1091,63 @@ def detect_hardware() -> Dict[str, Any]:
             "os": os_name,
         }
 
-    # 2. NVIDIA GPU via nvidia-smi
-    nv_out = run_cmd([
+    # 2. 收集各厂商显卡。NVIDIA 额外读取已用显存，用来判断模型实际加载在哪些卡上
+    nv = parse_nvidia_smi(run_cmd([
         "nvidia-smi",
-        "--query-gpu=name,memory.total",
+        "--query-gpu=name,memory.total,memory.used",
         "--format=csv,noheader,nounits",
-    ])
-    if nv_out:
-        gpus: List[Tuple[str, int]] = []
-        for line in nv_out.splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2:
-                try:
-                    vram = max(1, round(float(parts[1]) / 1024))
-                except ValueError:
-                    vram = 0
-                gpus.append((parts[0], vram))
-        if gpus:
-            name, vram = gpus[0]
-            # Check for DGX Spark (GB10 unified memory)
-            if "gb10" in name.lower():
-                return {
-                    "kind": "unified",
-                    "hw_id": "dgxspark",
-                    "hw_raw": name,
-                    "cpu_raw": cpu_raw,
-                    "gpu_count": len(gpus),
-                    "vram_gb": None,
-                    "ram_gb": ram_gb or 128,
-                    "ram_type": "Unified",
-                    "ram_channels": None,
-                    "os": os_name,
-                }
-            return {
-                "kind": "gpu",
-                "hw_id": map_gpu_id(name, vram),
-                "hw_raw": name,
-                "cpu_raw": cpu_raw,
-                "gpu_count": len(gpus),
-                "vram_gb": vram or None,
-                "ram_gb": ram_gb,
-                "ram_type": detect_ram_type(os_name, cpu_raw),
-                "ram_channels": None,
-                "os": os_name,
-            }
+    ]))
+    if nv and "gb10" in nv[0]["name"].lower():
+        # DGX Spark (GB10 unified memory)
+        return {
+            "kind": "unified",
+            "hw_id": "dgxspark",
+            "hw_raw": nv[0]["name"],
+            "cpu_raw": cpu_raw,
+            "gpu_count": len(nv),
+            "vram_gb": None,
+            "ram_gb": ram_gb or 128,
+            "ram_type": "Unified",
+            "ram_channels": None,
+            "os": os_name,
+        }
+
+    def _gpu_spec(name: str, vram: Optional[int], count: int) -> Dict[str, Any]:
+        return {
+            "kind": "gpu",
+            "hw_id": map_gpu_id(name, vram),
+            "hw_raw": name,
+            "cpu_raw": cpu_raw,
+            "gpu_count": count,
+            "vram_gb": vram or None,
+            "ram_gb": ram_gb,
+            "ram_type": detect_ram_type(os_name, cpu_raw),
+            "ram_channels": None,
+            "os": os_name,
+        }
+
+    other = detect_non_nvidia_gpus(os_name)
+    other_dgpu = [g for g in other if map_gpu_id(g[0], g[1]) or (g[1] or 0) >= 8]
+
+    nv_active = [g for g in nv if g["used_mb"] is not None and g["used_mb"] >= NV_ACTIVE_USED_MB]
+    nv_known_idle = bool(nv) and all(g["used_mb"] is not None and g["used_mb"] < NV_ACTIVE_USED_MB for g in nv)
+
+    if nv and not (nv_known_idle and other_dgpu):
+        pool = nv_active or nv
+        name, vram, count, others = choose_gpu_group([(g["name"], g["vram_gb"]) for g in pool])
+        if nv_active and len(nv_active) < len(nv):
+            _note(f"检测到 {len(nv)} 张 NVIDIA 显卡，其中 {len(nv_active)} 张已加载模型（显存占用 ≥{NV_ACTIVE_USED_MB // 1024}GB），按这 {len(nv_active)} 张中的同型号卡统计。")
+        if others:
+            _note(f"检测到不同型号的显卡（{'、'.join(others)}），按 {name} ×{count} 统计；如不对请用 --hw-id / --gpu-count 手动指定。")
+        if other_dgpu:
+            _note(f"同时检测到非 NVIDIA 显卡（{'、'.join(g[0] for g in other_dgpu)}），按 NVIDIA 显卡统计；如模型实际跑在其它卡上请用 --hw-id 指定。")
+        return _gpu_spec(name, vram, count)
+
+    if nv and other_dgpu:
+        _note(f"NVIDIA 显卡（{nv[0]['name']}）上未发现已加载的模型，按 {other_dgpu[0][0]} 统计；如不对请用 --hw-id 手动指定。")
 
     # 3. AMD Ryzen AI Max+ 395 (unified) on Linux/Windows
-    if cpu_raw and "ai max" in cpu_raw.lower() and "395" in cpu_raw.lower():
+    if cpu_raw and "ai max" in cpu_raw.lower() and "395" in cpu_raw.lower() and not other_dgpu:
         return {
             "kind": "unified",
             "hw_id": "aimax395",
@@ -1145,83 +1161,12 @@ def detect_hardware() -> Dict[str, Any]:
             "os": os_name,
         }
 
-    # 4. AMD / Intel discrete GPU fallback (Windows PowerShell or Linux ROCm/lspci)
-    if os_name == "windows":
-        # Prefer 64-bit registry qwMemorySize (avoids Win32_VideoController 4GB uint32 cap)
-        ps = run_cmd([
-            "powershell", "-NoProfile", "-Command",
-            (
-                "$reg = Get-ItemProperty 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' "
-                "-ErrorAction SilentlyContinue | Where-Object { $_.DriverDesc }; "
-                "if ($reg) { $reg | ForEach-Object { \"$($_.DriverDesc)|$($_.'HardwareInformation.qwMemorySize')\" } } "
-                "else { Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)|$($_.AdapterRAM)\" } }"
-            ),
-        ])
-        cands = []
-        skip_win = ("microsoft basic", "microsoft remote", "virtual", "parsec", "citrix", "vmware")
-        for line in ps.splitlines():
-            if "|" not in line:
-                continue
-            name, ram_b = line.split("|", 1)
-            name = name.strip()
-            if not name or any(sk in name.lower() for sk in skip_win):
-                continue
-            vram = max(1, round(int(ram_b) / (1024 ** 3))) if ram_b.strip().isdigit() and int(ram_b) > 0 else None
-            cands.append((name, vram))
-        if cands:
-            # Prefer a GPU that maps to a known hw_id or has the largest VRAM
-            cands.sort(key=lambda c: (1 if map_gpu_id(c[0], c[1]) else 0, c[1] or 0), reverse=True)
-            name, vram = cands[0]
-            return {
-                "kind": "gpu",
-                "hw_id": map_gpu_id(name, vram),
-                "hw_raw": name,
-                "cpu_raw": cpu_raw,
-                "gpu_count": sum(1 for c in cands if c[0] == name),
-                "vram_gb": vram,
-                "ram_gb": ram_gb,
-                "ram_type": detect_ram_type(os_name, cpu_raw),
-                "ram_channels": None,
-                "os": os_name,
-            }
-    elif os_name == "linux":
-        amd_smi = run_cmd(["amd-smi", "static", "--asic", "--vram", "--csv"]).splitlines()
-        rocm = run_cmd(["rocm-smi", "--showproductname", "--csv"]).splitlines()
-        rocm_mem = run_cmd(["rocm-smi", "--showmeminfo", "vram", "--csv"]).splitlines()
-        pci = [
-            l for l in run_cmd(["lspci"]).splitlines()
-            if re.search(r"VGA|3D|Display", l, re.IGNORECASE)
-        ]
-        vram_bytes: List[int] = []
-        try:
-            drm_dir = "/sys/class/drm"
-            if os.path.isdir(drm_dir):
-                for entry in sorted(os.listdir(drm_dir)):
-                    if not re.fullmatch(r"card\d+", entry):
-                        continue
-                    p = os.path.join(drm_dir, entry, "device", "mem_info_vram_total")
-                    if os.path.isfile(p):
-                        with open(p, "r", encoding="utf-8") as f:
-                            raw_b = f.read().strip()
-                            if raw_b.isdigit():
-                                vram_bytes.append(int(raw_b))
-        except Exception:
-            pass
-        non_nv = parse_linux_non_nvidia_gpus(rocm, rocm_mem, amd_smi, pci, vram_bytes)
-        if non_nv:
-            name, vram = non_nv[0]
-            return {
-                "kind": "gpu",
-                "hw_id": map_gpu_id(name, vram),
-                "hw_raw": name,
-                "cpu_raw": cpu_raw,
-                "gpu_count": len(non_nv),
-                "vram_gb": vram,
-                "ram_gb": ram_gb,
-                "ram_type": detect_ram_type(os_name, cpu_raw),
-                "ram_channels": None,
-                "os": os_name,
-            }
+    # 4. AMD / Intel GPU
+    if other:
+        name, vram, count, others = choose_gpu_group(other_dgpu or other)
+        if others:
+            _note(f"检测到不同型号的显卡（{'、'.join(others)}），按 {name} ×{count} 统计；如不对请用 --hw-id / --gpu-count 手动指定。")
+        return _gpu_spec(name, vram, count)
 
     return {
         "kind": "gpu",
@@ -1235,6 +1180,119 @@ def detect_hardware() -> Dict[str, Any]:
         "ram_channels": None,
         "os": os_name,
     }
+
+
+# 显存占用达到该值的 NVIDIA 卡视为「已加载模型」（桌面/浏览器通常只占几百 MB）
+NV_ACTIVE_USED_MB = 2048
+# 最近一次硬件识别的提示（不会上传；CLI 打印、WebUI 写入日志）
+LAST_DETECT_NOTES: List[str] = []
+
+
+def _note(msg: str) -> None:
+    if msg not in LAST_DETECT_NOTES:
+        LAST_DETECT_NOTES.append(msg)
+
+
+def parse_nvidia_smi(out: str) -> List[Dict[str, Any]]:
+    """Parse `nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader,nounits`."""
+    gpus: List[Dict[str, Any]] = []
+    for line in (out or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        try:
+            vram = max(1, round(float(parts[1]) / 1024))
+        except ValueError:
+            vram = 0
+        used: Optional[int] = None
+        if len(parts) >= 3:
+            try:
+                used = int(float(parts[2]))
+            except ValueError:
+                used = None  # e.g. "[N/A]"
+        gpus.append({"name": parts[0], "vram_gb": vram, "used_mb": used})
+    return gpus
+
+
+def choose_gpu_group(cands: List[Tuple[str, Optional[int]]]) -> Tuple[str, Optional[int], int, List[str]]:
+    """Pick the primary GPU model and count only cards of that same model.
+
+    Mixed setups (e.g. 4090 + 3060) must not be reported as "4090 ×2". Prefers a card that maps
+    to a known hw_id, then the largest VRAM. Returns (name, vram_gb, count, other_model_names).
+    """
+    order = sorted(
+        range(len(cands)),
+        key=lambda i: (1 if map_gpu_id(cands[i][0], cands[i][1]) else 0, cands[i][1] or 0, -i),
+        reverse=True,
+    )
+    name, vram = cands[order[0]]
+    count = sum(1 for c in cands if c[0] == name)
+    others: List[str] = []
+    for c in cands:
+        if c[0] != name and c[0] not in others:
+            others.append(c[0])
+    return name, vram, count, others
+
+
+# Windows：以当前「在位」的显示适配器（Win32_VideoController）为准，注册表只用来查 64 位显存大小。
+# 直接枚举注册表会带出已拔掉/旧驱动残留的显卡记录，导致张数或型号识别错误。
+_WIN_GPU_PS = (
+    "$reg = Get-ItemProperty 'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' "
+    "-ErrorAction SilentlyContinue | Where-Object { $_.DriverDesc }; "
+    "Get-CimInstance Win32_VideoController | Where-Object { $_.Name } | ForEach-Object { "
+    "$v = $_; $n = $v.Name; "
+    "$m = $reg | Where-Object { $_.DriverDesc -eq $n } | ForEach-Object { $_.'HardwareInformation.qwMemorySize' } "
+    "| Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1; "
+    "if (-not $m) { $m = $v.AdapterRAM }; \"$n|$m\" }"
+)
+_WIN_SKIP = ("microsoft basic", "microsoft remote", "virtual", "parsec", "citrix", "vmware", "nvidia")
+
+
+def parse_windows_gpu_lines(text: str) -> List[Tuple[str, Optional[int]]]:
+    """Parse 'name|bytes' lines from _WIN_GPU_PS into non-NVIDIA (name, vram_gb) pairs."""
+    cands: List[Tuple[str, Optional[int]]] = []
+    for line in (text or "").splitlines():
+        if "|" not in line:
+            continue
+        name, ram_b = line.split("|", 1)
+        name = name.strip()
+        ram_b = ram_b.strip()
+        if not name or any(sk in name.lower() for sk in _WIN_SKIP):
+            continue
+        vram = max(1, round(int(ram_b) / (1024 ** 3))) if ram_b.isdigit() and int(ram_b) > 0 else None
+        cands.append((name, vram))
+    return cands
+
+
+def detect_non_nvidia_gpus(os_name: str) -> List[Tuple[str, Optional[int]]]:
+    """AMD / Intel GPUs on Windows or Linux as (name, vram_gb) pairs."""
+    if os_name == "windows":
+        return parse_windows_gpu_lines(run_cmd(["powershell", "-NoProfile", "-Command", _WIN_GPU_PS]))
+    if os_name == "linux":
+        amd_smi = run_cmd(["amd-smi", "static", "--asic", "--vram", "--csv"]).splitlines()
+        rocm = run_cmd(["rocm-smi", "--showproductname", "--csv"]).splitlines()
+        rocm_mem = run_cmd(["rocm-smi", "--showmeminfo", "vram", "--csv"]).splitlines()
+        pci = [
+            l for l in run_cmd(["lspci"]).splitlines()
+            if re.search(r"VGA|3D|Display", l, re.IGNORECASE) and "nvidia" not in l.lower()
+        ]
+        vram_bytes: List[int] = []
+        try:
+            drm_dir = "/sys/class/drm"
+            if os.path.isdir(drm_dir):
+                for entry in sorted(os.listdir(drm_dir)):
+                    if not re.fullmatch(r"card\d+", entry):
+                        continue
+                    vp = os.path.join(drm_dir, entry, "device", "mem_info_vram_total")
+                    if os.path.isfile(vp):
+                        with open(vp, "r", encoding="utf-8") as f:
+                            raw_b = f.read().strip()
+                            if raw_b.isdigit():
+                                vram_bytes.append(int(raw_b))
+        except Exception:
+            pass
+        return parse_linux_non_nvidia_gpus(rocm, rocm_mem, amd_smi, pci, vram_bytes)
+    return []
 
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -2014,6 +2072,13 @@ def tier_quality_warnings(samples: List[Dict[str, Any]], gen_tokens_cap: int) ->
     return warns
 
 
+LogFn = Callable[..., None]
+
+
+def _stderr_log(msg: str, color: Optional[str] = None) -> None:
+    print(_c(msg, color) if color else msg, file=sys.stderr)
+
+
 def benchmark_context(
     endpoint: str,
     model_name: str,
@@ -2023,19 +2088,22 @@ def benchmark_context(
     api_key: Optional[str] = None,
     chars_per_token: float = 5.6,
     tier_label: Optional[str] = None,
+    log: Optional[LogFn] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], float]:
+    """Run one context tier (median of N runs). Shared by the CLI and the local WebUI."""
+    emit = log or _stderr_log
     samples: List[Dict[str, Any]] = []
     tier_runs = effective_runs_for_ctx(ctx_prompt, runs)
-    req_timeout = timeout_for_ctx(ctx_prompt)
+    req_timeout = timeout or timeout_for_ctx(ctx_prompt)
     ctx_lbl = tier_label or format_ctx_label(ctx_prompt)
     cpt = chars_per_token
-    print(
-        _c(f"\n>> 开始测速 [{ctx_lbl} 上下文]（输入 ≈{ctx_prompt} tok，每轮生成上限 {gen_tokens} tok，共 {tier_runs} 轮）：", "1;36"),
-        file=sys.stderr,
-    )
+    emit(f"\n>> 开始测速 [{ctx_lbl} 上下文]（输入 ≈{ctx_prompt} tok，每轮生成上限 {gen_tokens} tok，共 {tier_runs} 轮）：", "1;36")
     for i in range(tier_runs):
         nonce = f"{ctx_prompt}-{i}-{int(time.time() * 1000) % 100000}"
         prompt = build_prompt(ctx_prompt, nonce, chars_per_token=cpt)
+        if ctx_prompt >= 16384:
+            emit(f"   第 {i + 1}/{tier_runs} 轮进行中（长上下文读题较慢，请耐心等待）...")
         r = run_single_completion(endpoint, model_name, prompt, gen_tokens, api_key=api_key, timeout=req_timeout)
         samples.append(r)
         if r["prompt_tokens"] >= 200:
@@ -2043,14 +2111,13 @@ def benchmark_context(
             if 3.0 <= measured_cpt <= 8.0:
                 cpt = measured_cpt
         src_lbl = "服务端精确计时" if r["source"] == "timings" else "客户端流式计时"
-        print(
-            f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33')} tok/s | "
-            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）",
-            file=sys.stderr,
+        emit(
+            f"   第 {i + 1}/{tier_runs} 轮：生成 {_c(str(r['tg_tps']), '1;33') if log is None else r['tg_tps']} tok/s | "
+            f"读题 {r['pp_tps']} tok/s | 首字 {r['ttft_ms']} ms（输入 {r['prompt_tokens']} / 生成 {r['gen_tokens']} tok，{src_lbl}）"
         )
 
     for w in tier_quality_warnings(samples, gen_tokens):
-        print(_c(f"   ! {w}", "33"), file=sys.stderr)
+        emit(f"   ! {w}", "33")
 
     res = {
         "ctx_prompt": int(round(statistics.median(s["prompt_tokens"] for s in samples))),
@@ -2063,6 +2130,82 @@ def benchmark_context(
         "source": "timings" if all(s["source"] == "timings" for s in samples) else "sse",
     }
     return res, cpt
+
+
+# 单个请求的超时上限：再慢的机器也不让一轮等超过 2 小时
+MAX_REQUEST_TIMEOUT = 7200.0
+
+
+def estimate_tier_timeout(target_ctx: int, prev: Optional[Dict[str, Any]]) -> Tuple[float, Optional[float]]:
+    """Return (socket timeout, estimated prefill seconds) for a tier, scaled by the previous tier's speed.
+
+    Most servers send nothing until the whole prompt is processed, so the read timeout must cover
+    the prefill. Prefill speed drops at long context (attention cost), hence the 0.5 safety factor.
+    """
+    base = timeout_for_ctx(target_ctx)
+    if not prev or not prev.get("pp_tps") or not prev.get("ctx_prompt"):
+        return base, None
+    pp = float(prev["pp_tps"])
+    if pp <= 0:
+        return base, None
+    est = target_ctx / (pp * 0.5)
+    return min(MAX_REQUEST_TIMEOUT, max(base, est * 1.5 + 120.0)), est
+
+
+def run_benchmark_tiers(
+    endpoint: str,
+    model_name: str,
+    ctx_list: List[int],
+    gen_tokens: int,
+    runs: int,
+    api_key: Optional[str] = None,
+    ctx_limit: Optional[int] = None,
+    warmup: bool = True,
+    log: Optional[LogFn] = None,
+) -> List[Dict[str, Any]]:
+    """Warm up, then benchmark each context tier in order. Shared by the CLI and the local WebUI.
+
+    A failing tier after at least one success keeps the finished tiers and stops (usually the
+    server's context/VRAM limit); a failure on the very first tier is raised to the caller.
+    """
+    emit = log or _stderr_log
+    if warmup:
+        emit("\n▸ 正在发送预热请求（避免冷启动影响成绩）...")
+        run_single_completion(endpoint, model_name, build_warmup_prompt(ctx_limit), 24, api_key=api_key)
+
+    results: List[Dict[str, Any]] = []
+    cpt = 5.6
+    for c in ctx_list:
+        lbl = format_ctx_label(c)
+        target = effective_ctx_target(c, gen_tokens, ctx_limit)
+        if target is None:
+            emit(f"▸ 跳过 [{lbl}]（当前服务上下文上限 {ctx_limit} tokens）")
+            continue
+        req_timeout, est = estimate_tier_timeout(target, results[-1] if results else None)
+        if est is not None and est >= 120:
+            emit(f"▸ [{lbl}] 按上一档读题速度估算，每轮约需 {est / 60:.0f} 分钟（单轮最长等待 {req_timeout / 60:.0f} 分钟）")
+        try:
+            res, cpt = benchmark_context(
+                endpoint,
+                model_name,
+                target,
+                gen_tokens,
+                runs,
+                api_key=api_key,
+                chars_per_token=cpt,
+                tier_label=lbl,
+                log=log,
+                timeout=req_timeout,
+            )
+            results.append(res)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if results:
+                emit(f"! [{lbl}] 测速失败（可能超出当前上下文上限、显存不足或等待超时：{e}），已保留已完成档位成绩并停止更高档位。", "33")
+                break
+            raise
+    return results
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -2810,6 +2953,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"\n◆ 本机硬件：{_c(hw['hw_raw'] + vram_hint, '1')} ×{hw['gpu_count']}{cpu_hint}{ram_hint} · 系统 {hw.get('os') or ''}",
         file=sys.stderr,
     )
+    if hw.get("detected_by") != "manual":
+        for note in LAST_DETECT_NOTES:
+            print(_c(f"  ! {note}", "33"), file=sys.stderr)
+
+    # 与 WebUI 保持一致的参数范围
+    args.runs = max(1, min(10, int(args.runs or 3)))
+    args.gen_tokens = max(16, min(4096, int(args.gen_tokens or 256)))
 
     # 2. Discover or resolve local-only endpoint
     if args.endpoint:
@@ -2890,41 +3040,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.model_id:
             args.model_id = detect_server_model_id(endpoint, model_name, api_key=args.api_key)
 
-    if not args.no_warmup:
-        print("\n▸ 正在发送预热请求（避免冷启动影响成绩）...", file=sys.stderr)
-        run_single_completion(endpoint, model_name, build_warmup_prompt(effective_ctx_limit), 24, api_key=args.api_key)
-
-    ctx_list = parse_ctx_list(ctx_str)
-    results: List[Dict[str, Any]] = []
-    cpt = 5.6
-    for c in ctx_list:
-        target = effective_ctx_target(c, args.gen_tokens, effective_ctx_limit)
-        if target is None:
-            print(
-                f"▸ 跳过 [{format_ctx_label(c)}]（当前服务上下文上限 {effective_ctx_limit} tokens）",
-                file=sys.stderr,
-            )
-            continue
-        try:
-            res, cpt = benchmark_context(
-                endpoint,
-                model_name,
-                target,
-                args.gen_tokens,
-                args.runs,
-                api_key=args.api_key,
-                chars_per_token=cpt,
-                tier_label=format_ctx_label(c),
-            )
-            results.append(res)
-        except Exception as e:
-            if results:
-                print(
-                    _c(f"! [{format_ctx_label(c)}] 测速失败（可能超出当前上下文上限或显存不足：{e}），已保留已完成档位成绩并停止更高档位。", "33"),
-                    file=sys.stderr,
-                )
-                break
-            raise
+    results = run_benchmark_tiers(
+        endpoint,
+        model_name,
+        parse_ctx_list(ctx_str),
+        args.gen_tokens,
+        args.runs,
+        api_key=args.api_key,
+        ctx_limit=effective_ctx_limit,
+        warmup=not args.no_warmup,
+    )
 
     if not results:
         print(_c("✗ 所有上下文档位均未能完成测速，请检查服务端上下文上限设置。", "1;31"), file=sys.stderr)

@@ -247,8 +247,13 @@ sync_files() {
   fi
 
   info "正在下载最新测速脚本到 $INSTALL_DIR ..."
-  if ! download_file "$BASE_URL/speedtest.py" "$INSTALL_DIR/speedtest.py" || \
-     ! download_file "$BASE_URL/ui.py" "$INSTALL_DIR/ui.py"; then
+  # 两个文件都下载成功后再一起替换，避免只更新了一个导致新旧版本混用
+  if download_file "$BASE_URL/speedtest.py" "$INSTALL_DIR/speedtest.py.new" && \
+     download_file "$BASE_URL/ui.py" "$INSTALL_DIR/ui.py.new"; then
+    mv -f "$INSTALL_DIR/speedtest.py.new" "$INSTALL_DIR/speedtest.py"
+    mv -f "$INSTALL_DIR/ui.py.new" "$INSTALL_DIR/ui.py"
+  else
+    rm -f "$INSTALL_DIR/speedtest.py.new" "$INSTALL_DIR/ui.py.new"
     if [ -f "$INSTALL_DIR/speedtest.py" ] && [ -f "$INSTALL_DIR/ui.py" ]; then
       warn "在线更新失败（可能是 GitHub 网络连接超时），将继续使用本地已有版本。"
       return 0
