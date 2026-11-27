@@ -1,6 +1,22 @@
-# llm-speedtest
+<div align="center">
+  <a href="https://itbanana.com/llm-speed">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.svg">
+      <img alt="LLM-SPEED by ITBANANA.COM" src="./assets/banner-dark.svg" width="820">
+    </picture>
+  </a>
 
-轻量、开源、零第三方依赖的**本机大模型推理速度测试工具**（Python 3.9+ 标准库实现，支持 **Windows / macOS / Linux**）。
+  <p>
+    <a href="https://itbanana.com/llm-speed"><img src="https://img.shields.io/badge/速度天梯图-itbanana.com-f59e0b?style=flat-square&logo=speedtest&logoColor=white" alt="速度天梯图"></a>
+    <img src="https://img.shields.io/badge/Python-3.9%2B-38bdf8?style=flat-square&logo=python&logoColor=white" alt="Python 3.9+">
+    <img src="https://img.shields.io/badge/Dependencies-Zero-22c55e?style=flat-square" alt="Zero Dependencies">
+    <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-64748b?style=flat-square" alt="Cross Platform">
+    <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-0ea5e9?style=flat-square" alt="MIT License"></a>
+  </p>
+
+  <p><b>轻量、开源、零第三方依赖的本机大模型推理速度标准化测试工具</b></p>
+</div>
 
 > 🏆 **测完即可实时上榜！**
 > 想知道你的显卡 / Mac 在同款硬件里排第几、离同卡第一还差多少 `tok/s`、别人是怎么调出极限速度的？
