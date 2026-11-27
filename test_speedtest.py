@@ -147,6 +147,16 @@ class MappingTests(unittest.TestCase):
         with mock.patch("builtins.input", return_value="q"):
             self.assertEqual(speedtest.prompt_launch_mode(), "quit")
 
+    def test_webui_entry_hidden(self):
+        # 启动选单暂时关闭，--ui 仍可手动使用但不出现在帮助里
+        self.assertFalse(speedtest.SHOW_LAUNCH_MENU)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), self.assertRaises(SystemExit):
+            speedtest.parse_args(["--help"])
+        self.assertIn("--cli", buf.getvalue())
+        self.assertNotIn("--ui", buf.getvalue())
+        self.assertTrue(speedtest.parse_args(["--ui"]).ui)
+
     def test_welcome_banner_box_alignment(self):
         buf = io.StringIO()
         with mock.patch("sys.stderr", buf):

@@ -30,9 +30,10 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.22"
+CLIENT_VERSION = "0.3.23"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
+SHOW_LAUNCH_MENU = False  # 「终端 / WebUI」启动选单；暂时关闭
 DEFAULT_SUBMIT_URL = "https://itbanana.com/api/llm-speedtest/submit"
 DEFAULT_STATS_URL = "https://itbanana.com/api/llm-speedtest/stats"
 
@@ -2614,9 +2615,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--client-id", help="选填：手动指定本地匿名 client_id（换新机时可用于沿用旧记录）")
 
     # Mode / upload / interaction controls
-    p.add_argument("--ui", action="store_true", help="直接启动本地 WebUI 可视化页面并打开浏览器")
-    p.add_argument("--cli", action="store_true", help="直接进入终端命令行交互模式（不询问模式选择）")
-    p.add_argument("--ui-port", type=int, default=0, help="本地 WebUI 监听端口（默认在 127.0.0.1 随机空闲端口）")
+    # WebUI 入口暂时隐藏（减少自由填写导致的脏数据），代码保留，仍可用 --ui 手动启动
+    p.add_argument("--ui", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--cli", action="store_true", help="直接进入终端命令行交互模式（默认即为此模式）")
+    p.add_argument("--ui-port", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--detect-only", action="store_true", help="仅输出本机自动识别的硬件 JSON 并退出")
     p.add_argument("--dry-run", action="store_true", help="仅本地测速并打印明文 JSON，不上传")
     p.add_argument("--interactive", "-i", action="store_true", help="强制开启终端命令行交互模式")
@@ -3447,9 +3449,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print_welcome_banner()
 
-    # When run with no flags in an interactive terminal, let the user choose CLI or WebUI
+    # 启动方式选单暂时隐藏：无参数运行直接进入终端测速（WebUI 只能用 --ui 手动打开）。
+    # 恢复时把 SHOW_LAUNCH_MENU 改回 True 即可。
     if (
-        len(raw_argv) == 0
+        SHOW_LAUNCH_MENU
+        and len(raw_argv) == 0
         and sys.stdin.isatty()
         and not args.cli
         and not args.non_interactive
