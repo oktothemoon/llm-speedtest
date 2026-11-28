@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.24"
+CLIENT_VERSION = "0.3.25"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 SHOW_LAUNCH_MENU = False  # 「终端 / WebUI」启动选单；暂时关闭
@@ -1530,6 +1530,7 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_err: Optional[Exception] = None
     auth_cand: Optional[Tuple[str, int]] = None
+    empty_cand: Optional[str] = None
     for cand in cands:
         try:
             data = http_json(f"{cand}/models", headers=headers, timeout=2.5)
@@ -1538,6 +1539,8 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
                 return cand, [explicit_model] if explicit_model else models
             if explicit_model:
                 return cand, [explicit_model]
+            if empty_cand is None:
+                empty_cand = cand
         except urllib.error.HTTPError as e:
             if e.code in (401, 403) and auth_cand is None:
                 auth_cand = (cand, e.code)
@@ -1550,9 +1553,14 @@ def resolve_endpoint(raw: str, api_key: Optional[str] = None, explicit_model: Op
         raise AuthRequiredError(auth_cand[0], auth_cand[1])
     if explicit_model:
         return cands[0], [explicit_model]
+    if empty_cand:
+        raise RuntimeError(
+            f"已连接本机服务 {empty_cand}，但当前未加载任何模型（/models 返回空列表），请先在客户端中加载并启动模型。"
+        )
+    err_hint = f"（{last_err}）" if last_err else ""
     raise RuntimeError(
         f"连不上本机接口 {raw}（已尝试 {', '.join(cands[:3])}{' 等' if len(cands) > 3 else ''}）。"
-        f"请确认服务已启动并加载模型（{last_err}）。"
+        f"请确认服务已启动并加载模型{err_hint}。"
     )
 
 

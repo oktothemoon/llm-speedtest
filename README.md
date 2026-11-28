@@ -24,6 +24,8 @@
 > - 🏅 **立刻看到你的同卡排名 & 全榜排名**（登顶还有专属榜首战绩卡片与直达高亮链接）
 > - 🏷️ **支持自由署名 & 留下一句话调优配方**（如引擎版本、KV Cache 精度、MTP 开关等），晒出你的神级调优，也让同卡玩家直接抄作业
 > - 🔒 **100% 本机实测锁定硬件**，真实可信、零水分、零个人隐私采集
+>
+> 🧭 **还没装模型？** 不用跑命令，先打开 [本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware)，选好显卡和内存，就能看到预估速度和同款硬件的实测成绩。
 
 支持所有本机运行中的 OpenAI 兼容接口（`llama.cpp`、`Strata`、`Basalt`、`vLLM`、`SGLang`、`Ollama`、`LM Studio`、`MLX`、`Project Maya` 等）。
 
@@ -64,7 +66,7 @@ cd $HOME; if (Test-Path llm-speedtest\.git) { git -C llm-speedtest pull --ff-onl
 
 运行后直接进入中文终端引导，适合本机或 SSH 终端：自动识别本机硬件、扫描端口与模型（如服务设置了 API Key 会直接引导输入）→ 自动跑 `1k / 32k / 64k / 128k / 256k` 测速 → 查看成绩单与明文 JSON → 选填署名/调优备注 → 确认上传并生成专属上榜战绩卡片与天梯直达链接。
 
-> 💡 **还没装模型 / 没开推理服务？** 工具检测不到运行中的模型时，会在退出前给出 [本地大模型配置选择器（itbanana.com/llm-hardware）](https://itbanana.com/llm-hardware) 链接：选好你的显卡和内存，就能先看到预估速度和同款硬件的实测成绩；装好模型后再运行即可实测上榜。（只打印链接，不发送任何数据；本机终端可按回车直接在浏览器打开，SSH 与 `--non-interactive` 下只打印不询问。）
+> 💡 **本机暂时没有运行中的模型？** 工具会在退出前给出 [配置选择器](https://itbanana.com/llm-hardware) 链接，先看预估速度，装好模型后再运行即可实测上榜。（只打印链接，不发送任何数据；本机终端可按回车直接在浏览器打开，SSH 与 `--non-interactive` 下只打印不询问。）
 
 ---
 

@@ -1924,3 +1924,18 @@ class _EmptyModelsHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+class ResolveEndpointEmptyModelsTests(unittest.TestCase):
+    def test_connected_but_no_models_says_so(self):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _EmptyModelsHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                speedtest.resolve_endpoint(f"http://127.0.0.1:{server.server_port}/v1")
+        finally:
+            server.shutdown()
+        msg = str(ctx.exception)
+        self.assertIn("未加载任何模型", msg)
+        self.assertNotIn("连不上", msg)
+        self.assertNotIn("None", msg)
