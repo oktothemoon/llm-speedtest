@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.23"
+CLIENT_VERSION = "0.3.24"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 SHOW_LAUNCH_MENU = False  # 「终端 / WebUI」启动选单；暂时关闭
@@ -2670,6 +2670,39 @@ def resolve_hardware(args: argparse.Namespace) -> Dict[str, Any]:
     return hw
 
 
+HARDWARE_PICKER_URL = "https://itbanana.com/llm-hardware"
+
+
+def print_estimate_hint(interactive: bool) -> None:
+    """测不了实测速度时（没有服务 / 没有加载模型），引导用户去配置选择器看预估速度。
+
+    只打印链接，不发任何网络请求。交互模式且非 SSH 会话时，可按回车用浏览器打开。
+    """
+    lines = [
+        "",
+        "没有检测到运行中的模型，暂时测不了实测速度。",
+        "想先看看这台电脑大概能跑多快，可以打开：",
+        f"  {_c(HARDWARE_PICKER_URL, '1;36')}",
+        "选好你的显卡和内存，就能看到预估速度和同款硬件的实测成绩。",
+        "装好模型后再运行这条命令，就能实测上榜。",
+    ]
+    for line in lines:
+        print(line, file=sys.stderr)
+    if not interactive or os.environ.get("SSH_CONNECTION"):
+        return
+    try:
+        ans = input("按回车在浏览器打开（输入 n 跳过）：").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("", file=sys.stderr)
+        return
+    if ans in ("", "y", "yes"):
+        try:
+            import webbrowser
+            webbrowser.open(HARDWARE_PICKER_URL)
+        except Exception:
+            pass
+
+
 def _ask(prompt_text: str, default: str = "") -> str:
     suffix = f"（默认 {default}）" if default else ""
     try:
@@ -3512,6 +3545,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         except RuntimeError as e:
             print(_c(f"\n✗ {e}", "1;31"), file=sys.stderr)
+            print_estimate_hint(interactive=interactive)
             return 1
     else:
         print("▸ 正在扫描本机推理服务...", file=sys.stderr)
@@ -3528,12 +3562,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         except RuntimeError as e:
             if not interactive:
                 print(_c(f"\n✗ {e}", "1;31"), file=sys.stderr)
+                print_estimate_hint(interactive=False)
                 return 1
             print(f"\n! {e}", file=sys.stderr)
             while True:
                 entered = _ask("请输入本机服务端口（如 8080，或完整本机地址；输入 q 退出）")
                 if not entered or entered.lower() in ("q", "quit", "exit"):
                     print("已退出测速。", file=sys.stderr)
+                    print_estimate_hint(interactive=True)
                     return 1
                 try:
                     endpoint, models = resolve_endpoint(entered, api_key=args.api_key, explicit_model=args.model)
@@ -3560,6 +3596,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not models and not args.model:
         print(_c("❌ 未检测到已加载模型，请先加载模型或通过 --model <模型名> 指定。", "1;31"), file=sys.stderr)
+        print_estimate_hint(interactive=interactive)
         return 1
 
     if interactive:

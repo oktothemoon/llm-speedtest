@@ -1856,3 +1856,71 @@ class BasaltAndMtpTests(unittest.TestCase):
     def test_idle_second_card_is_not_a_mix(self):
         hw, _ = self._detect("NVIDIA GeForce RTX 5090, 32607, 30000\nNVIDIA GeForce RTX 5060 Ti, 16311, 300\n")
         self.assertNotIn("gpu_mix", hw)
+
+
+class EstimateHintTests(unittest.TestCase):
+    """测不了速时引导到配置选择器：只打印链接，交互且非 SSH 时才询问打开浏览器。"""
+
+    def _run(self, interactive, env, answer=""):
+        err = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=False), \
+             mock.patch("sys.stderr", err), \
+             mock.patch("builtins.input", return_value=answer) as m_input, \
+             mock.patch("webbrowser.open") as m_open:
+            speedtest.print_estimate_hint(interactive=interactive)
+        return err.getvalue(), m_input, m_open
+
+    def test_non_interactive_only_prints(self):
+        out, m_input, m_open = self._run(False, {})
+        self.assertIn("https://itbanana.com/llm-hardware", out)
+        self.assertIn("暂时测不了实测速度", out)
+        m_input.assert_not_called()
+        m_open.assert_not_called()
+
+    def test_interactive_enter_opens_browser(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("SSH_CONNECTION", None)
+            _, m_input, m_open = self._run(True, {}, answer="")
+        m_input.assert_called_once()
+        m_open.assert_called_once_with("https://itbanana.com/llm-hardware")
+
+    def test_interactive_n_skips_browser(self):
+        import os
+        os.environ.pop("SSH_CONNECTION", None)
+        _, _, m_open = self._run(True, {}, answer="n")
+        m_open.assert_not_called()
+
+    def test_ssh_never_prompts_or_opens(self):
+        out, m_input, m_open = self._run(True, {"SSH_CONNECTION": "1.2.3.4 5 6.7.8.9 22"})
+        self.assertIn("https://itbanana.com/llm-hardware", out)
+        m_input.assert_not_called()
+        m_open.assert_not_called()
+
+    def test_empty_endpoint_prints_hint_and_keeps_exit_code(self):
+        server = http.server.HTTPServer(("127.0.0.1", 0), _EmptyModelsHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err), mock.patch("webbrowser.open") as m_open:
+                rc = speedtest.main([
+                    "--endpoint", f"http://127.0.0.1:{server.server_port}/v1",
+                    "--non-interactive", "--hw-id", "rtx4090",
+                ])
+        finally:
+            server.shutdown()
+        self.assertEqual(rc, 1)
+        self.assertIn("https://itbanana.com/llm-hardware", err.getvalue())
+        m_open.assert_not_called()
+
+
+class _EmptyModelsHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"object": "list", "data": []}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
