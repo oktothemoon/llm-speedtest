@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-CLIENT_VERSION = "0.3.25"
+CLIENT_VERSION = "0.3.26"
 USER_AGENT = f"llm-speedtest/{CLIENT_VERSION} (+https://github.com/oktothemoon/llm-speedtest)"
 SCHEMA_VERSION = 1
 SHOW_LAUNCH_MENU = False  # 「终端 / WebUI」启动选单；暂时关闭
